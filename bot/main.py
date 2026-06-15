@@ -25,7 +25,7 @@ from .reconcile import reconcile_wallet
 from .risk import RiskManager
 from .safety import SafetyScreener
 from .state import load_state, save_state
-from .strategy import Strategy
+from .strategy import build_strategy
 
 log = logging.getLogger("bot")
 
@@ -59,7 +59,7 @@ class TradingBot:
         self.screener = SafetyScreener(cfg, self.session)
         self.risk = RiskManager(cfg)
         self.portfolio = Portfolio()
-        self.strategy = Strategy(self.session)
+        self.strategy = build_strategy(cfg, self.session)
         self.notifier = Notifier(cfg, self.session)
         self._running = True
         # Restore any persisted positions / daily state before trading.

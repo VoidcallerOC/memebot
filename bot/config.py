@@ -57,6 +57,30 @@ def _parse_ladder(raw: str) -> list[tuple[float, float]]:
     return rungs
 
 
+def _parse_wallets(raw: str, path: str) -> list[str]:
+    """Collect watched wallet addresses from a comma/whitespace-separated env
+    value and/or a file (one address per line, ``#`` comments allowed)."""
+    seen: set[str] = set()
+    wallets: list[str] = []
+
+    def _add(token: str) -> None:
+        token = token.strip()
+        if token and not token.startswith("#") and token not in seen:
+            seen.add(token)
+            wallets.append(token)
+
+    for chunk in raw.replace(",", " ").split():
+        _add(chunk)
+    if path:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    _add(line)
+        except OSError as exc:
+            log.warning("could not read SMART_MONEY_WALLETS_FILE %r: %s", path, exc)
+    return wallets
+
+
 @dataclass(frozen=True)
 class Config:
     # Safety
@@ -93,6 +117,11 @@ class Config:
 
     # Loop
     poll_interval_seconds: int = 15
+
+    # Strategy / candidate source: "boosted" (DexScreener) or "smart_money".
+    strategy: str = "boosted"
+    smart_money_wallets: list[str] = field(default_factory=list)
+    smart_money_surface_existing: bool = False
 
     # Alerts (all optional; off unless configured)
     telegram_bot_token: str = ""
@@ -137,6 +166,12 @@ def load_config() -> Config:
         require_freeze_revoked=_get_bool("REQUIRE_FREEZE_REVOKED", True),
         max_top_holder_pct=_get_float("MAX_TOP_HOLDER_PCT", 25.0),
         poll_interval_seconds=_get_int("POLL_INTERVAL_SECONDS", 15),
+        strategy=os.getenv("STRATEGY", "boosted").strip().lower(),
+        smart_money_wallets=_parse_wallets(
+            os.getenv("SMART_MONEY_WALLETS", ""),
+            os.getenv("SMART_MONEY_WALLETS_FILE", "").strip(),
+        ),
+        smart_money_surface_existing=_get_bool("SMART_MONEY_SURFACE_EXISTING", False),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),

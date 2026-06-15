@@ -182,6 +182,29 @@ The strategy in `strategy.py` is deliberately simple and meant to be replaced.
 The parts that protect you — `safety.py` and `risk.py` — are the parts worth
 trusting.
 
+### Choosing a candidate source
+
+`strategy.py` ships two interchangeable *sources* of tokens to evaluate,
+selected with `STRATEGY`. Neither is a buy signal — every candidate still has
+to clear `safety.py` and `risk.py`:
+
+- **`boosted`** (default) — recently-active tokens from DexScreener's boosted
+  feed. Broad and noisy; leans entirely on the safety screen.
+- **`smart_money`** — tokens that a watchlist of wallets is *newly*
+  accumulating, read from your `RPC_URL`. Following proven on-chain actors is a
+  more defensible edge than chasing boosts, but it's only as good as the wallet
+  list you give it. The first time it sees a wallet it records the current bag
+  as a baseline and emits nothing, so it won't try to buy a wallet's whole
+  pre-existing position on startup — only fresh accumulation after that.
+
+```bash
+STRATEGY=smart_money
+SMART_MONEY_WALLETS=Wallet1,Wallet2        # and/or SMART_MONEY_WALLETS_FILE
+```
+
+A private/paid RPC is recommended for `smart_money` — it polls each watched
+wallet every tick.
+
 ## Legal / disclaimer
 
 This software is provided for educational purposes, as-is, with no warranty.
