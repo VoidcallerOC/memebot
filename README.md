@@ -45,7 +45,6 @@ the behavior.
 ## Quick start
 
 ```bash
-cd trading-bot
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.env .env      # then edit .env
@@ -155,6 +154,12 @@ See `config.example.env` for every knob, but the important ones:
 | `DAILY_LOSS_LIMIT_PCT` | Stop trading for the day after this drawdown | `10` |
 | `TAKE_PROFIT_LADDER` | Profit targets / sell fractions | `50:0.5,100:0.25,300:0.25` |
 | `MAX_OPEN_POSITIONS` | Concurrent positions allowed | `3` |
+| `JUPITER_BASE_URL` | Jupiter swap API base | `https://lite-api.jup.ag/swap/v1` |
+
+> **Jupiter endpoint:** the bot quotes and swaps through Jupiter. The legacy
+> `quote-api.jup.ag/v6` host was deprecated on 2025-10-01, so the default is now
+> the keyless free tier `lite-api.jup.ag/swap/v1`. With a Jupiter API key, set
+> `JUPITER_API_KEY` and point `JUPITER_BASE_URL` at `https://api.jup.ag/swap/v1`.
 
 ## Architecture
 

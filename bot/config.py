@@ -64,6 +64,13 @@ class Config:
     wallet_private_key: str = ""
     rpc_url: str = "https://api.mainnet-beta.solana.com"
 
+    # Jupiter swap API. The legacy quote-api.jup.ag/v6 host was deprecated on
+    # 2025-10-01; the current free tier is lite-api.jup.ag/swap/v1 (no key).
+    # Holders of a Jupiter API key should point this at https://api.jup.ag/swap/v1
+    # and set jupiter_api_key.
+    jupiter_base_url: str = "https://lite-api.jup.ag/swap/v1"
+    jupiter_api_key: str = ""
+
     # Bankroll & sizing
     bankroll_usd: float = 100.0
     max_position_pct: float = 2.0
@@ -113,6 +120,10 @@ def load_config() -> Config:
         live_trading=_get_bool("LIVE_TRADING", False),
         wallet_private_key=os.getenv("WALLET_PRIVATE_KEY", "").strip(),
         rpc_url=os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com").strip(),
+        jupiter_base_url=os.getenv(
+            "JUPITER_BASE_URL", "https://lite-api.jup.ag/swap/v1"
+        ).strip().rstrip("/"),
+        jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip(),
         bankroll_usd=_get_float("BANKROLL_USD", 100.0),
         max_position_pct=_get_float("MAX_POSITION_PCT", 2.0),
         max_open_positions=_get_int("MAX_OPEN_POSITIONS", 3),
