@@ -1,0 +1,16 @@
+# NEVER commit secrets or real config
+.env
+*.env
+!config.example.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Bot state / logs
+*.log
+state.json
+positions.json
