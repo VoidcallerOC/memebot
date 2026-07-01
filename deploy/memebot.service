@@ -1,0 +1,34 @@
+# systemd unit for running the bot on a plain VM (no Docker).
+# Install (as root):
+#   git clone https://github.com/VoidcallerOC/memebot.git /opt/memebot
+#   cd /opt/memebot
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#   cp config.example.env .env && $EDITOR .env
+#   useradd --system --home /opt/memebot memebot && chown -R memebot:memebot /opt/memebot
+#   cp deploy/memebot.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now memebot
+#   journalctl -u memebot -f       # watch it tick
+[Unit]
+Description=Solana memecoin trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=memebot
+WorkingDirectory=/opt/memebot
+EnvironmentFile=/opt/memebot/.env
+ExecStart=/opt/memebot/.venv/bin/python -m bot.main
+Restart=on-failure
+RestartSec=5
+# State + logs stay under the working dir; STATE_FILE defaults to state.json.
+
+# Basic hardening — the bot needs nothing but outbound network.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/memebot
+
+[Install]
+WantedBy=multi-user.target

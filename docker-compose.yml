@@ -1,0 +1,17 @@
+# Run the bot unattended, restarting on crash or reboot.
+#   1. cp config.example.env .env   # then edit .env
+#   2. docker compose up -d --build
+#   3. docker compose logs -f        # watch it tick
+services:
+  memebot:
+    build: .
+    image: memebot:latest
+    container_name: memebot
+    env_file: .env            # your secrets/config live here (git-ignored)
+    volumes:
+      - memebot-state:/data   # positions + daily state survive restarts
+    restart: unless-stopped
+    # Trading is a background loop with no inbound ports — nothing to expose.
+
+volumes:
+  memebot-state:

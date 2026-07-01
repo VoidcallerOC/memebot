@@ -51,6 +51,9 @@ cp config.example.env .env      # then edit .env
 python -m bot.main              # dry-run by default
 ```
 
+To run it unattended on an always-on host (Docker or systemd, restarts on
+crash/reboot), see [`deploy/README.md`](deploy/README.md).
+
 ### Run the tests
 
 ```bash
