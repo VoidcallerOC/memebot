@@ -1,7 +1,7 @@
 """Jupiter integration — price quotes and swap execution.
 
-Jupiter (https://station.jup.ag/docs/apis/swap-api) aggregates Solana DEX
-liquidity. We use it for two things:
+Jupiter (https://dev.jup.ag/docs/swap-api/) aggregates Solana DEX liquidity.
+We use it for two things:
 
   * quoting — what would I receive if I swapped X of token A for token B?
   * swapping — build, sign, and send the actual transaction (LIVE only).
@@ -10,6 +10,12 @@ The signing/sending path is fully implemented but is only reachable when the
 config's safety lock is armed (``LIVE_TRADING=true`` + a wallet key). In
 dry-run mode :meth:`SwapExecutor.swap` returns a simulated fill and touches no
 funds.
+
+Endpoint note: the legacy ``quote-api.jup.ag/v6`` host was deprecated by Jupiter
+on 2025-10-01. The base URL is now configurable (``JUPITER_BASE_URL``) and
+defaults to the keyless free tier ``https://lite-api.jup.ag/swap/v1``. Set a
+``JUPITER_API_KEY`` and point ``JUPITER_BASE_URL`` at ``https://api.jup.ag/swap/v1``
+for the higher-rate-limit paid tier.
 """
 
 from __future__ import annotations
@@ -24,8 +30,6 @@ from .config import Config
 
 log = logging.getLogger(__name__)
 
-JUP_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUP_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 HTTP_TIMEOUT = 12
 
 # Canonical mints
@@ -48,6 +52,19 @@ class JupiterClient:
         self.cfg = cfg
         self.session = session or requests.Session()
 
+    @property
+    def quote_url(self) -> str:
+        return f"{self.cfg.jupiter_base_url}/quote"
+
+    @property
+    def swap_url(self) -> str:
+        return f"{self.cfg.jupiter_base_url}/swap"
+
+    def _headers(self) -> dict:
+        # Jupiter's paid tier (api.jup.ag) authenticates via an x-api-key
+        # header; the keyless lite tier ignores it.
+        return {"x-api-key": self.cfg.jupiter_api_key} if self.cfg.jupiter_api_key else {}
+
     def quote(
         self, input_mint: str, output_mint: str, amount: int
     ) -> Optional[dict]:
@@ -60,7 +77,10 @@ class JupiterClient:
             "slippageBps": str(self.cfg.max_slippage_bps),
         }
         try:
-            resp = self.session.get(JUP_QUOTE_URL, params=params, timeout=HTTP_TIMEOUT)
+            resp = self.session.get(
+                self.quote_url, params=params, headers=self._headers(),
+                timeout=HTTP_TIMEOUT,
+            )
             resp.raise_for_status()
             data = resp.json()
             if not data or "outAmount" not in data:
@@ -119,7 +139,7 @@ class SwapExecutor:
             user_pubkey = str(keypair.pubkey())
 
             swap_resp = self.session.post(
-                JUP_SWAP_URL,
+                self.jup.swap_url,
                 json={
                     "quoteResponse": quote,
                     "userPublicKey": user_pubkey,
@@ -127,6 +147,7 @@ class SwapExecutor:
                     "dynamicComputeUnitLimit": True,
                     "prioritizationFeeLamports": "auto",
                 },
+                headers=self.jup._headers(),
                 timeout=HTTP_TIMEOUT,
             )
             swap_resp.raise_for_status()

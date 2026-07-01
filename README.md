@@ -45,12 +45,14 @@ the behavior.
 ## Quick start
 
 ```bash
-cd trading-bot
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.env .env      # then edit .env
 python -m bot.main              # dry-run by default
 ```
+
+To run it unattended on an always-on host (Docker or systemd, restarts on
+crash/reboot), see [`deploy/README.md`](deploy/README.md).
 
 ### Run the tests
 
@@ -155,6 +157,12 @@ See `config.example.env` for every knob, but the important ones:
 | `DAILY_LOSS_LIMIT_PCT` | Stop trading for the day after this drawdown | `10` |
 | `TAKE_PROFIT_LADDER` | Profit targets / sell fractions | `50:0.5,100:0.25,300:0.25` |
 | `MAX_OPEN_POSITIONS` | Concurrent positions allowed | `3` |
+| `JUPITER_BASE_URL` | Jupiter swap API base | `https://lite-api.jup.ag/swap/v1` |
+
+> **Jupiter endpoint:** the bot quotes and swaps through Jupiter. The legacy
+> `quote-api.jup.ag/v6` host was deprecated on 2025-10-01, so the default is now
+> the keyless free tier `lite-api.jup.ag/swap/v1`. With a Jupiter API key, set
+> `JUPITER_API_KEY` and point `JUPITER_BASE_URL` at `https://api.jup.ag/swap/v1`.
 
 ## Architecture
 
@@ -176,6 +184,29 @@ bot/
 The strategy in `strategy.py` is deliberately simple and meant to be replaced.
 The parts that protect you — `safety.py` and `risk.py` — are the parts worth
 trusting.
+
+### Choosing a candidate source
+
+`strategy.py` ships two interchangeable *sources* of tokens to evaluate,
+selected with `STRATEGY`. Neither is a buy signal — every candidate still has
+to clear `safety.py` and `risk.py`:
+
+- **`boosted`** (default) — recently-active tokens from DexScreener's boosted
+  feed. Broad and noisy; leans entirely on the safety screen.
+- **`smart_money`** — tokens that a watchlist of wallets is *newly*
+  accumulating, read from your `RPC_URL`. Following proven on-chain actors is a
+  more defensible edge than chasing boosts, but it's only as good as the wallet
+  list you give it. The first time it sees a wallet it records the current bag
+  as a baseline and emits nothing, so it won't try to buy a wallet's whole
+  pre-existing position on startup — only fresh accumulation after that.
+
+```bash
+STRATEGY=smart_money
+SMART_MONEY_WALLETS=Wallet1,Wallet2        # and/or SMART_MONEY_WALLETS_FILE
+```
+
+A private/paid RPC is recommended for `smart_money` — it polls each watched
+wallet every tick.
 
 ## Legal / disclaimer
 
