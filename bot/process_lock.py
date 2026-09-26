@@ -1,15 +1,55 @@
-"""Single-instance advisory lock for the memebot runtime.
+"""Cross-platform single-instance advisory lock for the memebot runtime.
 
-The lock uses the host OS's advisory file-locking primitive.  The lock file
-contains no credentials or process metadata; its existence alone is not used
-to infer liveness, so stale files do not block startup.  A lock-access error
-fails closed.
+The lock file contains no credentials or process metadata. Its existence alone
+is not used to infer liveness, so stale files do not block startup. Lock-access
+errors fail closed.
 """
 from __future__ import annotations
 
-import fcntl
 import os
 from typing import Optional
+
+_IS_WINDOWS = os.name == "nt"
+_LOCK_BYTES = 1
+
+
+def _ensure_lock_byte(handle: object) -> None:
+    """Ensure the lock file has one byte for Windows region locking."""
+    handle.seek(0, os.SEEK_END)  # type: ignore[attr-defined]
+    if handle.tell() == 0:  # type: ignore[attr-defined]
+        handle.write(b"\0")  # type: ignore[attr-defined]
+        handle.flush()  # type: ignore[attr-defined]
+    handle.seek(0)  # type: ignore[attr-defined]
+
+
+def _acquire_native(handle: object) -> None:
+    if _IS_WINDOWS:
+        # Import only on Windows: importing fcntl on Windows breaks test
+        # collection and normal module import.
+        import msvcrt
+
+        _ensure_lock_byte(handle)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, _LOCK_BYTES)  # type: ignore[attr-defined]
+        return
+
+    # Import only on POSIX hosts; Linux remains fully supported without a
+    # third-party dependency.
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+
+
+def _release_native(handle: object) -> None:
+    if _IS_WINDOWS:
+        import msvcrt
+
+        handle.seek(0)  # type: ignore[attr-defined]
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, _LOCK_BYTES)  # type: ignore[attr-defined]
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
 
 
 class ProcessLock:
@@ -27,10 +67,10 @@ class ProcessLock:
             parent = os.path.dirname(self.path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            handle = open(self.path, "a+", encoding="utf-8")
+            handle = open(self.path, "a+b")
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
+                _acquire_native(handle)
+            except (ImportError, OSError, ValueError):
                 handle.close()
                 return False
             self._handle = handle
@@ -45,11 +85,11 @@ class ProcessLock:
         if handle is None:
             return
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
+            _release_native(handle)
+        except (ImportError, OSError, ValueError):
             pass
         try:
-            handle.close()
+            handle.close()  # type: ignore[attr-defined]
         except OSError:
             pass
 
@@ -65,8 +105,8 @@ class ProcessLock:
 def process_lock_available(path: str) -> bool:
     """Return whether a memebot process lock can be acquired right now.
 
-    A return value of False means either another instance holds the lock or the
-    lock state could not be established.  Both cases must fail closed.
+    False means either another instance holds the lock or lock state could not
+    be established. Both cases fail closed.
     """
     lock = ProcessLock(path)
     if not lock.acquire():
