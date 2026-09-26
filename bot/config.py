@@ -92,6 +92,9 @@ class Config:
     wallet_private_key: str = ""
     burner_wallet_pubkey: str = ""
     rpc_url: str = "https://api.mainnet-beta.solana.com"
+    confirmation_commitment: str = "confirmed"
+    confirmation_timeout_seconds: float = 30.0
+    confirmation_poll_interval_seconds: float = 1.0
 
     # Jupiter swap API. The legacy quote-api.jup.ag/v6 host was deprecated on
     # 2025-10-01; the current free tier is lite-api.jup.ag/swap/v1 (no key).
@@ -156,6 +159,9 @@ def load_config() -> Config:
         wallet_private_key=os.getenv("WALLET_PRIVATE_KEY", "").strip(),
         burner_wallet_pubkey=os.getenv("BURNER_WALLET_PUBKEY", "").strip(),
         rpc_url=os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com").strip(),
+        confirmation_commitment=os.getenv("CONFIRMATION_COMMITMENT", "confirmed").strip().lower(),
+        confirmation_timeout_seconds=_get_float("CONFIRMATION_TIMEOUT_SECONDS", 30.0),
+        confirmation_poll_interval_seconds=_get_float("CONFIRMATION_POLL_INTERVAL_SECONDS", 1.0),
         jupiter_base_url=os.getenv(
             "JUPITER_BASE_URL", "https://lite-api.jup.ag/swap/v1"
         ).strip().rstrip("/"),

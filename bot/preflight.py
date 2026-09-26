@@ -234,7 +234,10 @@ def run_preflight(
 
     try:
         executor = swap_executor_factory(cfg, jup=jupiter, session=session) if session is not None else swap_executor_factory(cfg, jup=jupiter)
-        accounting_ok = callable(getattr(executor, "swap", None))
+        accounting_ok = (
+            callable(getattr(executor, "swap", None))
+            and callable(getattr(executor, "_confirm_transaction", None))
+        )
     except Exception:
         accounting_ok = False
     add(_check(

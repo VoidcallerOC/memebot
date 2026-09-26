@@ -19,7 +19,9 @@ import requests
 
 from .alerts import Notifier
 from .config import Config, load_config
-from .jupiter import JupiterClient, SOL_MINT, USDC_MINT, SwapExecutor
+from .jupiter import (
+    JupiterClient, SOL_MINT, USDC_MINT, SwapExecutor, TransactionStatus,
+)
 from .preflight import run_preflight
 from .portfolio import Portfolio
 from .process_lock import ProcessLock
@@ -64,6 +66,7 @@ class TradingBot:
         self.strategy = build_strategy(cfg, self.session)
         self.notifier = Notifier(cfg, self.session)
         self._running = True
+        self._reconciliation_required = False
         # Restore any persisted positions / daily state before trading.
         load_state(cfg.state_file, self.portfolio, self.risk)
 
@@ -100,6 +103,16 @@ class TradingBot:
     # -- one iteration ------------------------------------------------------
 
     def _tick(self) -> None:
+        if self._reconciliation_required:
+            reconciliation = reconcile_wallet(
+                self.cfg, self.portfolio, self.session, self.notifier
+            )
+            if reconciliation is None or not reconciliation.clean:
+                log.error("trading halted: reconciliation required after unknown transaction")
+                self._running = False
+                return
+            self._reconciliation_required = False
+            return
         self._manage_positions()
         if self.risk.can_open_new_position(self.portfolio.open_count):
             self._seek_entry()
@@ -137,7 +150,23 @@ class TradingBot:
             )
             if not result.ok:
                 log.info("entry aborted for %s: %s", safety.symbol, result.error)
+                if self.cfg.is_armed and result.status in {
+                    TransactionStatus.SUBMITTED,
+                    TransactionStatus.TIMEOUT,
+                    TransactionStatus.UNKNOWN,
+                }:
+                    self._reconciliation_required = True
+                    log.error("live entry unresolved; new entries require reconciliation")
                 continue
+            if self.cfg.is_armed and result.status != TransactionStatus.CONFIRMED_SUCCESS:
+                log.error("live entry was not confirmed; no position recorded")
+                return
+            if self.cfg.is_armed and (
+                result.actual_in_amount is None or result.actual_out_amount is None
+            ):
+                self._reconciliation_required = True
+                log.error("confirmed live entry lacks actual fill data; no position recorded")
+                return
             self.portfolio.open(candidate.mint, safety.symbol,
                                 safety.price_usd, size_usd, tokens)
             self.notifier.buy(safety.symbol, size_usd, safety.price_usd, result.simulated)
