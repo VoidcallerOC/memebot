@@ -26,7 +26,7 @@ from typing import Optional
 
 import requests
 
-from .config import Config
+from .config import MAX_EXPERIMENT_USD, Config
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +100,20 @@ class SwapExecutor:
         self.session = session or requests.Session()
         self.jup = jup or JupiterClient(cfg, self.session)
 
-    def swap(self, input_mint: str, output_mint: str, amount: int) -> SwapResult:
+    def swap(
+        self, input_mint: str, output_mint: str, amount: int,
+        *, allocation_usd: Optional[float] = None,
+    ) -> SwapResult:
+        if self.cfg.is_armed and (
+            not isinstance(allocation_usd, (int, float))
+            or isinstance(allocation_usd, bool)
+            or allocation_usd <= 0
+            or allocation_usd > MAX_EXPERIMENT_USD
+        ):
+            return SwapResult(
+                ok=False, simulated=False, in_amount=amount, out_amount=0,
+                error=f"live allocation exceeds hard ${MAX_EXPERIMENT_USD:.2f} ceiling",
+            )
         quote = self.jup.quote(input_mint, output_mint, amount)
         if quote is None:
             return SwapResult(ok=False, simulated=not self.cfg.is_armed,
@@ -137,6 +150,12 @@ class SwapExecutor:
         try:
             keypair = self._load_keypair(Keypair)
             user_pubkey = str(keypair.pubkey())
+            if not self.cfg.burner_wallet_pubkey or user_pubkey != self.cfg.burner_wallet_pubkey:
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount,
+                    out_amount=out_amount,
+                    error="signer does not match BURNER_WALLET_PUBKEY",
+                )
 
             swap_resp = self.session.post(
                 self.jup.swap_url,

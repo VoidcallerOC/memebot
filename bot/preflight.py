@@ -15,15 +15,12 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from .config import Config, load_config
+from .config import MAX_EXPERIMENT_USD, Config, load_config
 from .jupiter import JupiterClient, SwapExecutor
 from .process_lock import process_lock_available
 from .reconcile import fetch_sol_balance, get_wallet_pubkey
 from .risk import RiskManager
 from .safety import SafetyScreener
-
-MAX_EXPERIMENT_USD = 20.0
-
 
 @dataclass(frozen=True)
 class Prerequisite:
@@ -99,6 +96,7 @@ def run_preflight(
     journal_path: Optional[str] = None,
     conflict_checker: Optional[Callable[[], bool]] = None,
     proposed_allocation_usd: Optional[float] = None,
+    process_lock_held: bool = False,
 ) -> PreflightResult:
     """Run all checks without changing ``cfg`` or performing a transaction.
 
@@ -251,7 +249,10 @@ def run_preflight(
         "journal directory is not writable" if not journal_ok else "",
     ), "JOURNAL_UNAVAILABLE")
 
-    if conflict_checker is None:
+    if process_lock_held:
+        conflict_ok = True
+        conflict_reason = ""
+    elif conflict_checker is None:
         try:
             conflict_ok = process_lock_available(cfg.process_lock_file)
             conflict_reason = (
