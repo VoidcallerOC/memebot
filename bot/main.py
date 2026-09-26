@@ -21,6 +21,7 @@ from .alerts import Notifier
 from .config import Config, load_config
 from .jupiter import JupiterClient, SOL_MINT, USDC_MINT, SwapExecutor
 from .portfolio import Portfolio
+from .process_lock import ProcessLock
 from .reconcile import reconcile_wallet
 from .risk import RiskManager
 from .safety import SafetyScreener
@@ -181,11 +182,18 @@ def main() -> int:
     except ValueError as exc:
         log.error("%s", exc)
         return 2
-    bot = TradingBot(cfg)
-    signal.signal(signal.SIGINT, bot.stop)
-    signal.signal(signal.SIGTERM, bot.stop)
-    bot.run()
-    return 0
+    process_lock = ProcessLock(cfg.process_lock_file)
+    if not process_lock.acquire():
+        log.error("another memebot instance is running or process lock is unavailable")
+        return 3
+    try:
+        bot = TradingBot(cfg)
+        signal.signal(signal.SIGINT, bot.stop)
+        signal.signal(signal.SIGTERM, bot.stop)
+        bot.run()
+        return 0
+    finally:
+        process_lock.release()
 
 
 if __name__ == "__main__":

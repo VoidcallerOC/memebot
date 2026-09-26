@@ -131,6 +131,7 @@ class Config:
 
     # Persistence
     state_file: str = "state.json"
+    process_lock_file: str = ".memebot.lock"
 
     @property
     def is_armed(self) -> bool:
@@ -178,6 +179,7 @@ def load_config() -> Config:
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
         state_file=os.getenv("STATE_FILE", "state.json").strip(),
+        process_lock_file=os.getenv("PROCESS_LOCK_FILE", ".memebot.lock").strip(),
     )
     _validate(cfg)
     return cfg

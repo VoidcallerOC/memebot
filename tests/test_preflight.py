@@ -3,6 +3,7 @@ import json
 
 from bot.config import Config
 from bot.preflight import MAX_EXPERIMENT_USD, run_preflight
+from bot.process_lock import ProcessLock, process_lock_available
 from bot.reconcile import fetch_sol_balance
 from bot.risk import RiskManager
 
@@ -177,6 +178,56 @@ def test_unwritable_journal_rejects(tmp_path):
 def test_conflicting_process_rejects(tmp_path):
     result = run(tmp_path, conflict_checker=lambda: True)
     assert "CONFLICTING_PROCESS" in result.reason_codes
+
+
+def test_no_conflicting_process_passes_with_default_detector(tmp_path):
+    lock_path = tmp_path / "memebot.lock"
+    result = run(tmp_path, cfg(process_lock_file=str(lock_path)), conflict_checker=None)
+    conflict = next(p for p in result.prerequisites if p.name == "conflicting_process")
+    assert conflict.passed
+
+
+def test_held_process_lock_fails_preflight(tmp_path):
+    lock_path = tmp_path / "memebot.lock"
+    holder = ProcessLock(str(lock_path))
+    assert holder.acquire()
+    try:
+        result = run(tmp_path, cfg(process_lock_file=str(lock_path)), conflict_checker=None)
+        conflict = next(p for p in result.prerequisites if p.name == "conflicting_process")
+        assert not conflict.passed
+        assert "CONFLICTING_PROCESS" in result.reason_codes
+    finally:
+        holder.release()
+
+
+def test_stale_lock_file_is_not_treated_as_conflict(tmp_path):
+    lock_path = tmp_path / "stale.lock"
+    lock_path.write_text("stale state that is not used for liveness")
+    assert process_lock_available(str(lock_path))
+
+
+def test_lock_state_failure_fails_closed(tmp_path):
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("blocker")
+    assert not process_lock_available(str(blocker / "memebot.lock"))
+    result = run(
+        tmp_path,
+        cfg(process_lock_file=str(blocker / "memebot.lock")),
+        conflict_checker=None,
+    )
+    assert "CONFLICTING_PROCESS" in result.reason_codes
+
+
+def test_process_lock_diagnostics_contain_no_wallet_secret(tmp_path, caplog):
+    lock_path = tmp_path / "memebot.lock"
+    holder = ProcessLock(str(lock_path))
+    assert holder.acquire()
+    try:
+        result = run(tmp_path, cfg(process_lock_file=str(lock_path)), conflict_checker=None)
+        rendered = json.dumps(result.to_dict()) + caplog.text
+        assert TEST_ONLY_SENTINEL not in rendered
+    finally:
+        holder.release()
 
 
 def test_failed_preflight_never_submits_transaction(tmp_path):
