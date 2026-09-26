@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 from .config import Config, load_config
 from .jupiter import JupiterClient, SwapExecutor
+from .process_lock import process_lock_available
 from .reconcile import fetch_sol_balance, get_wallet_pubkey
 from .risk import RiskManager
 from .safety import SafetyScreener
@@ -102,8 +103,8 @@ def run_preflight(
     """Run all checks without changing ``cfg`` or performing a transaction.
 
     ``conflict_checker`` follows the supported-detector convention: it returns
-    True when a conflicting live process is present.  If no supported detector
-    is supplied, the preflight fails closed as unverified.
+    True when a conflicting live process is present.  If omitted, the shared
+    OS-level process lock is probed; lock-access failures fail closed.
     """
     checks: list[Prerequisite] = []
     reasons: list[str] = []
@@ -251,8 +252,15 @@ def run_preflight(
     ), "JOURNAL_UNAVAILABLE")
 
     if conflict_checker is None:
-        conflict_ok = False
-        conflict_reason = "no supported conflicting-process detector is available"
+        try:
+            conflict_ok = process_lock_available(cfg.process_lock_file)
+            conflict_reason = (
+                "conflicting process detected or process lock unavailable"
+                if not conflict_ok else ""
+            )
+        except Exception:
+            conflict_ok = False
+            conflict_reason = "conflicting-process detector failed"
     else:
         try:
             conflict_present = bool(conflict_checker())
