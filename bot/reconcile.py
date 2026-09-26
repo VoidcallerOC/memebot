@@ -148,6 +148,31 @@ def fetch_onchain_balances(
     return balances
 
 
+def fetch_sol_balance(cfg: Config, pubkey: str, session=None) -> Optional[float]:
+    """Read the native SOL balance for ``pubkey`` through JSON-RPC.
+
+    This is deliberately read-only and returns SOL, not lamports. ``None``
+    means the balance could not be independently established.
+    """
+    if requests is None:
+        return None
+    session = session or requests.Session()
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getBalance", "params": [pubkey],
+    }
+    try:
+        resp = session.post(cfg.rpc_url, json=payload, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        value = (resp.json().get("result") or {}).get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) / 1_000_000_000.0
+    except Exception as exc:
+        log.warning("failed to fetch SOL balance: %s", exc)
+        return None
+
+
 def reconcile_wallet(cfg: Config, portfolio, session=None, notifier=None) -> Optional[ReconcileResult]:
     """Orchestrate a startup reconciliation. Returns None if it couldn't run
     (e.g. dry-run / no wallet / RPC down). Warns and alerts on mismatch."""

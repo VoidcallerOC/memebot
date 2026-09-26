@@ -86,6 +86,7 @@ class Config:
     # Safety
     live_trading: bool = False
     wallet_private_key: str = ""
+    burner_wallet_pubkey: str = ""
     rpc_url: str = "https://api.mainnet-beta.solana.com"
 
     # Jupiter swap API. The legacy quote-api.jup.ag/v6 host was deprecated on
@@ -148,6 +149,7 @@ def load_config() -> Config:
     cfg = Config(
         live_trading=_get_bool("LIVE_TRADING", False),
         wallet_private_key=os.getenv("WALLET_PRIVATE_KEY", "").strip(),
+        burner_wallet_pubkey=os.getenv("BURNER_WALLET_PUBKEY", "").strip(),
         rpc_url=os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com").strip(),
         jupiter_base_url=os.getenv(
             "JUPITER_BASE_URL", "https://lite-api.jup.ag/swap/v1"
