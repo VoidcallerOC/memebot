@@ -21,17 +21,16 @@ class Position:
     tokens: float                   # token units currently held
     ladder_filled: set[float] = field(default_factory=set)
     realized_pnl: float = 0.0       # banked PnL from partial sells
+    token_decimals: int | None = None
+    entry_signature: str | None = None
+    actual_in_amount: int | None = None
+    actual_out_amount: int | None = None
+    fee_lamports: int | None = None
 
     @property
     def original_tokens(self) -> float:
-        # entry_price is fixed at entry, so original token count is recoverable
-        # from the initial cost basis; we store remaining tokens and derive
-        # fractions against the original via the caller's bookkeeping.
         return self._original_tokens
 
-    # When restored from disk we need the original token count preserved so
-    # take-profit fractions stay anchored to the entry size. It can be passed
-    # explicitly; otherwise it defaults to the current token balance.
     original_tokens_override: float | None = None
 
     def __post_init__(self):
@@ -50,6 +49,11 @@ class Position:
             "ladder_filled": sorted(self.ladder_filled),
             "realized_pnl": self.realized_pnl,
             "original_tokens": self._original_tokens,
+            "token_decimals": self.token_decimals,
+            "entry_signature": self.entry_signature,
+            "actual_in_amount": self.actual_in_amount,
+            "actual_out_amount": self.actual_out_amount,
+            "fee_lamports": self.fee_lamports,
         }
 
     @classmethod
@@ -63,6 +67,11 @@ class Position:
             ladder_filled=set(d.get("ladder_filled", [])),
             realized_pnl=d.get("realized_pnl", 0.0),
             original_tokens_override=d.get("original_tokens"),
+            token_decimals=d.get("token_decimals"),
+            entry_signature=d.get("entry_signature"),
+            actual_in_amount=d.get("actual_in_amount"),
+            actual_out_amount=d.get("actual_out_amount"),
+            fee_lamports=d.get("fee_lamports"),
         )
 
 
@@ -70,11 +79,14 @@ class Portfolio:
     def __init__(self):
         self.positions: dict[str, Position] = {}
         self.realized_pnl: float = 0.0
+        self.pending_intents: list[dict] = []
 
     def open(self, mint: str, symbol: str, entry_price: float,
-             size_usd: float, tokens: float) -> Position:
-        pos = Position(mint=mint, symbol=symbol, entry_price=entry_price,
-                       size_usd=size_usd, tokens=tokens)
+             size_usd: float, tokens: float, **fill) -> Position:
+        pos = Position(
+            mint=mint, symbol=symbol, entry_price=entry_price,
+            size_usd=size_usd, tokens=tokens, **fill,
+        )
         self.positions[mint] = pos
         log.info("OPEN  %s: $%.2f @ %.8f (%.2f tokens)", symbol, size_usd, entry_price, tokens)
         return pos
@@ -88,8 +100,6 @@ class Portfolio:
 
     def sell_fraction(self, mint: str, fraction: float, current_price: float,
                       reason: str) -> float:
-        """Sell ``fraction`` of the ORIGINAL position at ``current_price``.
-        Returns realized PnL from this sell. Closes the position if emptied."""
         pos = self.positions[mint]
         tokens_to_sell = min(pos.original_tokens * fraction, pos.tokens)
         if tokens_to_sell <= 0:
@@ -119,6 +129,7 @@ class Portfolio:
         return {
             "realized_pnl": self.realized_pnl,
             "positions": [p.to_dict() for p in self.positions.values()],
+            "pending_intents": list(self.pending_intents),
         }
 
     def load_dict(self, d: dict) -> None:
@@ -127,6 +138,7 @@ class Portfolio:
         for pd in d.get("positions", []):
             pos = Position.from_dict(pd)
             self.positions[pos.mint] = pos
+        self.pending_intents = list(d.get("pending_intents") or [])
 
     def unrealized_pnl(self, prices: dict[str, float]) -> float:
         total = 0.0
