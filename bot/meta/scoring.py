@@ -48,9 +48,10 @@ SOCIAL_CONTRIBUTOR_RATIO = 0.10
 BUY_PRESSURE_EXTREME = 0.85
 BUY_PRESSURE_MIN_TXNS = 50
 
-# Absolute 1h volume (USD) below which a 5m/1h ratio is not scored: with
-# 5m == 1h volume the ratio is 12 whatever the size, so $0.05 would read as
-# EXTREME_ACCELERATION. Eligibility only; the formula and states are unchanged.
+# Absolute long-window volume (USD) below which a rate ratio is not scored:
+# with 5m == 1h volume the ratio is 12 whatever the size, so $0.05 would read
+# as EXTREME_ACCELERATION. Applied to the 1h live window and the reconstructed
+# 4h window alike. Eligibility only; the formula and states are unchanged.
 MIN_VOLUME_FLOOR_USD = 500.0
 DUST_VOLUME = "DUST_VOLUME"
 
@@ -126,7 +127,8 @@ def score_historical_trading(snap: TokenSnapshot) -> Score:
         return unverified("no reconstructed 4h history for this token", long_window=HISTORY_LONG)
     short = _pick(snap.market, LIVE_SHORT, lambda w: w.volume_usd)
     score = _accel_score(short, window.volume_usd, LIVE_SHORT, HISTORY_LONG, "historical_trading_velocity",
-                         "HISTORICAL_VOLUME", "5m volume missing for historical comparison")
+                         "HISTORICAL_VOLUME", "5m volume missing for historical comparison",
+                         volume_floor=MIN_VOLUME_FLOOR_USD)
     if score.verified:
         score.details["family"] = "historical"
         score.details["history_source"] = window.source
