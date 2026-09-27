@@ -9,6 +9,12 @@ from typing import Any, Optional
 
 import requests
 
+from .chain import (
+    extract_fill,
+    get_confirmed_transaction,
+    get_signature_status,
+    send_raw_transaction,
+)
 from .config import MAX_EXPERIMENT_USD, Config
 
 log = logging.getLogger(__name__)
@@ -34,10 +40,12 @@ class SwapResult:
     tx_signature: Optional[str] = None
     error: Optional[str] = None
     status: TransactionStatus = TransactionStatus.UNKNOWN
-    # Phase 3 supplies these from confirmed chain data; Phase 2 never invents them.
     actual_in_amount: Optional[int] = None
     actual_out_amount: Optional[int] = None
     fee_lamports: Optional[int] = None
+    in_decimals: Optional[int] = None
+    out_decimals: Optional[int] = None
+    fill_source: Optional[str] = None
 
 
 def _status_from_rpc(value: Any, commitment: str) -> Optional[TransactionStatus]:
@@ -124,14 +132,22 @@ class SwapExecutor:
                 ok=True, simulated=True, in_amount=amount, out_amount=out_amount,
                 tx_signature="DRYRUN", status=TransactionStatus.CONFIRMED_SUCCESS,
             )
-        return self._execute_live(quote, amount, out_amount)
+        return self._execute_live(
+            quote, amount, out_amount,
+            input_mint=input_mint, output_mint=output_mint,
+        )
 
-    def _execute_live(self, quote: dict, amount: int, out_amount: int) -> SwapResult:
-        """Build, sign, submit, and explicitly resolve a live transaction."""
+    def _execute_live(
+        self,
+        quote: dict,
+        amount: int,
+        out_amount: int,
+        input_mint: Optional[str] = None,
+        output_mint: Optional[str] = None,
+    ) -> SwapResult:
         try:
             from solders.keypair import Keypair
             from solders.transaction import VersionedTransaction
-            from solana.rpc.api import Client
         except ImportError:
             return SwapResult(
                 ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
@@ -162,18 +178,26 @@ class SwapExecutor:
             raw = __import__("base64").b64decode(swap_resp.json()["swapTransaction"])
             tx = VersionedTransaction.from_bytes(raw)
             signed = VersionedTransaction(tx.message, [keypair])
-            client = Client(self.cfg.rpc_url)
-            signature = str(client.send_raw_transaction(bytes(signed)).value)
+            signature = send_raw_transaction(self.session, self.cfg.rpc_url, bytes(signed))
             log.info("LIVE swap submitted: %s", signature)
-            status = self._confirm_transaction(client, signature)
-            if status == TransactionStatus.CONFIRMED_SUCCESS:
+            status = self._confirm_transaction(self.session, signature)
+            if status != TransactionStatus.CONFIRMED_SUCCESS:
                 return SwapResult(
-                    ok=True, simulated=False, in_amount=amount, out_amount=out_amount,
-                    tx_signature=signature, status=status,
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    tx_signature=signature, status=status, error=f"transaction {status.value}",
                 )
+            fill = self._extract_confirmed_fill(
+                signature, user_pubkey, input_mint, output_mint,
+            )
             return SwapResult(
-                ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
-                tx_signature=signature, status=status, error=f"transaction {status.value}",
+                ok=True, simulated=False, in_amount=amount, out_amount=out_amount,
+                tx_signature=signature, status=status,
+                actual_in_amount=fill.actual_in_amount if fill else None,
+                actual_out_amount=fill.actual_out_amount if fill else None,
+                fee_lamports=fill.fee_lamports if fill else None,
+                in_decimals=fill.in_decimals if fill else None,
+                out_decimals=fill.out_decimals if fill else None,
+                fill_source="getTransaction" if fill and fill.complete else None,
             )
         except Exception as exc:
             log.error("LIVE swap failed: %s", exc)
@@ -182,18 +206,39 @@ class SwapExecutor:
                 status=TransactionStatus.UNKNOWN, error=str(exc),
             )
 
+    def _extract_confirmed_fill(
+        self,
+        signature: str,
+        owner: str,
+        input_mint: Optional[str],
+        output_mint: Optional[str],
+    ):
+        if not input_mint or not output_mint:
+            return None
+        try:
+            tx = get_confirmed_transaction(
+                self.session, self.cfg.rpc_url, signature, self.cfg.confirmation_commitment,
+            )
+        except Exception as exc:
+            log.warning("getTransaction failed for %s: %s", signature, exc)
+            return None
+        if not tx:
+            return None
+        return extract_fill(tx, owner, input_mint, output_mint)
+
     def _confirm_transaction(self, client: Any, signature: str) -> TransactionStatus:
-        """Poll signature status until the configured commitment resolves."""
         deadline = time.monotonic() + max(self.cfg.confirmation_timeout_seconds, 0.0)
         while True:
             try:
-                response = client.get_signature_statuses([signature])
-                value = getattr(response, "value", None)
-                if value is None and isinstance(response, dict):
-                    value = (response.get("result") or {}).get("value")
-                status = _status_from_rpc(
-                    value[0] if value else None, self.cfg.confirmation_commitment
-                )
+                if hasattr(client, "get_signature_statuses"):
+                    response = client.get_signature_statuses([signature])
+                    value = getattr(response, "value", None)
+                    if value is None and isinstance(response, dict):
+                        value = (response.get("result") or {}).get("value")
+                    raw = value[0] if value else None
+                else:
+                    raw = get_signature_status(client, self.cfg.rpc_url, signature)
+                status = _status_from_rpc(raw, self.cfg.confirmation_commitment)
                 if status is not None:
                     return status
             except Exception as exc:
@@ -204,7 +249,6 @@ class SwapExecutor:
             time.sleep(max(self.cfg.confirmation_poll_interval_seconds, 0.01))
 
     def _load_keypair(self, Keypair):
-        """Accept either a base58 secret key or a JSON byte-array."""
         key = self.cfg.wallet_private_key.strip()
         if key.startswith("["):
             import json
