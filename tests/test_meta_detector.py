@@ -69,3 +69,60 @@ def test_creator_concentration():
     signal = score_snapshot(snap(creator_pct=62.0, top_holder_pct=62.0))
     assert signal.creator_concentration.status == OK
     assert "HIGH_CREATOR_CONCENTRATION" in signal.reason_codes
+
+
+# -- F1: dust-volume floor ----------------------------------------------------
+
+from bot.meta.scoring import DUST_VOLUME, MIN_VOLUME_FLOOR_USD
+
+
+def _volume_snap(vol_5m: float, vol_1h: float) -> TokenSnapshot:
+    return snap(market={
+        "5m": MarketWindow(volume_usd=vol_5m, source="dexscreener"),
+        "1h": MarketWindow(volume_usd=vol_1h, source="dexscreener"),
+    })
+
+
+def test_dust_volume_is_not_extreme_acceleration():
+    # Run C shape: 5m == 1h volume gives ratio 12 regardless of size.
+    signal = score_snapshot(_volume_snap(0.05, 0.05))
+    assert signal.trading_velocity.status == UNVERIFIED
+    assert signal.trading_velocity.value is None
+    assert signal.trading_velocity.details.get("state") != "EXTREME_ACCELERATION"
+    assert "VOLUME_EXTREME" not in signal.reason_codes
+
+
+def test_volume_below_floor_is_unverified_with_dust_code():
+    signal = score_snapshot(_volume_snap(50.0, 100.0))
+    assert signal.trading_velocity.status == UNVERIFIED
+    assert DUST_VOLUME in signal.trading_velocity.reason_codes
+    assert DUST_VOLUME in signal.reason_codes
+    assert signal.trading_velocity.details["volume_floor"] == MIN_VOLUME_FLOOR_USD
+
+
+def test_normal_volume_formula_unchanged():
+    extreme = score_snapshot(_volume_snap(9_620.0, 9_620.0)).trading_velocity
+    assert extreme.status == OK
+    assert extreme.value == 100.0
+    assert extreme.details["state"] == "EXTREME_ACCELERATION"
+    assert extreme.details["acceleration"] == 12.0
+    # 5m=1000 over 5 min vs 1h=6000 over 60 min -> ratio 2.0 -> 50 + 25*log2(2) = 75
+    doubled = score_snapshot(_volume_snap(1_000.0, 6_000.0)).trading_velocity
+    assert doubled.status == OK
+    assert abs(doubled.value - 75.0) < 1e-9
+    assert doubled.details["state"] == "ACCELERATING"
+    assert DUST_VOLUME not in doubled.reason_codes
+
+
+def test_volume_exactly_at_floor_is_scored():
+    at_floor = score_snapshot(_volume_snap(MIN_VOLUME_FLOOR_USD, MIN_VOLUME_FLOOR_USD)).trading_velocity
+    assert at_floor.status == OK
+    assert DUST_VOLUME not in at_floor.reason_codes
+    assert at_floor.details["long_value"] == MIN_VOLUME_FLOOR_USD
+
+
+def test_volume_just_below_floor_is_dust():
+    just_below = MIN_VOLUME_FLOOR_USD - 0.01
+    score = score_snapshot(_volume_snap(just_below, just_below)).trading_velocity
+    assert score.status == UNVERIFIED
+    assert DUST_VOLUME in score.reason_codes

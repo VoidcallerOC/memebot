@@ -48,6 +48,12 @@ SOCIAL_CONTRIBUTOR_RATIO = 0.10
 BUY_PRESSURE_EXTREME = 0.85
 BUY_PRESSURE_MIN_TXNS = 50
 
+# Absolute 1h volume (USD) below which a 5m/1h ratio is not scored: with
+# 5m == 1h volume the ratio is 12 whatever the size, so $0.05 would read as
+# EXTREME_ACCELERATION. Eligibility only; the formula and states are unchanged.
+MIN_VOLUME_FLOOR_USD = 500.0
+DUST_VOLUME = "DUST_VOLUME"
+
 ACCEL_CODES = {
     "EXTREME_ACCELERATION": "EXTREME",
     "ACCELERATING": "ACCELERATING",
@@ -57,9 +63,15 @@ ACCEL_CODES = {
 
 def _accel_score(short_value: Optional[float], long_value: Optional[float],
                  short_window: str, long_window: str, label: str,
-                 prefix: str, missing: str) -> Score:
+                 prefix: str, missing: str, volume_floor: Optional[float] = None) -> Score:
     if short_value is None or long_value is None:
         return unverified(missing, short_window=short_window, long_window=long_window)
+    if volume_floor is not None and long_value < volume_floor:
+        score = unverified(f"{label}: {long_window} volume below dust floor",
+                           short_window=short_window, long_window=long_window,
+                           short_value=short_value, long_value=long_value, volume_floor=volume_floor)
+        score.reason_codes.append(DUST_VOLUME)
+        return score
     acc = acceleration(short_value, short_window, long_value, long_window)
     if acc is None:
         return unverified(f"{label}: both windows are zero", short_window=short_window, long_window=long_window)
@@ -95,7 +107,8 @@ def score_trading(snap: TokenSnapshot) -> Score:
     short = _pick(snap.market, LIVE_SHORT, lambda w: w.volume_usd)
     long = _pick(snap.market, LIVE_LONG, lambda w: w.volume_usd)
     score = _accel_score(short, long, LIVE_SHORT, LIVE_LONG, "trading_velocity",
-                         "VOLUME", "market provider did not supply both 5m and 1h volume")
+                         "VOLUME", "market provider did not supply both 5m and 1h volume",
+                         volume_floor=MIN_VOLUME_FLOOR_USD)
     if score.verified:
         pressure = buy_pressure(snap.market.get(LIVE_SHORT))
         if pressure is not None:
