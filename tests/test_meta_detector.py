@@ -126,3 +126,51 @@ def test_volume_just_below_floor_is_dust():
     score = score_snapshot(_volume_snap(just_below, just_below)).trading_velocity
     assert score.status == UNVERIFIED
     assert DUST_VOLUME in score.reason_codes
+
+
+# -- F1 follow-up: same floor on the reconstructed 4h comparison --------------
+
+def _history_snap(vol_5m: float, vol_4h: float) -> TokenSnapshot:
+    return snap(market={
+        "5m": MarketWindow(volume_usd=vol_5m, source="dexscreener"),
+        "1h": MarketWindow(volume_usd=vol_5m, source="dexscreener"),
+        "4h": MarketWindow(volume_usd=vol_4h, source="history_reconstructed:test"),
+    })
+
+
+def test_historical_dust_volume_is_not_extreme():
+    hist = score_snapshot(_history_snap(0.05, 0.05)).historical_trading_velocity
+    assert hist.status == UNVERIFIED
+    assert hist.value is None
+    assert DUST_VOLUME in hist.reason_codes
+    assert hist.details["volume_floor"] == MIN_VOLUME_FLOOR_USD
+    assert hist.details["long_window"] == "4h"
+
+
+def test_historical_formula_unchanged_above_floor():
+    # 5m=1000 over 5 min vs 4h=48000 over 240 min -> ratio 1.0 -> score 50
+    hist = score_snapshot(_history_snap(1_000.0, 48_000.0)).historical_trading_velocity
+    assert hist.status == OK
+    assert abs(hist.value - 50.0) < 1e-9
+    assert hist.details["state"] == "NORMAL"
+    assert hist.details["family"] == "historical"
+    assert DUST_VOLUME not in hist.reason_codes
+
+
+def test_historical_floor_boundary():
+    at_floor = score_snapshot(_history_snap(MIN_VOLUME_FLOOR_USD, MIN_VOLUME_FLOOR_USD)).historical_trading_velocity
+    assert at_floor.status == OK
+    below = score_snapshot(_history_snap(MIN_VOLUME_FLOOR_USD - 0.01, MIN_VOLUME_FLOOR_USD - 0.01)).historical_trading_velocity
+    assert below.status == UNVERIFIED
+    assert DUST_VOLUME in below.reason_codes
+
+
+def test_missing_history_still_unverified_without_dust_code():
+    signal = score_snapshot(snap(market={
+        "5m": MarketWindow(volume_usd=10.0, source="dexscreener"),
+        "1h": MarketWindow(volume_usd=10.0, source="dexscreener"),
+    }))
+    hist = signal.historical_trading_velocity
+    assert hist.status == UNVERIFIED
+    assert DUST_VOLUME not in hist.reason_codes
+    assert hist.details["reason"] == "no reconstructed 4h history for this token"
