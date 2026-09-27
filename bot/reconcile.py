@@ -23,21 +23,34 @@ try:
 except ImportError:  # reconciliation is best-effort
     requests = None  # type: ignore[assignment]
 
+from .chain import (
+    SPL_TOKEN_PROGRAM,
+    TOKEN_2022_PROGRAM,
+    fetch_wallet_token_balances,
+)
 from .config import Config
 
 log = logging.getLogger(__name__)
 
 HTTP_TIMEOUT = 10
-SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+__all__ = [
+    "ReconcileResult",
+    "SPL_TOKEN_PROGRAM",
+    "TOKEN_2022_PROGRAM",
+    "compare_holdings",
+    "fetch_onchain_balances",
+    "fetch_sol_balance",
+    "fetch_wallet_token_balances",
+    "get_wallet_pubkey",
+    "reconcile_wallet",
+]
 
 
 @dataclass
 class ReconcileResult:
-    # bot thinks it holds these but the chain shows ~nothing (phantom)
     phantom: list[str] = field(default_factory=list)
-    # chain holds these but the bot isn't tracking them (untracked)
     untracked: list[str] = field(default_factory=list)
-    # tracked AND on-chain, but amounts differ beyond tolerance
     drifted: list[tuple[str, float, float]] = field(default_factory=list)
 
     @property
@@ -63,12 +76,6 @@ def compare_holdings(
     rel_tol: float = 0.02,
     dust: float = 1e-9,
 ) -> ReconcileResult:
-    """Compare tracked token balances against on-chain balances.
-
-    ``rel_tol`` is the allowed relative difference before a position is flagged
-    as drifted (default 2%, to tolerate decimals/rounding). ``dust`` treats
-    near-zero balances as zero.
-    """
     result = ReconcileResult()
     all_mints = set(tracked) | set(onchain)
     for mint in sorted(all_mints):
@@ -88,8 +95,6 @@ def compare_holdings(
 
 
 def get_wallet_pubkey(cfg: Config) -> Optional[str]:
-    """Derive the wallet public key from the configured private key, or None
-    if not armed / the crypto libs aren't installed."""
     if not cfg.wallet_private_key:
         return None
     try:
@@ -114,46 +119,13 @@ def get_wallet_pubkey(cfg: Config) -> Optional[str]:
 def fetch_onchain_balances(
     cfg: Config, pubkey: str, session=None
 ) -> Optional[dict[str, float]]:
-    """Fetch SPL token balances for ``pubkey`` via RPC. Returns mint -> uiAmount
-    or None on failure."""
-    if requests is None:
+    snapshot = fetch_wallet_token_balances(cfg, pubkey, session)
+    if snapshot is None:
         return None
-    session = session or requests.Session()
-    payload = {
-        "jsonrpc": "2.0", "id": 1,
-        "method": "getTokenAccountsByOwner",
-        "params": [
-            pubkey,
-            {"programId": SPL_TOKEN_PROGRAM},
-            {"encoding": "jsonParsed"},
-        ],
-    }
-    try:
-        resp = session.post(cfg.rpc_url, json=payload, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        accounts = (resp.json().get("result") or {}).get("value") or []
-    except Exception as exc:
-        log.warning("failed to fetch on-chain balances: %s", exc)
-        return None
-
-    balances: dict[str, float] = {}
-    for acct in accounts:
-        try:
-            info = acct["account"]["data"]["parsed"]["info"]
-            mint = info["mint"]
-            ui = float(info["tokenAmount"]["uiAmount"] or 0)
-            balances[mint] = balances.get(mint, 0.0) + ui
-        except (KeyError, TypeError, ValueError):
-            continue
-    return balances
+    return snapshot.amounts
 
 
 def fetch_sol_balance(cfg: Config, pubkey: str, session=None) -> Optional[float]:
-    """Read the native SOL balance for ``pubkey`` through JSON-RPC.
-
-    This is deliberately read-only and returns SOL, not lamports. ``None``
-    means the balance could not be independently established.
-    """
     if requests is None:
         return None
     session = session or requests.Session()
@@ -174,8 +146,6 @@ def fetch_sol_balance(cfg: Config, pubkey: str, session=None) -> Optional[float]
 
 
 def reconcile_wallet(cfg: Config, portfolio, session=None, notifier=None) -> Optional[ReconcileResult]:
-    """Orchestrate a startup reconciliation. Returns None if it couldn't run
-    (e.g. dry-run / no wallet / RPC down). Warns and alerts on mismatch."""
     pubkey = get_wallet_pubkey(cfg)
     if pubkey is None:
         log.debug("reconciliation skipped (no wallet key available)")
