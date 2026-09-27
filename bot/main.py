@@ -20,6 +20,7 @@ import requests
 from .alerts import Notifier
 from .config import Config, load_config
 from .jupiter import JupiterClient, SOL_MINT, USDC_MINT, SwapExecutor
+from .preflight import run_preflight
 from .portfolio import Portfolio
 from .process_lock import ProcessLock
 from .reconcile import reconcile_wallet
@@ -78,7 +79,12 @@ class TradingBot:
         # When armed, verify our tracked positions match the actual wallet
         # before we start trading on a possibly-stale picture.
         if self.cfg.is_armed:
-            reconcile_wallet(self.cfg, self.portfolio, self.session, self.notifier)
+            reconciliation = reconcile_wallet(
+                self.cfg, self.portfolio, self.session, self.notifier
+            )
+            if reconciliation is None or not reconciliation.clean:
+                log.error("live startup blocked: wallet reconciliation is not clean")
+                return
         while self._running:
             try:
                 self._tick()
@@ -126,7 +132,8 @@ class TradingBot:
             # paper path we record USD cost basis directly and simulate fill.
             tokens = size_usd / safety.price_usd
             result = self.executor.swap(
-                SOL_MINT, candidate.mint, self._usd_to_lamports(size_usd)
+                SOL_MINT, candidate.mint, self._usd_to_lamports(size_usd),
+                allocation_usd=size_usd,
             )
             if not result.ok:
                 log.info("entry aborted for %s: %s", safety.symbol, result.error)
@@ -187,6 +194,14 @@ def main() -> int:
         log.error("another memebot instance is running or process lock is unavailable")
         return 3
     try:
+        if cfg.is_armed:
+            preflight = run_preflight(cfg, process_lock_held=True)
+            if not preflight.eligible:
+                log.error(
+                    "live startup blocked by preflight: %s",
+                    ", ".join(preflight.reason_codes),
+                )
+                return 4
         bot = TradingBot(cfg)
         signal.signal(signal.SIGINT, bot.stop)
         signal.signal(signal.SIGTERM, bot.stop)

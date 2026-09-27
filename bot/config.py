@@ -21,6 +21,10 @@ except Exception:  # pragma: no cover - dotenv is a convenience only
 
 log = logging.getLogger(__name__)
 
+# One authoritative hard ceiling for the controlled live experiment. This is
+# intentionally independent of BANKROLL_USD and strategy configuration.
+MAX_EXPERIMENT_USD = 20.0
+
 
 def _get_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
