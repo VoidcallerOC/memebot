@@ -66,16 +66,33 @@ def test_confirmation_timeout_is_explicit():
 
 
 class FakeResponse:
+    def __init__(self, payload=None):
+        self._payload = payload if payload is not None else {"swapTransaction": "AA=="}
+
     def raise_for_status(self):
         pass
 
     def json(self):
-        return {"swapTransaction": "AA=="}
+        return self._payload
 
 
 class FakeSession:
-    def post(self, *_args, **_kwargs):
-        return FakeResponse()
+    def __init__(self, status=None, tx=None, status_error=None):
+        self.status = status
+        self.tx = tx
+        self.status_error = status_error
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        method = (json or {}).get("method")
+        if method == "sendTransaction":
+            return FakeResponse({"result": "sig"})
+        if method == "getSignatureStatuses":
+            if self.status_error:
+                raise self.status_error
+            return FakeResponse({"result": {"value": [self.status]}})
+        if method == "getTransaction":
+            return FakeResponse({"result": self.tx})
+        return FakeResponse({"swapTransaction": "AA=="})
 
 
 def install_fake_live_modules(monkeypatch, status):
@@ -129,9 +146,12 @@ def install_fake_live_modules(monkeypatch, status):
         monkeypatch.setitem(sys.modules, name, module)
 
 
-def run_live_execution(monkeypatch, status):
+def run_live_execution(monkeypatch, status, tx=None):
+    status_error = status if isinstance(status, Exception) else None
+    status_value = None if isinstance(status, Exception) else status
     install_fake_live_modules(monkeypatch, status)
-    executor = SwapExecutor(cfg(), jup=JupiterClient(cfg()), session=FakeSession())
+    session = FakeSession(status=status_value, tx=tx, status_error=status_error)
+    executor = SwapExecutor(cfg(), jup=JupiterClient(cfg()), session=session)
     executor._load_keypair = lambda _keypair: types.SimpleNamespace(pubkey=lambda: "PUBKEY")
     return executor._execute_live({"outAmount": "10"}, 5, 10)
 

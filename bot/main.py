@@ -7,7 +7,6 @@ Each tick:
 
 Run with: ``python -m bot.main``
 """
-
 from __future__ import annotations
 
 import logging
@@ -43,9 +42,7 @@ def _setup_logging() -> None:
 
 
 def _price_usd(jup: JupiterClient, mint: str) -> float | None:
-    """Price one token in USDC via a small Jupiter quote (1 token, 6dp est).
-    Returns None if there's no route."""
-    quote = jup.quote(mint, USDC_MINT, 1_000_000)  # ~1 token at 6 decimals
+    quote = jup.quote(mint, USDC_MINT, 1_000_000)
     if not quote:
         return None
     try:
@@ -67,7 +64,6 @@ class TradingBot:
         self.notifier = Notifier(cfg, self.session)
         self._running = True
         self._reconciliation_required = False
-        # Restore any persisted positions / daily state before trading.
         load_state(cfg.state_file, self.portfolio, self.risk)
 
     def stop(self, *_):
@@ -79,8 +75,6 @@ class TradingBot:
         mode = "LIVE — REAL MONEY" if self.cfg.is_armed else "DRY-RUN"
         if self.notifier.enabled:
             self.notifier.startup(mode)
-        # When armed, verify our tracked positions match the actual wallet
-        # before we start trading on a possibly-stale picture.
         if self.cfg.is_armed:
             reconciliation = reconcile_wallet(
                 self.cfg, self.portfolio, self.session, self.notifier
@@ -91,7 +85,7 @@ class TradingBot:
         while self._running:
             try:
                 self._tick()
-            except Exception as exc:  # never let one bad tick kill the bot
+            except Exception as exc:
                 log.exception("tick error: %s", exc)
             for _ in range(self.cfg.poll_interval_seconds):
                 if not self._running:
@@ -100,9 +94,12 @@ class TradingBot:
         self._save()
         self._summary()
 
-    # -- one iteration ------------------------------------------------------
-
     def _tick(self) -> None:
+        if any(
+            intent.get("status") in {"pending", "unresolved", "blocked"}
+            for intent in getattr(self.portfolio, "pending_intents", [])
+        ):
+            self._reconciliation_required = True
         if self._reconciliation_required:
             reconciliation = reconcile_wallet(
                 self.cfg, self.portfolio, self.session, self.notifier
@@ -122,7 +119,6 @@ class TradingBot:
             pos = self.portfolio.positions[mint]
             price = _price_usd(self.jup, mint)
             if price is None:
-                # Can't price it = possible rug/liquidity pull. Try to bail.
                 log.warning("%s: no price/route — attempting emergency exit", pos.symbol)
                 self._sell(mint, 1.0, price or 0.0, "no_route_exit")
                 continue
@@ -141,8 +137,6 @@ class TradingBot:
                 continue
 
             size_usd = self.risk.position_size_usd()
-            # Buy with SOL; size in lamports requires SOL price, but for the
-            # paper path we record USD cost basis directly and simulate fill.
             tokens = size_usd / safety.price_usd
             result = self.executor.swap(
                 SOL_MINT, candidate.mint, self._usd_to_lamports(size_usd),
@@ -167,14 +161,39 @@ class TradingBot:
                 self._reconciliation_required = True
                 log.error("confirmed live entry lacks actual fill data; no position recorded")
                 return
-            self.portfolio.open(candidate.mint, safety.symbol,
-                                safety.price_usd, size_usd, tokens)
-            self.notifier.buy(safety.symbol, size_usd, safety.price_usd, result.simulated)
+            if self.cfg.is_armed:
+                decimals = result.out_decimals if result.out_decimals is not None else 6
+                tokens = result.actual_out_amount / (10 ** decimals)
+                if tokens <= 0:
+                    self._reconciliation_required = True
+                    log.error("confirmed live entry produced a zero fill")
+                    return
+                entry_price = size_usd / tokens
+                self.portfolio.open(
+                    candidate.mint, safety.symbol, entry_price, size_usd, tokens,
+                    token_decimals=result.out_decimals,
+                    entry_signature=result.tx_signature,
+                    actual_in_amount=result.actual_in_amount,
+                    actual_out_amount=result.actual_out_amount,
+                    fee_lamports=result.fee_lamports,
+                )
+            else:
+                self.portfolio.open(
+                    candidate.mint, safety.symbol, safety.price_usd, size_usd, tokens,
+                )
+            opened = self.portfolio.positions[candidate.mint]
+            self.notifier.buy(safety.symbol, size_usd, opened.entry_price, result.simulated)
             self._save()
-            return  # one entry per tick keeps things calm
+            return
 
     def _sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
-        symbol = self.portfolio.positions[mint].symbol if mint in self.portfolio.positions else mint[:6]
+        if mint not in self.portfolio.positions:
+            return
+        pos = self.portfolio.positions[mint]
+        symbol = pos.symbol
+        if self.cfg.is_armed:
+            if not self._settle_live_sell(pos, fraction, price, reason):
+                return
         was_halted = self.risk.trading_halted()
         pnl = self.portfolio.sell_fraction(mint, fraction, price, reason)
         self.risk.record_realized_pnl(pnl)
@@ -183,14 +202,61 @@ class TradingBot:
             self.notifier.halt(-self.risk.realized_pnl_today)
         self._save()
 
+    def _settle_live_sell(self, pos, fraction: float, price: float, reason: str) -> bool:
+        tokens_to_sell = min(pos.original_tokens * fraction, pos.tokens)
+        decimals = pos.token_decimals
+        intent = {
+            "mint": pos.mint,
+            "fraction": fraction,
+            "reason": reason,
+            "requested_price": price,
+            "status": "pending",
+            "tx_signature": None,
+        }
+        self.portfolio.pending_intents.append(intent)
+        self._save()
+        if decimals is None or tokens_to_sell <= 0:
+            intent["status"] = "blocked"
+            self._reconciliation_required = True
+            log.error("live sell fail-closed for %s: missing decimals or size", pos.symbol)
+            self._save()
+            return False
+        raw_amount = int(tokens_to_sell * (10 ** decimals))
+        if raw_amount <= 0:
+            intent["status"] = "blocked"
+            self._reconciliation_required = True
+            self._save()
+            return False
+        result = self.executor.swap(
+            pos.mint, SOL_MINT, raw_amount,
+            allocation_usd=min(tokens_to_sell * price, self.cfg.max_position_usd()),
+        )
+        intent["tx_signature"] = result.tx_signature
+        if not result.ok or result.status != TransactionStatus.CONFIRMED_SUCCESS:
+            intent["status"] = "unresolved"
+            if result.status in {
+                TransactionStatus.SUBMITTED,
+                TransactionStatus.TIMEOUT,
+                TransactionStatus.UNKNOWN,
+            }:
+                self._reconciliation_required = True
+            log.error("live sell fail-closed for %s: %s", pos.symbol, result.error or result.status)
+            self._save()
+            return False
+        if result.actual_in_amount is None or result.actual_out_amount is None:
+            intent["status"] = "unresolved"
+            self._reconciliation_required = True
+            log.error("live sell confirmed without fill data for %s", pos.symbol)
+            self._save()
+            return False
+        intent["status"] = "settled"
+        self._save()
+        return True
+
     def _save(self) -> None:
         save_state(self.cfg.state_file, self.portfolio, self.risk)
 
-    # -- helpers ------------------------------------------------------------
-
     def _usd_to_lamports(self, usd: float) -> int:
-        """Rough USD->lamports using a live SOL/USDC quote; falls back to a
-        conservative constant if the quote is unavailable."""
         sol_price = _price_usd(self.jup, SOL_MINT) or 150.0
         sol_amount = usd / sol_price
         return int(sol_amount * 1_000_000_000)
