@@ -25,6 +25,9 @@ class FakeExecutor:
         type(self).calls += 1
         raise AssertionError("preflight must never call swap")
 
+    def _confirm_transaction(self, *args, **kwargs):
+        raise AssertionError("preflight must never confirm a transaction")
+
 
 class FakeSafety:
     def __init__(self, *args, **kwargs):
