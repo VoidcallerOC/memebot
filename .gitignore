@@ -16,3 +16,6 @@ state.json
 positions.json
 .memebot.lock
 meta_observations.jsonl
+decision_shadow.jsonl
+artifacts/decision/synthetic_train.jsonl
+artifacts/decision/shadow_demo.jsonl
