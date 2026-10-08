@@ -3,8 +3,9 @@
 Never authorizes live execution. When enabled, dry-run entries may be gated on
 BUY + risk ALLOW. Live (armed) trading ignores this gate (Phase 11).
 
-Shadow decisions use the full META TokenSnapshot + MetaSignal feature schema
-when market data is available. Sparse safety-only snapshots are fail-closed
+Shadow decisions use the same META enrichment path as MetaDetector.evaluate():
+DexScreener TokenSnapshot → holder concentration → ObservationHistory windows
+→ score_snapshot → MetaSignal. Sparse safety-only snapshots are fail-closed
 (missing-feature threshold is never relaxed for scoring).
 """
 from __future__ import annotations
@@ -18,7 +19,8 @@ import requests
 
 from ..config import Config
 from ..meta.adapters import snapshot_from_dexscreener
-from ..meta.detector import score_snapshot
+from ..meta.detector import prepare_snapshot_for_scoring, score_snapshot
+from ..meta.history import ObservationHistory
 from ..meta.model import MetaSignal, TokenSnapshot
 from ..portfolio import Portfolio
 from ..risk import RiskManager
@@ -59,29 +61,49 @@ def build_meta_context(
     session: Optional[requests.Session] = None,
     snapshot: Optional[TokenSnapshot] = None,
     signal: Optional[MetaSignal] = None,
+    history: Optional[ObservationHistory] = None,
+    rpc_url: str = "",
+    enrich: bool = True,
 ) -> tuple[TokenSnapshot, Optional[MetaSignal], str]:
-    """Resolve TokenSnapshot + MetaSignal for the decision feature schema.
+    """Resolve TokenSnapshot + MetaSignal with MetaDetector feature-source parity.
 
     Preference order:
-      1. Caller-provided snapshot (+ optional signal; scored if omitted)
-      2. Live DexScreener META snapshot + score_snapshot
+      1. Caller-provided snapshot (enriched like MetaDetector unless enrich=False)
+      2. Live DexScreener META snapshot + MetaDetector enrichment + score_snapshot
       3. Sparse safety fallback (no MetaSignal) — fail-closed on missing features
 
-    Never invents market windows or META scores.
+    Enrichment (when enrich=True and a market snapshot exists):
+      holder concentration → ObservationHistory reconstructed windows → score
+
+    Never invents market windows, social/wallet providers, or META scores.
     """
     now = now if now is not None else time.time()
+    hist = history if history is not None else ObservationHistory()
 
     def _apply_safety_flags(snap: TokenSnapshot) -> TokenSnapshot:
         if any("liquidity" in r.lower() for r in safety.reasons):
             snap.liquidity_removed = True
         return snap
 
-    if snapshot is not None:
-        snap = _apply_safety_flags(snapshot)
+    def _enrich_and_score(snap: TokenSnapshot, source: str) -> tuple[TokenSnapshot, MetaSignal, str]:
+        snap = _apply_safety_flags(snap)
         if snap.observed_at <= 0:
             snap.observed_at = now
-        sig = signal if signal is not None else score_snapshot(snap)
-        return snap, sig, "provided"
+        if enrich:
+            prepare_snapshot_for_scoring(
+                snap, hist, now=now, rpc_url=rpc_url, session=session,
+                attach_holders=True,
+            )
+        # After enrichment, always re-score so MetaSignal matches the snap.
+        # When enrich=False, honor a caller-provided signal (tests / replay).
+        if signal is not None and not enrich:
+            sig = signal
+        else:
+            sig = score_snapshot(snap)
+        return snap, sig, source
+
+    if snapshot is not None:
+        return _enrich_and_score(snapshot, "provided")
 
     try:
         fetched = snapshot_from_dexscreener(safety.mint, session=session, now=now)
@@ -90,16 +112,15 @@ def build_meta_context(
         fetched = None
 
     if fetched is not None:
-        snap = _apply_safety_flags(fetched)
         # Prefer safety screener price/liq when present (already screened).
-        if safety.price_usd and (snap.price_usd is None or snap.price_usd <= 0):
-            snap.price_usd = safety.price_usd
-        if safety.liquidity_usd and (snap.liquidity_usd is None or snap.liquidity_usd <= 0):
-            snap.liquidity_usd = safety.liquidity_usd
-        if safety.symbol and not snap.symbol:
-            snap.symbol = safety.symbol
-        sig = score_snapshot(snap)
-        return snap, sig, "meta_dexscreener"
+        if safety.price_usd and (fetched.price_usd is None or fetched.price_usd <= 0):
+            fetched.price_usd = safety.price_usd
+        if safety.liquidity_usd and (fetched.liquidity_usd is None or fetched.liquidity_usd <= 0):
+            fetched.liquidity_usd = safety.liquidity_usd
+        if safety.symbol and not fetched.symbol:
+            fetched.symbol = safety.symbol
+        snap, sig, _ = _enrich_and_score(fetched, "meta_detector_parity")
+        return snap, sig, "meta_detector_parity"
 
     snap = _apply_safety_flags(snapshot_from_safety(safety, now=now))
     return snap, None, "safety_fallback"
@@ -116,6 +137,7 @@ class DecisionShadowBridge:
         screener: Optional[SafetyScreener] = None,
         *,
         session: Optional[requests.Session] = None,
+        history: Optional[ObservationHistory] = None,
     ):
         self.cfg = cfg
         self.enabled = bool(getattr(cfg, "decision_shadow_enabled", False))
@@ -123,6 +145,7 @@ class DecisionShadowBridge:
         self._engine: Optional[DecisionEngine] = None
         self._seen_events: set[str] = set()  # mint+bucket for duplicate suppression
         self._session = session if session is not None else requests.Session()
+        self._history = history if history is not None else ObservationHistory()
         if not self.enabled:
             return
         model_path = getattr(cfg, "decision_model_path", "") or ""
@@ -150,6 +173,7 @@ class DecisionShadowBridge:
         wallet_entry_price: Optional[float] = None,
         snapshot: Optional[TokenSnapshot] = None,
         signal: Optional[MetaSignal] = None,
+        enrich: bool = True,
     ) -> EngineResult:
         if self._engine is None:
             raise RuntimeError("DecisionShadowBridge not enabled")
@@ -160,6 +184,9 @@ class DecisionShadowBridge:
             session=self._session,
             snapshot=snapshot,
             signal=signal,
+            history=self._history,
+            rpc_url=getattr(self.cfg, "rpc_url", "") or "",
+            enrich=enrich,
         )
         # Duplicate event suppression: same mint within the same second.
         key = f"{safety.mint}:{int(now)}"
@@ -191,6 +218,14 @@ class DecisionShadowBridge:
             result.decision.reasons.append("META_SNAPSHOT_UNAVAILABLE")
         rec = record_from_engine(result, wallet_entry_price=wallet_entry_price, now=now)
         rec.notes.append(f"meta_source={source}")
+        if "4h" in snap.market:
+            rec.notes.append("meta_window_4h=present")
+        else:
+            rec.notes.append("meta_window_4h=absent")
+        if snap.top_holder_pct is not None:
+            rec.notes.append("meta_holders=present")
+        else:
+            rec.notes.append("meta_holders=absent")
         self.journal.append(rec)
         return result
 

@@ -177,9 +177,20 @@ def fetch_holder_concentration(mint: str, rpc_url: str,
     }
 
 
-def attach_holder_concentration(snap: TokenSnapshot, rpc_url: str,
-                                session: Optional[requests.Session] = None) -> bool:
-    """Populate top-holder share from RPC. Creator linkage stays unavailable."""
+def attach_holder_concentration(
+    snap: TokenSnapshot,
+    rpc_url: str,
+    session: Optional[requests.Session] = None,
+    *,
+    force: bool = False,
+) -> bool:
+    """Populate top-holder share from RPC. Creator linkage stays unavailable.
+
+    Skips the RPC call when both holder fields are already present unless
+    ``force=True`` — so safety / META / decision can share one concentration fetch.
+    """
+    if not force and snap.top_holder_pct is not None and snap.top10_holder_pct is not None:
+        return True
     if not rpc_url:
         return False
     conc = fetch_holder_concentration(snap.mint, rpc_url, session)

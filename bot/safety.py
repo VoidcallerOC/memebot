@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import requests
 
 from .config import Config
+
+if TYPE_CHECKING:
+    from .meta.model import TokenSnapshot
 
 log = logging.getLogger(__name__)
 
@@ -55,10 +58,26 @@ class SafetyScreener:
 
     # -- public API ---------------------------------------------------------
 
-    def screen(self, mint: str) -> TokenSafety:
+    def screen(
+        self,
+        mint: str,
+        *,
+        snapshot: Optional["TokenSnapshot"] = None,
+    ) -> TokenSafety:
+        """Screen a mint. When ``snapshot`` is provided, reuse its DexScreener
+        market fields (and holder pct if present) instead of re-fetching.
+        """
         result = TokenSafety(mint=mint, passed=True)
 
-        market = self._fetch_market(mint)
+        if snapshot is not None:
+            market = {
+                "liquidity_usd": float(snapshot.liquidity_usd or 0.0),
+                "price_usd": float(snapshot.price_usd or 0.0),
+                "symbol": snapshot.symbol or "?",
+            }
+        else:
+            market = self._fetch_market(mint)
+
         if market is None:
             result.reject("no market data from DexScreener (untradeable/too new)")
             return result
@@ -69,7 +88,8 @@ class SafetyScreener:
 
         self._check_liquidity(result)
         self._check_mint_authorities(result, mint)
-        self._check_holder_concentration(result, mint)
+        top_pct = snapshot.top_holder_pct if snapshot is not None else None
+        self._check_holder_concentration(result, mint, top_pct=top_pct)
         self._consult_rugcheck(result, mint)
 
         if result.passed:
@@ -103,8 +123,15 @@ class SafetyScreener:
         if self.cfg.require_freeze_revoked and info.get("freeze_authority") is not None:
             result.reject("freeze authority NOT revoked (possible honeypot)")
 
-    def _check_holder_concentration(self, result: TokenSafety, mint: str) -> None:
-        top_pct = self._fetch_top_holder_pct(mint)
+    def _check_holder_concentration(
+        self,
+        result: TokenSafety,
+        mint: str,
+        *,
+        top_pct: Optional[float] = None,
+    ) -> None:
+        if top_pct is None:
+            top_pct = self._fetch_top_holder_pct(mint)
         if top_pct is None:
             return  # informational; don't hard-reject on RPC gaps here
         if top_pct > self.cfg.max_top_holder_pct:
