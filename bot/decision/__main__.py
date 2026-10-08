@@ -1,11 +1,12 @@
 """CLI: python -m bot.decision <command>
 
 Commands:
-  schema      print feature/target schema
-  train       time-aware train + evaluate candidates
-  benchmark   latency p50/p90/p95/p99 + throughput
-  compare     A/B(/C) comparison on same dataset
-  decide-demo one offline decision on a synthetic sample (NO TRADE)
+  schema       print feature/target schema
+  train        time-aware train + evaluate candidates
+  benchmark    latency p50/p90/p95/p99 + throughput
+  compare      A/B(/C) comparison on same dataset (+ walk-forward + shadow PnL)
+  label-meta   build labeled JSONL from META observations (needs forward prices)
+  decide-demo  one offline decision on a synthetic sample (NO TRADE)
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from .benchmark import run_benchmark
 from .compare import compare_arms
 from .dataset import generate_synthetic
 from .engine import DecisionEngine
+from .label_meta import label_from_meta_observations
 from .models.base import LocalModel
 from .risk_firewall import RiskFirewall
 from .schema import schema_manifest
@@ -70,6 +72,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2))
         return 0
 
+    if cmd == "label-meta":
+        obs = "meta_observations.jsonl"
+        if "--observations" in argv:
+            obs = argv[argv.index("--observations") + 1]
+        out = f"{out_dir}/labeled_from_meta.jsonl"
+        if "--out" in argv:
+            out = argv[argv.index("--out") + 1]
+        summary = label_from_meta_observations(obs, out_path=out)
+        print(json.dumps(summary, indent=2))
+        return 0 if summary.get("labeled", 0) > 0 else 1
+
     if cmd == "decide-demo":
         # Offline demo only — writes a shadow/counterfactual row, never trades.
         examples = generate_synthetic(5, seed=1)
@@ -93,7 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(
-        "usage: python -m bot.decision [schema|train|benchmark|compare|decide-demo]",
+        "usage: python -m bot.decision "
+        "[schema|train|benchmark|compare|label-meta|decide-demo]",
         file=sys.stderr,
     )
     return 2

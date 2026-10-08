@@ -1,9 +1,10 @@
 {
   "arms": {
     "rules": {
-      "latency_note": "see benchmark.py \u2014 model inference is local CPU",
       "cost_usd_per_decision": 0.0,
-      "test": {
+      "latency_ms_per_decision_mean": 0.0013597599991044262,
+      "throughput_decisions_per_sec": 735423.8988193698,
+      "test_classification": {
         "n": 100,
         "threshold": 0.65,
         "confusion": {
@@ -99,7 +100,7 @@
           "confidence is not accuracy; see calibration / ECE / Brier"
         ]
       },
-      "valid": {
+      "valid_classification": {
         "n": 100,
         "threshold": 0.65,
         "confusion": {
@@ -195,13 +196,29 @@
           "confidence is not accuracy; see calibration / ECE / Brier"
         ]
       },
+      "shadow_simulation": {
+        "n_candidates": 100,
+        "n_entered": 42,
+        "n_skipped": 58,
+        "net_pnl_pct_sum": 23.44074397083461,
+        "gross_pnl_pct_sum": 48.640743970834606,
+        "max_drawdown_pct": 14.734518839213166,
+        "opportunity_cost_pct": 114.75531540232694,
+        "false_positive_entries": 30,
+        "false_negative_skips": 14,
+        "true_positive_entries": 12,
+        "true_positive_rejections": 44,
+        "expectancy_per_entry": 0.5581129516865383,
+        "profitability": "SYNTHETIC_OR_UNVERIFIED \u2014 not live evidence"
+      },
       "model_path": "artifacts/decision/model_rules.v1.json",
       "synthetic": true
     },
     "logistic": {
-      "latency_note": "see benchmark.py \u2014 model inference is local CPU",
       "cost_usd_per_decision": 0.0,
-      "test": {
+      "latency_ms_per_decision_mean": 0.003840890001356456,
+      "throughput_decisions_per_sec": 260356.32357261938,
+      "test_classification": {
         "n": 100,
         "threshold": 0.65,
         "confusion": {
@@ -297,7 +314,7 @@
           "confidence is not accuracy; see calibration / ECE / Brier"
         ]
       },
-      "valid": {
+      "valid_classification": {
         "n": 100,
         "threshold": 0.65,
         "confusion": {
@@ -393,13 +410,29 @@
           "confidence is not accuracy; see calibration / ECE / Brier"
         ]
       },
+      "shadow_simulation": {
+        "n_candidates": 100,
+        "n_entered": 0,
+        "n_skipped": 100,
+        "net_pnl_pct_sum": 0.0,
+        "gross_pnl_pct_sum": 0.0,
+        "max_drawdown_pct": 0.0,
+        "opportunity_cost_pct": 210.85053281268364,
+        "false_positive_entries": 0,
+        "false_negative_skips": 26,
+        "true_positive_entries": 0,
+        "true_positive_rejections": 74,
+        "expectancy_per_entry": 0.0,
+        "profitability": "SYNTHETIC_OR_UNVERIFIED \u2014 not live evidence"
+      },
       "model_path": "artifacts/decision/model_logistic.v1.json",
       "synthetic": true
     },
     "stumps": {
-      "latency_note": "see benchmark.py \u2014 model inference is local CPU",
       "cost_usd_per_decision": 0.0,
-      "test": {
+      "latency_ms_per_decision_mean": 0.002858530001503823,
+      "throughput_decisions_per_sec": 349830.1572745143,
+      "test_classification": {
         "n": 100,
         "threshold": 0.65,
         "confusion": {
@@ -495,7 +528,7 @@
           "confidence is not accuracy; see calibration / ECE / Brier"
         ]
       },
-      "valid": {
+      "valid_classification": {
         "n": 100,
         "threshold": 0.65,
         "confusion": {
@@ -591,21 +624,401 @@
           "confidence is not accuracy; see calibration / ECE / Brier"
         ]
       },
+      "shadow_simulation": {
+        "n_candidates": 100,
+        "n_entered": 100,
+        "n_skipped": 0,
+        "net_pnl_pct_sum": -50.8202076448113,
+        "gross_pnl_pct_sum": 9.179792355188713,
+        "max_drawdown_pct": 59.493197304821834,
+        "opportunity_cost_pct": 0.0,
+        "false_positive_entries": 74,
+        "false_negative_skips": 0,
+        "true_positive_entries": 26,
+        "true_positive_rejections": 0,
+        "expectancy_per_entry": -0.5082020764481125,
+        "profitability": "SYNTHETIC_OR_UNVERIFIED \u2014 not live evidence"
+      },
       "model_path": "artifacts/decision/model_stumps.v1.json",
       "synthetic": true
     }
   },
   "winner": "logistic",
-  "winner_reason": "Highest out-of-sample precision with preference for simpler logistic when within 0.02 of stumps",
+  "winner_reason": "Useful OOS precision above base rate + 5pp if any; else calibrated fail-closed logistic",
+  "walk_forward": [
+    {
+      "fold": 0,
+      "n_train": 100,
+      "n_valid": 25,
+      "n_test": 125,
+      "classification": {
+        "n": 125,
+        "threshold": 0.65,
+        "confusion": {
+          "tp": 0,
+          "fp": 0,
+          "tn": 84,
+          "fn": 41,
+          "precision": 0.0,
+          "recall": 0.0,
+          "accuracy": 0.672,
+          "false_positive_rate": 0.0,
+          "false_negative_rate": 1.0
+        },
+        "calibration": [
+          {
+            "lower": 0.0,
+            "upper": 0.1,
+            "count": 13,
+            "mean_confidence": 0.08832107305554154,
+            "empirical_rate": 0.46153846153846156
+          },
+          {
+            "lower": 0.1,
+            "upper": 0.2,
+            "count": 65,
+            "mean_confidence": 0.13832483482700322,
+            "empirical_rate": 0.27692307692307694
+          },
+          {
+            "lower": 0.2,
+            "upper": 0.30000000000000004,
+            "count": 19,
+            "mean_confidence": 0.23891567329223554,
+            "empirical_rate": 0.3684210526315789
+          },
+          {
+            "lower": 0.30000000000000004,
+            "upper": 0.4,
+            "count": 27,
+            "mean_confidence": 0.3390644260042668,
+            "empirical_rate": 0.3333333333333333
+          },
+          {
+            "lower": 0.4,
+            "upper": 0.5,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.5,
+            "upper": 0.6000000000000001,
+            "count": 1,
+            "mean_confidence": 0.5993154446665119,
+            "empirical_rate": 1.0
+          },
+          {
+            "lower": 0.6000000000000001,
+            "upper": 0.7000000000000001,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.7000000000000001,
+            "upper": 0.8,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.8,
+            "upper": 0.9,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.9,
+            "upper": 1.0,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          }
+        ],
+        "ece": 0.13501390441135175,
+        "brier": 0.23894736894838045,
+        "mean_probability": 0.1954619276224916,
+        "buy_hit_rate": 0.0,
+        "illustrative_expectancy": 0.0,
+        "notes": [
+          "illustrative_expectancy uses synthetic payoff +1/-0.5 without fees; NOT live or shadow PnL evidence",
+          "confidence is not accuracy; see calibration / ECE / Brier"
+        ]
+      },
+      "shadow_simulation": {
+        "n_candidates": 125,
+        "n_entered": 0,
+        "n_skipped": 125,
+        "net_pnl_pct_sum": 0.0,
+        "gross_pnl_pct_sum": 0.0,
+        "max_drawdown_pct": 0.0,
+        "opportunity_cost_pct": 329.3616970620785,
+        "false_positive_entries": 0,
+        "false_negative_skips": 41,
+        "true_positive_entries": 0,
+        "true_positive_rejections": 84,
+        "expectancy_per_entry": 0.0,
+        "profitability": "SYNTHETIC_OR_UNVERIFIED \u2014 not live evidence"
+      }
+    },
+    {
+      "fold": 1,
+      "n_train": 200,
+      "n_valid": 50,
+      "n_test": 125,
+      "classification": {
+        "n": 125,
+        "threshold": 0.65,
+        "confusion": {
+          "tp": 0,
+          "fp": 0,
+          "tn": 96,
+          "fn": 29,
+          "precision": 0.0,
+          "recall": 0.0,
+          "accuracy": 0.768,
+          "false_positive_rate": 0.0,
+          "false_negative_rate": 1.0
+        },
+        "calibration": [
+          {
+            "lower": 0.0,
+            "upper": 0.1,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.1,
+            "upper": 0.2,
+            "count": 38,
+            "mean_confidence": 0.16588757956045033,
+            "empirical_rate": 0.13157894736842105
+          },
+          {
+            "lower": 0.2,
+            "upper": 0.30000000000000004,
+            "count": 61,
+            "mean_confidence": 0.24593732352450803,
+            "empirical_rate": 0.26229508196721313
+          },
+          {
+            "lower": 0.30000000000000004,
+            "upper": 0.4,
+            "count": 25,
+            "mean_confidence": 0.32851459842539943,
+            "empirical_rate": 0.32
+          },
+          {
+            "lower": 0.4,
+            "upper": 0.5,
+            "count": 1,
+            "mean_confidence": 0.41145021658993236,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.5,
+            "upper": 0.6000000000000001,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.6000000000000001,
+            "upper": 0.7000000000000001,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.7000000000000001,
+            "upper": 0.8,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.8,
+            "upper": 0.9,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.9,
+            "upper": 1.0,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          }
+        ],
+        "ece": 0.02340693172421633,
+        "brier": 0.17292661035201162,
+        "mean_probability": 0.23944175948413615,
+        "buy_hit_rate": 0.0,
+        "illustrative_expectancy": 0.0,
+        "notes": [
+          "illustrative_expectancy uses synthetic payoff +1/-0.5 without fees; NOT live or shadow PnL evidence",
+          "confidence is not accuracy; see calibration / ECE / Brier"
+        ]
+      },
+      "shadow_simulation": {
+        "n_candidates": 125,
+        "n_entered": 0,
+        "n_skipped": 125,
+        "net_pnl_pct_sum": 0.0,
+        "gross_pnl_pct_sum": 0.0,
+        "max_drawdown_pct": 0.0,
+        "opportunity_cost_pct": 235.40875138532314,
+        "false_positive_entries": 0,
+        "false_negative_skips": 29,
+        "true_positive_entries": 0,
+        "true_positive_rejections": 96,
+        "expectancy_per_entry": 0.0,
+        "profitability": "SYNTHETIC_OR_UNVERIFIED \u2014 not live evidence"
+      }
+    },
+    {
+      "fold": 2,
+      "n_train": 300,
+      "n_valid": 75,
+      "n_test": 125,
+      "classification": {
+        "n": 125,
+        "threshold": 0.65,
+        "confusion": {
+          "tp": 0,
+          "fp": 0,
+          "tn": 92,
+          "fn": 33,
+          "precision": 0.0,
+          "recall": 0.0,
+          "accuracy": 0.736,
+          "false_positive_rate": 0.0,
+          "false_negative_rate": 1.0
+        },
+        "calibration": [
+          {
+            "lower": 0.0,
+            "upper": 0.1,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.1,
+            "upper": 0.2,
+            "count": 7,
+            "mean_confidence": 0.19755381534572067,
+            "empirical_rate": 0.14285714285714285
+          },
+          {
+            "lower": 0.2,
+            "upper": 0.30000000000000004,
+            "count": 81,
+            "mean_confidence": 0.24703327254898375,
+            "empirical_rate": 0.2222222222222222
+          },
+          {
+            "lower": 0.30000000000000004,
+            "upper": 0.4,
+            "count": 37,
+            "mean_confidence": 0.32288167006172247,
+            "empirical_rate": 0.3783783783783784
+          },
+          {
+            "lower": 0.4,
+            "upper": 0.5,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.5,
+            "upper": 0.6000000000000001,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.6000000000000001,
+            "upper": 0.7000000000000001,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.7000000000000001,
+            "upper": 0.8,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.8,
+            "upper": 0.9,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          },
+          {
+            "lower": 0.9,
+            "upper": 1.0,
+            "count": 0,
+            "mean_confidence": 0.0,
+            "empirical_rate": 0.0
+          }
+        ],
+        "ece": 0.035567599932831984,
+        "brier": 0.1870061912359717,
+        "mean_probability": 0.2667135486093717,
+        "buy_hit_rate": 0.0,
+        "illustrative_expectancy": 0.0,
+        "notes": [
+          "illustrative_expectancy uses synthetic payoff +1/-0.5 without fees; NOT live or shadow PnL evidence",
+          "confidence is not accuracy; see calibration / ECE / Brier"
+        ]
+      },
+      "shadow_simulation": {
+        "n_candidates": 125,
+        "n_entered": 0,
+        "n_skipped": 125,
+        "net_pnl_pct_sum": 0.0,
+        "gross_pnl_pct_sum": 0.0,
+        "max_drawdown_pct": 0.0,
+        "opportunity_cost_pct": 268.3908720758672,
+        "false_positive_entries": 0,
+        "false_negative_skips": 33,
+        "true_positive_entries": 0,
+        "true_positive_rejections": 92,
+        "expectancy_per_entry": 0.0,
+        "profitability": "SYNTHETIC_OR_UNVERIFIED \u2014 not live evidence"
+      }
+    }
+  ],
+  "latency_benchmark": {
+    "feature_extraction_p50_ms": 0.009034499953486375,
+    "feature_extraction_p99_ms": 0.022334630050409032,
+    "model_inference_p50_ms": 0.004514500005825539,
+    "model_inference_p99_ms": 0.011209919985049048,
+    "end_to_end_p50_ms": 0.009626000064599793,
+    "end_to_end_p99_ms": 0.02526136980350202,
+    "throughput_decisions_per_sec": 38007.44885203356,
+    "rss_mb_after": 52.4296875
+  },
   "arm_C_frontier_llm": {
     "status": "UNAVAILABLE",
     "reason": "No frontier LLM is wired into the decision path by design. Offline comparison requires a separately supplied score file; none present.",
     "cost_usd_per_decision": null
   },
   "profitability": "NO VERIFIED PROFITABILITY",
+  "dataset_synthetic": true,
   "notes": [
-    "All metrics on synthetic or user-supplied labeled JSONL",
-    "Shadow expectancy with real chain data is NOT STARTED until observations accumulate",
-    "generated 500 SYNTHETIC examples \u2192 artifacts/decision/synthetic_train.jsonl"
+    "All arms evaluated on the SAME chronological test slice",
+    "Shadow PnL uses latency-adjusted entry + fee/slippage; not wallet fills",
+    "Walk-forward folds retrain without future leakage",
+    "SYNTHETIC metrics are not trading evidence"
   ]
 }

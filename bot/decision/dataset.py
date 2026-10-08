@@ -113,6 +113,43 @@ def time_aware_split(
     return train, valid, test
 
 
+def walk_forward_folds(
+    examples: Sequence[LabeledExample],
+    *,
+    n_folds: int = 3,
+    min_train: int = 40,
+    valid_frac: float = 0.2,
+) -> list[tuple[list[LabeledExample], list[LabeledExample], list[LabeledExample]]]:
+    """Rolling chronological folds: expand train window, hold out next test slice.
+
+    Fold k trains on [0, train_end), validates on a trailing fraction of train,
+    tests on the next contiguous block. Never peeks into the future.
+    """
+    ordered = sorted(examples, key=lambda e: e.detection_ts)
+    n = len(ordered)
+    if n < min_train + 2:
+        return []
+    folds: list[tuple[list[LabeledExample], list[LabeledExample], list[LabeledExample]]] = []
+    # Reserve the last (n_folds)/(n_folds+1) of the timeline for successive tests.
+    test_size = max(1, n // (n_folds + 1))
+    for k in range(n_folds):
+        test_start = n - (n_folds - k) * test_size
+        test_end = test_start + test_size
+        if test_start < min_train:
+            continue
+        if test_end > n:
+            test_end = n
+        train_block = ordered[:test_start]
+        test = ordered[test_start:test_end]
+        if len(train_block) < min_train or not test:
+            continue
+        split_at = max(1, int(len(train_block) * (1.0 - valid_frac)))
+        train = train_block[:split_at]
+        valid = train_block[split_at:]
+        folds.append((train, valid, test))
+    return folds
+
+
 def _make_snapshot(
     mint: str,
     ts: float,

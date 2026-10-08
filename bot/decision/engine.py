@@ -83,6 +83,7 @@ class DecisionEngine:
         safety=None,
         skip_network_screen: bool = False,
         now: Optional[float] = None,
+        relax_missing_threshold: bool = False,
     ) -> EngineResult:
         import time
         t0 = time.perf_counter()
@@ -90,7 +91,10 @@ class DecisionEngine:
             snap, signal, in_active_meta=in_active_meta, now=now,
         )
         t1 = time.perf_counter()
-        decision = self._infer(features, now=now or features.observed_at)
+        decision = self._infer(
+            features, now=now or features.observed_at,
+            relax_missing_threshold=relax_missing_threshold,
+        )
         t2 = time.perf_counter()
         risk = self.risk.evaluate(
             features.mint, decision,
@@ -117,10 +121,14 @@ class DecisionEngine:
         safety=None,
         skip_network_screen: bool = True,
         now: Optional[float] = None,
+        relax_missing_threshold: bool = False,
     ) -> EngineResult:
         import time
         t0 = time.perf_counter()
-        decision = self._infer(features, now=now or features.observed_at)
+        decision = self._infer(
+            features, now=now or features.observed_at,
+            relax_missing_threshold=relax_missing_threshold,
+        )
         t1 = time.perf_counter()
         risk = self.risk.evaluate(
             features.mint, decision,
@@ -139,7 +147,13 @@ class DecisionEngine:
             },
         )
 
-    def _infer(self, features: FeatureRecord, *, now: float) -> TypedDecision:
+    def _infer(
+        self,
+        features: FeatureRecord,
+        *,
+        now: float,
+        relax_missing_threshold: bool = False,
+    ) -> TypedDecision:
         base_kwargs = dict(
             feature_schema_version=FEATURE_SCHEMA_VERSION,
             decision_engine_version=DECISION_ENGINE_VERSION,
@@ -214,7 +228,10 @@ class DecisionEngine:
             )
 
         reasons = list(pred.reasons)
-        if features.missing_frac > MAX_MISSING_FRAC_FOR_BUY:
+        # Sparse safety-bridge snapshots can exceed the missing threshold even
+        # after SafetyScreener passed. When relax_missing_threshold=True the
+        # model may still BUY; risk firewall retains the hard veto.
+        if features.missing_frac > MAX_MISSING_FRAC_FOR_BUY and not relax_missing_threshold:
             action = REJECT
             reasons.append("MISSING_FEATURES_ABOVE_THRESHOLD")
         elif p >= self.buy_threshold:
