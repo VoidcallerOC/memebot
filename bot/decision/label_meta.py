@@ -2,10 +2,11 @@
 
 Required historical data for a real label:
   1. A decision-time market_snapshot (or signal) row with features
-  2. A forward price path for that mint after detection_ts
+  2. A forward price path for that mint after detection_ts covering the
+     full target horizon (or resolving TP/stop earlier)
 
-Without (2), examples cannot be labeled — this module reports how many rows
-were skipped for missing forward prices rather than inventing outcomes.
+Without sufficient forward coverage, examples are UNLABELED — this module
+reports how many rows were skipped rather than inventing label=0 outcomes.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from ..meta.model import TokenSnapshot
 from .dataset import LabeledExample, save_jsonl
 from .features import extract_features
 from .labels import PriceTick, label_path
-from .schema import DEFAULT_DETECTION_LATENCY_SECONDS, TARGET_NAME
+from .schema import DEFAULT_DETECTION_LATENCY_SECONDS, TARGET_HORIZON_SECONDS, TARGET_NAME
 
 
 def _load_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -66,8 +67,12 @@ def label_from_meta_observations(
     out_path: Optional[str | Path] = None,
     latency_seconds: float = DEFAULT_DETECTION_LATENCY_SECONDS,
     min_forward_ticks: int = 2,
+    horizon_seconds: float = TARGET_HORIZON_SECONDS,
 ) -> dict[str, Any]:
     """Create labeled JSONL from META observations when forward prices exist.
+
+    Incomplete horizons (stream ended before target window without TP/stop)
+    are counted as unlabeled and never written as label=0.
 
     Returns a summary; writes JSONL only when out_path is set and labels > 0.
     """
@@ -80,6 +85,7 @@ def label_from_meta_observations(
     examples: list[LabeledExample] = []
     skipped_no_path = 0
     skipped_bad = 0
+    skipped_incomplete = 0
 
     for row in market_rows:
         mint = str(row.get("mint") or "")
@@ -98,11 +104,22 @@ def label_from_meta_observations(
             continue
         signal = score_snapshot(snap)
         feats = extract_features(snap, signal, in_active_meta=False, now=ts)
-        outcome = label_path(path, ts, latency_seconds=latency_seconds)
+        outcome = label_path(
+            path, ts, latency_seconds=latency_seconds, horizon_seconds=horizon_seconds,
+        )
+        if outcome.label is None:
+            # no_path / invalid / incomplete — never invent label=0
+            if outcome.exit_reason == "incomplete":
+                skipped_incomplete += 1
+            elif outcome.exit_reason in ("no_path", "invalid"):
+                skipped_no_path += 1
+            else:
+                skipped_incomplete += 1
+            continue
         examples.append(
             LabeledExample(
                 features=feats,
-                label=outcome.label,
+                label=int(outcome.label),
                 detection_ts=ts,
                 path=path,
                 meta={
@@ -122,9 +139,13 @@ def label_from_meta_observations(
         "market_rows": len(market_rows),
         "labeled": len(examples),
         "skipped_no_forward_path": skipped_no_path,
+        "skipped_incomplete_horizon": skipped_incomplete,
         "skipped_bad_row": skipped_bad,
         "out_path": str(out_path) if out_path and examples else None,
         "status": "COMPLETE" if examples else "BLOCKED",
-        "blocker": None if examples else "No mint has enough forward price ticks to label",
+        "blocker": None if examples else (
+            "No mint has enough forward price coverage to label "
+            "(incomplete horizons are UNLABELED, not label=0)"
+        ),
         "profitability": "NO VERIFIED PROFITABILITY",
     }

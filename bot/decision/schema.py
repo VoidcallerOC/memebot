@@ -159,7 +159,10 @@ N_FEATURES = len(FEATURE_SPECS)
 # price paths (META snapshots + forward prices). Not "should I buy?"
 #
 # Label = 1 iff, after a latency-adjusted entry, price reaches +TAKE_PROFIT_PCT
-# before -STOP_PCT within HORIZON_SECONDS. Timeout / neither hit → 0.
+# before -STOP_PCT within HORIZON_SECONDS.
+# Label = 0 iff stop hits first, OR the full horizon is observed with neither hit.
+# Incomplete / censored streams (ended before horizon without TP/stop) are
+# UNLABELED — never invented as 0.
 TARGET_NAME = "hit_plus10_before_minus5"
 TARGET_TAKE_PROFIT_PCT = 10.0
 TARGET_STOP_PCT = 5.0
@@ -188,7 +191,9 @@ def schema_manifest() -> dict[str, Any]:
             "definition": (
                 f"1 iff price reaches +{TARGET_TAKE_PROFIT_PCT:g}% before "
                 f"-{TARGET_STOP_PCT:g}% within {TARGET_HORIZON_SECONDS:g}s "
-                "after latency-adjusted entry; else 0"
+                "after latency-adjusted entry; 0 iff stop first or true "
+                "timeout with full horizon coverage; UNLABELED if stream "
+                "ends before horizon without TP/stop"
             ),
             "take_profit_pct": TARGET_TAKE_PROFIT_PCT,
             "stop_pct": TARGET_STOP_PCT,
@@ -201,6 +206,7 @@ def schema_manifest() -> dict[str, Any]:
                 "Must not use future META scores or post-entry volumes as features",
                 "Must not use wallet entry price as our fill",
                 "Random shuffle train/test is forbidden; use time-aware splits",
+                "Train/valid/test boundaries require purge+embargo ≥ label horizon",
             ],
             "unavailable_features": [
                 "wallet historical PnL / win rate (smart_money tracks mints only)",

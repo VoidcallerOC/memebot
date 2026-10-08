@@ -228,9 +228,10 @@ class DecisionEngine:
             )
 
         reasons = list(pred.reasons)
-        # Sparse safety-bridge snapshots can exceed the missing threshold even
-        # after SafetyScreener passed. When relax_missing_threshold=True the
-        # model may still BUY; risk firewall retains the hard veto.
+        # Missing-feature safety is fail-closed. The live shadow bridge must
+        # feed full META TokenSnapshot+MetaSignal features; sparse safety-only
+        # snapshots must NOT set relax_missing_threshold=True merely to score.
+        # Risk firewall retains the hard veto regardless.
         if features.missing_frac > MAX_MISSING_FRAC_FOR_BUY and not relax_missing_threshold:
             action = REJECT
             reasons.append("MISSING_FEATURES_ABOVE_THRESHOLD")
