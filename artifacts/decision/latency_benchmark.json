@@ -1,0 +1,51 @@
+{
+  "n_warmup": 50,
+  "n_iter": 2000,
+  "model_version": "logistic.v1.bench",
+  "n_features": 25,
+  "feature_extraction": {
+    "name": "feature_extraction",
+    "n": 2000,
+    "p50_ms": 0.008245000003626046,
+    "p90_ms": 0.008762999982536712,
+    "p95_ms": 0.009170049997919705,
+    "p99_ms": 0.01122687991937709,
+    "max_ms": 0.02682100000583887,
+    "min_ms": 0.007578999998258951,
+    "mean_ms": 0.008393961000422223
+  },
+  "model_inference": {
+    "name": "model_inference",
+    "n": 2000,
+    "p50_ms": 0.004184999966128089,
+    "p90_ms": 0.00454809999155259,
+    "p95_ms": 0.00473000000056345,
+    "p99_ms": 0.005664070013153832,
+    "max_ms": 0.009352000006401795,
+    "min_ms": 0.0037790000533277635,
+    "mean_ms": 0.004252679500666545
+  },
+  "end_to_end": {
+    "name": "end_to_end_decision",
+    "n": 2000,
+    "p50_ms": 0.009085999977287429,
+    "p90_ms": 0.009750100002747786,
+    "p95_ms": 0.010330300040095605,
+    "p99_ms": 0.01332226997305952,
+    "max_ms": 0.025434000008317525,
+    "min_ms": 0.008179999895219225,
+    "mean_ms": 0.00925650600015615
+  },
+  "throughput_decisions_per_sec": 44424.639940012894,
+  "cpu_process_time_sec": 0.04501529900000001,
+  "wall_time_sec": 0.0450200609999456,
+  "rss_mb_before": 54.36328125,
+  "rss_mb_after": 54.61328125,
+  "rss_mb_delta": 0.25,
+  "notes": [
+    "feature_extraction = TokenSnapshot+MetaSignal \u2192 FeatureRecord (local, no RPC)",
+    "end_to_end = model inference + risk firewall (offline, no RPC/DexScreener)",
+    "Network I/O for META collection is outside the local decision critical path",
+    "Do not compare these numbers to proprietary vendor claims"
+  ]
+}
