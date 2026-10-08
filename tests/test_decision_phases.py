@@ -19,10 +19,33 @@ from bot.decision.risk_firewall import BLOCK, RiskFirewall
 from bot.decision.schema import N_FEATURES
 from bot.decision.shadow import record_from_engine
 from bot.decision.signal import BUY, REJECT
+from bot.meta.detector import score_snapshot
+from bot.meta.model import MarketWindow, TokenSnapshot
 from bot.portfolio import Portfolio
 from bot.risk import RiskManager
 from bot.safety import TokenSafety
 import bot.main as main_module
+
+
+def _rich_snap(mint: str = "MintBridge111111111111111111111111111111", *, now: float = 1700000000.0) -> TokenSnapshot:
+    """Full META-shaped snapshot matching the training feature schema."""
+    return TokenSnapshot(
+        mint=mint,
+        symbol="BR",
+        observed_at=now,
+        price_usd=0.01,
+        liquidity_usd=50_000.0,
+        market_cap_usd=200_000.0,
+        pair_created_at=now - 7200.0,
+        market={
+            "5m": MarketWindow(volume_usd=5000, tx_buys=40, tx_sells=20, price_change_pct=5.0),
+            "1h": MarketWindow(volume_usd=40000, tx_buys=200, tx_sells=150, price_change_pct=10.0),
+        },
+        top_holder_pct=12.0,
+        top10_holder_pct=35.0,
+        creator_pct=5.0,
+        source="test_meta",
+    )
 
 
 def _cfg(**kwargs) -> Config:
@@ -126,13 +149,18 @@ def test_bridge_journals_and_gates_paper(tmp_path: Path):
         mint="MintBridge111111111111111111111111111111",
         passed=True, liquidity_usd=50_000, price_usd=0.01, symbol="BR",
     )
-    result = bridge.evaluate_candidate(safety, now=1700000000.0)
+    snap = _rich_snap(safety.mint, now=1700000000.0)
+    result = bridge.evaluate_candidate(
+        safety, now=1700000000.0, snapshot=snap, signal=score_snapshot(snap),
+    )
     assert result.decision.action == BUY
     assert bridge.allows_paper_entry(result) is True
+    assert result.features.missing_frac <= 0.40
     rows = Path(cfg.decision_shadow_file).read_text(encoding="utf-8").strip().splitlines()
     assert len(rows) == 1
     rec = json.loads(rows[0])
     assert "model_version" in rec and "risk_engine_version" in rec
+    assert any(n.startswith("meta_source=provided") for n in rec.get("notes") or [])
 
 
 def test_bridge_blocks_when_risk_halts(tmp_path: Path):
@@ -143,7 +171,8 @@ def test_bridge_blocks_when_risk_halts(tmp_path: Path):
     risk._halted_today = True
     bridge = DecisionShadowBridge(cfg, risk, Portfolio())
     safety = TokenSafety(mint="m", passed=True, liquidity_usd=50_000, price_usd=1.0, symbol="X")
-    result = bridge.evaluate_candidate(safety, now=1700000000.0)
+    snap = _rich_snap("m", now=1700000000.0)
+    result = bridge.evaluate_candidate(safety, now=1700000000.0, snapshot=snap)
     assert result.decision.action == BUY
     assert result.risk.status == BLOCK
     assert bridge.allows_paper_entry(result) is False
@@ -156,7 +185,9 @@ def test_bridge_missing_model_rejects(tmp_path: Path):
     )
     bridge = DecisionShadowBridge(cfg, RiskManager(cfg), Portfolio())
     safety = TokenSafety(mint="m", passed=True, liquidity_usd=50_000, price_usd=1.0, symbol="X")
-    result = bridge.evaluate_candidate(safety, now=1700000000.0)
+    result = bridge.evaluate_candidate(
+        safety, now=1700000000.0, snapshot=_rich_snap("m", now=1700000000.0),
+    )
     assert result.decision.action == REJECT
     assert "MODEL_UNAVAILABLE" in result.decision.reasons
 
@@ -167,8 +198,9 @@ def test_bridge_duplicate_event_forced_reject(tmp_path: Path):
     cfg = _cfg(decision_model_path=str(model_path), decision_shadow_file=str(tmp_path / "s.jsonl"))
     bridge = DecisionShadowBridge(cfg, RiskManager(cfg), Portfolio())
     safety = TokenSafety(mint="dupmint", passed=True, liquidity_usd=50_000, price_usd=1.0, symbol="D")
-    r1 = bridge.evaluate_candidate(safety, now=1700000000.0)
-    r2 = bridge.evaluate_candidate(safety, now=1700000000.0)
+    snap = _rich_snap("dupmint", now=1700000000.0)
+    r1 = bridge.evaluate_candidate(safety, now=1700000000.0, snapshot=snap)
+    r2 = bridge.evaluate_candidate(safety, now=1700000000.0, snapshot=snap)
     assert r1.decision.action == BUY
     assert r2.decision.action == REJECT
     assert "DUPLICATE_EVENT" in r2.decision.reasons or any(
@@ -182,7 +214,9 @@ def test_corrupted_model_file_fail_closed(tmp_path: Path):
     cfg = _cfg(decision_model_path=str(bad), decision_shadow_file=str(tmp_path / "s.jsonl"))
     bridge = DecisionShadowBridge(cfg, RiskManager(cfg), Portfolio())
     safety = TokenSafety(mint="m", passed=True, liquidity_usd=50_000, price_usd=1.0, symbol="X")
-    result = bridge.evaluate_candidate(safety, now=1700000000.0)
+    result = bridge.evaluate_candidate(
+        safety, now=1700000000.0, snapshot=_rich_snap("m", now=1700000000.0),
+    )
     assert result.decision.action == REJECT
 
 

@@ -3,6 +3,9 @@
 Target: hit_plus10_before_minus5
 Entry price MUST be latency-adjusted (price at detection + latency), never the
 observed wallet fill price.
+
+Incomplete / censored paths (observation stream ended before the full target
+horizon without hitting TP or stop) are UNLABELED — never invented as label=0.
 """
 from __future__ import annotations
 
@@ -17,6 +20,9 @@ from .schema import (
     TARGET_TAKE_PROFIT_PCT,
 )
 
+# Explicit unlabeled sentinel for incomplete / censored observations.
+UNLABELED: None = None
+
 
 @dataclass(frozen=True)
 class PriceTick:
@@ -27,7 +33,7 @@ class PriceTick:
 @dataclass
 class OutcomeLabel:
     target_name: str
-    label: int  # 1 = hit TP before stop, 0 otherwise
+    label: Optional[int]  # 1 = TP before stop, 0 = stop or true timeout, None = UNLABELED
     entry_ts: float
     entry_price: float
     detection_ts: float
@@ -36,15 +42,20 @@ class OutcomeLabel:
     max_adverse_excursion_pct: float
     exit_ts: Optional[float]
     exit_price: Optional[float]
-    exit_reason: str  # take_profit | stop | timeout | no_path | invalid
+    exit_reason: str  # take_profit | stop | timeout | incomplete | no_path | invalid
     horizon_seconds: float
     take_profit_pct: float
     stop_pct: float
+
+    @property
+    def is_labeled(self) -> bool:
+        return self.label is not None
 
     def to_dict(self) -> dict:
         return {
             "target_name": self.target_name,
             "label": self.label,
+            "is_labeled": self.is_labeled,
             "entry_ts": self.entry_ts,
             "entry_price": self.entry_price,
             "detection_ts": self.detection_ts,
@@ -79,12 +90,20 @@ def label_path(
     """Label one opportunity from a forward price path.
 
     Simulated entry uses the first tick at or after detection_ts + latency.
+
+    A sample is UNLABELED (label=None) when:
+      - no entry tick exists (no_path)
+      - entry price is invalid
+      - the path ends before the full horizon without hitting TP or stop
+
+    True timeout (full horizon observed, neither TP nor stop) → label=0.
+    Never invent outcomes from truncated streams.
     """
     entry_ts = detection_ts + float(latency_seconds)
     entry_tick = _price_at_or_after(path, entry_ts)
     if entry_tick is None:
         return OutcomeLabel(
-            target_name=TARGET_NAME, label=0,
+            target_name=TARGET_NAME, label=UNLABELED,
             entry_ts=entry_ts, entry_price=0.0,
             detection_ts=detection_ts, detection_latency_seconds=latency_seconds,
             max_favorable_excursion_pct=0.0, max_adverse_excursion_pct=0.0,
@@ -95,7 +114,7 @@ def label_path(
     entry = entry_tick.price
     if entry <= 0:
         return OutcomeLabel(
-            target_name=TARGET_NAME, label=0,
+            target_name=TARGET_NAME, label=UNLABELED,
             entry_ts=entry_tick.ts, entry_price=entry,
             detection_ts=detection_ts, detection_latency_seconds=latency_seconds,
             max_favorable_excursion_pct=0.0, max_adverse_excursion_pct=0.0,
@@ -112,7 +131,8 @@ def label_path(
     exit_ts = None
     exit_price = None
     exit_reason = "timeout"
-    label = 0
+    label: Optional[int] = 0
+    last_in_window_ts: Optional[float] = None
 
     for tick in path:
         if tick.ts < entry_tick.ts:
@@ -121,6 +141,7 @@ def label_path(
             break
         if tick.price <= 0:
             continue
+        last_in_window_ts = tick.ts
         ret = (tick.price / entry - 1.0) * 100.0
         mfe = max(mfe, ret)
         mae = min(mae, ret)
@@ -132,6 +153,35 @@ def label_path(
             label = 0
             exit_ts, exit_price, exit_reason = tick.ts, tick.price, "stop"
             break
+
+    # Incomplete / censored: stream ended before full horizon without TP/SL.
+    # Require a tick at or after the deadline (or a resolved TP/SL) to label.
+    if exit_reason == "timeout":
+        covered = last_in_window_ts is not None and last_in_window_ts >= deadline
+        # Also accept coverage if any tick exists at/after deadline in the raw path
+        # (loop breaks when tick.ts > deadline, so check path for boundary coverage).
+        if not covered:
+            for tick in path:
+                if tick.ts >= deadline and tick.price > 0:
+                    covered = True
+                    break
+        if not covered:
+            return OutcomeLabel(
+                target_name=TARGET_NAME,
+                label=UNLABELED,
+                entry_ts=entry_tick.ts,
+                entry_price=entry,
+                detection_ts=detection_ts,
+                detection_latency_seconds=latency_seconds,
+                max_favorable_excursion_pct=mfe,
+                max_adverse_excursion_pct=mae,
+                exit_ts=last_in_window_ts,
+                exit_price=None,
+                exit_reason="incomplete",
+                horizon_seconds=horizon_seconds,
+                take_profit_pct=take_profit_pct,
+                stop_pct=stop_pct,
+            )
 
     return OutcomeLabel(
         target_name=TARGET_NAME,

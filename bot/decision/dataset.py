@@ -27,6 +27,7 @@ from .schema import (
     DEFAULT_DETECTION_LATENCY_SECONDS,
     FEATURE_SCHEMA_VERSION,
     N_FEATURES,
+    TARGET_HORIZON_SECONDS,
     TARGET_NAME,
 )
 
@@ -93,13 +94,54 @@ def examples_to_xy(examples: Sequence[LabeledExample]) -> tuple[np.ndarray, np.n
     return X, y, ts
 
 
+def purge_overlapping_labels(
+    left: Sequence[LabeledExample],
+    right: Sequence[LabeledExample],
+    *,
+    horizon_seconds: float = TARGET_HORIZON_SECONDS,
+    embargo_seconds: Optional[float] = None,
+) -> list[LabeledExample]:
+    """Drop left-set examples whose forward label window overlaps the right set.
+
+    A training label at detection_ts depends on prices through
+    detection_ts + horizon_seconds. Those prices must not fall inside the
+    validation/test period. An additional embargo gap before the right-set
+    start removes boundary leakage.
+
+    Chronological order is preserved. Never shuffles.
+    """
+    if not left:
+        return []
+    if not right:
+        return list(left)
+    if embargo_seconds is None:
+        embargo_seconds = horizon_seconds
+    right_start = min(e.detection_ts for e in right)
+    # Label window ends at detection_ts + horizon; require it ends before
+    # right_start - embargo (purge + embargo).
+    cutoff = right_start - float(embargo_seconds)
+    return [
+        e for e in left
+        if e.detection_ts + float(horizon_seconds) <= cutoff
+    ]
+
+
 def time_aware_split(
     examples: Sequence[LabeledExample],
     *,
     train_frac: float = 0.6,
     valid_frac: float = 0.2,
+    purge_horizon_seconds: float = TARGET_HORIZON_SECONDS,
+    embargo_seconds: Optional[float] = None,
 ) -> tuple[list[LabeledExample], list[LabeledExample], list[LabeledExample]]:
-    """Chronological split. Never shuffle across time."""
+    """Chronological split with purge/embargo. Never shuffle across time.
+
+    After the index split, purge train samples whose forward-label windows
+    overlap valid (or test if valid is empty), and purge valid samples that
+    overlap test. Embargo defaults to the label horizon.
+    """
+    if embargo_seconds is None:
+        embargo_seconds = purge_horizon_seconds
     ordered = sorted(examples, key=lambda e: e.detection_ts)
     n = len(ordered)
     if n == 0:
@@ -110,6 +152,24 @@ def time_aware_split(
     train = ordered[:i_train]
     valid = ordered[i_train:i_valid]
     test = ordered[i_valid:]
+    if valid:
+        train = purge_overlapping_labels(
+            train, valid,
+            horizon_seconds=purge_horizon_seconds,
+            embargo_seconds=embargo_seconds,
+        )
+    elif test:
+        train = purge_overlapping_labels(
+            train, test,
+            horizon_seconds=purge_horizon_seconds,
+            embargo_seconds=embargo_seconds,
+        )
+    if valid and test:
+        valid = purge_overlapping_labels(
+            valid, test,
+            horizon_seconds=purge_horizon_seconds,
+            embargo_seconds=embargo_seconds,
+        )
     return train, valid, test
 
 
@@ -119,12 +179,17 @@ def walk_forward_folds(
     n_folds: int = 3,
     min_train: int = 40,
     valid_frac: float = 0.2,
+    purge_horizon_seconds: float = TARGET_HORIZON_SECONDS,
+    embargo_seconds: Optional[float] = None,
 ) -> list[tuple[list[LabeledExample], list[LabeledExample], list[LabeledExample]]]:
-    """Rolling chronological folds: expand train window, hold out next test slice.
+    """Rolling chronological folds with purge/embargo between boundaries.
 
     Fold k trains on [0, train_end), validates on a trailing fraction of train,
     tests on the next contiguous block. Never peeks into the future.
+    Never randomly shuffles.
     """
+    if embargo_seconds is None:
+        embargo_seconds = purge_horizon_seconds
     ordered = sorted(examples, key=lambda e: e.detection_ts)
     n = len(ordered)
     if n < min_train + 2:
@@ -146,6 +211,25 @@ def walk_forward_folds(
         split_at = max(1, int(len(train_block) * (1.0 - valid_frac)))
         train = train_block[:split_at]
         valid = train_block[split_at:]
+        if valid:
+            train = purge_overlapping_labels(
+                train, valid,
+                horizon_seconds=purge_horizon_seconds,
+                embargo_seconds=embargo_seconds,
+            )
+        train = purge_overlapping_labels(
+            train, test,
+            horizon_seconds=purge_horizon_seconds,
+            embargo_seconds=embargo_seconds,
+        )
+        if valid:
+            valid = purge_overlapping_labels(
+                valid, test,
+                horizon_seconds=purge_horizon_seconds,
+                embargo_seconds=embargo_seconds,
+            )
+        if len(train) < max(1, min_train // 4) or not test:
+            continue
         folds.append((train, valid, test))
     return folds
 
@@ -221,13 +305,22 @@ def _price_path(
     *,
     will_hit_tp: bool,
     rng: random.Random,
-    n_ticks: int = 60,
+    n_ticks: Optional[int] = None,
     step_seconds: float = 60.0,
+    horizon_seconds: float = TARGET_HORIZON_SECONDS,
+    latency_seconds: float = DEFAULT_DETECTION_LATENCY_SECONDS,
 ) -> list[PriceTick]:
-    """Generate a forward path that either hits +10% before -5% or the reverse."""
+    """Generate a forward path that either hits +10% before -5% or the reverse.
+
+    Paths always extend through detection + latency + horizon so true timeouts
+    remain labelable (incomplete streams are never fabricated as label=0).
+    """
+    # Cover past the label deadline so timeout ≠ incomplete.
+    min_ticks = int(math.ceil((latency_seconds + horizon_seconds) / step_seconds)) + 2
+    n_ticks = max(n_ticks or 0, min_ticks)
     ticks = [PriceTick(start_ts, entry_price)]
     price = entry_price
-    # Prepend a couple ticks before detection for realism
+    hit = False
     for i in range(1, n_ticks + 1):
         ts = start_ts + i * step_seconds
         if will_hit_tp:
@@ -237,10 +330,11 @@ def _price_path(
             shock = rng.uniform(-0.035, 0.01)
         price = max(1e-12, price * (1.0 + shock))
         ticks.append(PriceTick(ts, price))
-        if will_hit_tp and price >= entry_price * 1.10:
-            break
-        if not will_hit_tp and price <= entry_price * 0.95:
-            break
+        if not hit and will_hit_tp and price >= entry_price * 1.10:
+            hit = True
+            # Continue ticks through horizon for coverage; label resolves at hit.
+        if not hit and (not will_hit_tp) and price <= entry_price * 0.95:
+            hit = True
     return ticks
 
 
@@ -279,12 +373,18 @@ def generate_synthetic(
         signal = _make_signal(snap, quality)
         feats = extract_features(snap, signal, in_active_meta=quality > 0.6, now=ts)
         # Price path starts at detection; label_path applies latency.
-        path = _price_path(ts, price, will_hit_tp=will_hit, rng=rng)
+        path = _price_path(
+            ts, price, will_hit_tp=will_hit, rng=rng,
+            latency_seconds=latency_seconds,
+        )
         outcome = label_path(path, ts, latency_seconds=latency_seconds)
+        if outcome.label is None:
+            # Synthetic generator must yield labeled rows only.
+            continue
         examples.append(
             LabeledExample(
                 features=feats,
-                label=outcome.label,
+                label=int(outcome.label),
                 detection_ts=ts,
                 path=path,
                 meta={
@@ -295,4 +395,48 @@ def generate_synthetic(
                 },
             )
         )
-    return examples
+    # If some paths were skipped, top up so callers get ~n examples.
+    guard = 0
+    while len(examples) < n and guard < n * 3:
+        guard += 1
+        i = len(examples)
+        ts = start_ts + i * 300.0
+        quality = rng.random()
+        p_pos = 0.15 + 0.7 * quality
+        will_hit = rng.random() < p_pos
+        mint = f"SynthMint{i:05d}{'x' * 20}"[:44]
+        liq = 10_000 * math.exp(quality * 2.5) * rng.uniform(0.8, 1.2)
+        vol_1h = liq * rng.uniform(0.2, 2.0)
+        vol_5m = vol_1h * (0.05 + 0.3 * quality) * rng.uniform(0.5, 1.5)
+        buys = int(20 + 200 * quality)
+        sells = int(20 + 200 * (1.0 - quality))
+        top = 10 + 40 * (1.0 - quality)
+        price = 10 ** rng.uniform(-6, -2)
+        snap = _make_snapshot(
+            mint, ts, liquidity=liq, volume_5m=vol_5m, volume_1h=vol_1h,
+            buys_5m=buys, sells_5m=sells, top_holder=top, price=price, rng=rng,
+        )
+        signal = _make_signal(snap, quality)
+        feats = extract_features(snap, signal, in_active_meta=quality > 0.6, now=ts)
+        path = _price_path(
+            ts, price, will_hit_tp=will_hit, rng=rng,
+            latency_seconds=latency_seconds,
+        )
+        outcome = label_path(path, ts, latency_seconds=latency_seconds)
+        if outcome.label is None:
+            continue
+        examples.append(
+            LabeledExample(
+                features=feats,
+                label=int(outcome.label),
+                detection_ts=ts,
+                path=path,
+                meta={
+                    "synthetic": True,
+                    "planted_quality": quality,
+                    "planted_will_hit": will_hit,
+                    "outcome": outcome.to_dict(),
+                },
+            )
+        )
+    return examples[:n]
