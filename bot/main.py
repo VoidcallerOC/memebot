@@ -30,6 +30,11 @@ from .safety import SafetyScreener
 from .state import load_state, save_state
 from .strategy import build_strategy
 
+try:
+    from .decision.bridge import DecisionShadowBridge
+except Exception:  # pragma: no cover - optional until package present
+    DecisionShadowBridge = None  # type: ignore
+
 log = logging.getLogger("bot")
 
 
@@ -64,6 +69,14 @@ class TradingBot:
         self.notifier = Notifier(cfg, self.session)
         self._running = True
         self._reconciliation_required = False
+        self.decision_shadow = None
+        if cfg.decision_shadow_enabled and DecisionShadowBridge is not None:
+            self.decision_shadow = DecisionShadowBridge(
+                cfg, self.risk, self.portfolio, screener=self.screener,
+            )
+            log.info(
+                "decision shadow ENABLED (dry-run journal/gate only; never authorizes live)"
+            )
         load_state(cfg.state_file, self.portfolio, self.risk)
 
     def stop(self, *_):
@@ -133,8 +146,29 @@ class TradingBot:
             if self.portfolio.has(candidate.mint):
                 continue
             safety = self.screener.screen(candidate.mint)
+            decision_shadow = getattr(self, "decision_shadow", None)
             if not safety.passed or safety.price_usd <= 0:
+                # Still journal counterfactual when shadow is on (rejected by safety).
+                if decision_shadow is not None and not self.cfg.is_armed:
+                    try:
+                        decision_shadow.evaluate_candidate(safety)
+                    except Exception as exc:
+                        log.debug("decision shadow journal failed: %s", exc)
                 continue
+
+            # Phase 7/11: decision engine gates dry-run paper only; never live.
+            if decision_shadow is not None and not self.cfg.is_armed:
+                try:
+                    eng = decision_shadow.evaluate_candidate(safety)
+                except Exception as exc:
+                    log.error("decision shadow failed closed: %s", exc)
+                    continue
+                if not decision_shadow.allows_paper_entry(eng):
+                    log.info(
+                        "decision shadow skip %s: action=%s risk=%s",
+                        safety.symbol, eng.decision.action, eng.risk.status,
+                    )
+                    continue
 
             size_usd = self.risk.position_size_usd()
             tokens = size_usd / safety.price_usd

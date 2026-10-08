@@ -1,6 +1,7 @@
 requests>=2.31.0
 python-dotenv>=1.0.0
 base58>=2.1.1
+numpy>=1.26.0
 # Optional, only needed for live trading (real swap signing/sending):
 solana>=0.34.0
 solders>=0.21.0

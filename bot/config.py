@@ -140,6 +140,13 @@ class Config:
     state_file: str = "state.json"
     process_lock_file: str = ".memebot.lock"
 
+    # Local decision engine — shadow / dry-run only. Never authorizes live swaps.
+    # When enabled in dry-run, paper entries are gated on BUY + risk ALLOW and
+    # every candidate is journaled (including rejects/counterfactuals).
+    decision_shadow_enabled: bool = False
+    decision_model_path: str = "artifacts/decision/model_logistic.v1.json"
+    decision_shadow_file: str = "decision_shadow.jsonl"
+
     @property
     def is_armed(self) -> bool:
         """True only when the bot is genuinely cleared to spend real money."""
@@ -190,6 +197,13 @@ def load_config() -> Config:
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
         state_file=os.getenv("STATE_FILE", "state.json").strip(),
         process_lock_file=os.getenv("PROCESS_LOCK_FILE", ".memebot.lock").strip(),
+        decision_shadow_enabled=_get_bool("DECISION_SHADOW", False),
+        decision_model_path=os.getenv(
+            "DECISION_MODEL_PATH", "artifacts/decision/model_logistic.v1.json"
+        ).strip(),
+        decision_shadow_file=os.getenv(
+            "DECISION_SHADOW_FILE", "decision_shadow.jsonl"
+        ).strip(),
     )
     _validate(cfg)
     return cfg

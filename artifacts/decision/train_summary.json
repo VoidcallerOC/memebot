@@ -1,0 +1,686 @@
+{
+  "rules": {
+    "model_kind": "rules",
+    "model_path": "artifacts/decision/model_rules.v1.json",
+    "model_version": "rules.v1",
+    "feature_schema_version": "features.v1",
+    "n_train": 300,
+    "n_valid": 100,
+    "n_test": 100,
+    "valid": {
+      "n": 100,
+      "threshold": 0.65,
+      "confusion": {
+        "tp": 16,
+        "fp": 34,
+        "tn": 40,
+        "fn": 10,
+        "precision": 0.32,
+        "recall": 0.6153846153846154,
+        "accuracy": 0.56,
+        "false_positive_rate": 0.4594594594594595,
+        "false_negative_rate": 0.38461538461538464
+      },
+      "calibration": [
+        {
+          "lower": 0.0,
+          "upper": 0.1,
+          "count": 19,
+          "mean_confidence": 0.04816508255904133,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.1,
+          "upper": 0.2,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.2,
+          "upper": 0.30000000000000004,
+          "count": 3,
+          "mean_confidence": 0.2976675026060442,
+          "empirical_rate": 0.6666666666666666
+        },
+        {
+          "lower": 0.30000000000000004,
+          "upper": 0.4,
+          "count": 2,
+          "mean_confidence": 0.30236454063754437,
+          "empirical_rate": 0.5
+        },
+        {
+          "lower": 0.4,
+          "upper": 0.5,
+          "count": 3,
+          "mean_confidence": 0.46090904085202045,
+          "empirical_rate": 0.3333333333333333
+        },
+        {
+          "lower": 0.5,
+          "upper": 0.6000000000000001,
+          "count": 20,
+          "mean_confidence": 0.5745812995544262,
+          "empirical_rate": 0.25
+        },
+        {
+          "lower": 0.6000000000000001,
+          "upper": 0.7000000000000001,
+          "count": 3,
+          "mean_confidence": 0.6103082307316972,
+          "empirical_rate": 0.3333333333333333
+        },
+        {
+          "lower": 0.7000000000000001,
+          "upper": 0.8,
+          "count": 10,
+          "mean_confidence": 0.7229952914959407,
+          "empirical_rate": 0.1
+        },
+        {
+          "lower": 0.8,
+          "upper": 0.9,
+          "count": 9,
+          "mean_confidence": 0.8773895083135917,
+          "empirical_rate": 0.3333333333333333
+        },
+        {
+          "lower": 0.9,
+          "upper": 1.0,
+          "count": 31,
+          "mean_confidence": 0.9764349966522998,
+          "empirical_rate": 0.3870967741935484
+        }
+      ],
+      "ece": 0.3951862617137127,
+      "brier": 0.366661724788781,
+      "mean_probability": 0.6251408934955771,
+      "buy_hit_rate": 0.32,
+      "illustrative_expectancy": -0.02,
+      "notes": [
+        "illustrative_expectancy uses synthetic payoff +1/-0.5 without fees; NOT live or shadow PnL evidence",
+        "confidence is not accuracy; see calibration / ECE / Brier"
+      ]
+    },
+    "test": {
+      "n": 100,
+      "threshold": 0.65,
+      "confusion": {
+        "tp": 12,
+        "fp": 30,
+        "tn": 44,
+        "fn": 14,
+        "precision": 0.2857142857142857,
+        "recall": 0.46153846153846156,
+        "accuracy": 0.56,
+        "false_positive_rate": 0.40540540540540543,
+        "false_negative_rate": 0.5384615384615384
+      },
+      "calibration": [
+        {
+          "lower": 0.0,
+          "upper": 0.1,
+          "count": 22,
+          "mean_confidence": 0.06234696986627706,
+          "empirical_rate": 0.13636363636363635
+        },
+        {
+          "lower": 0.1,
+          "upper": 0.2,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.2,
+          "upper": 0.30000000000000004,
+          "count": 2,
+          "mean_confidence": 0.2983411987813043,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.30000000000000004,
+          "upper": 0.4,
+          "count": 4,
+          "mean_confidence": 0.30403354582733055,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.4,
+          "upper": 0.5,
+          "count": 2,
+          "mean_confidence": 0.46427250933331804,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.5,
+          "upper": 0.6000000000000001,
+          "count": 22,
+          "mean_confidence": 0.5702878966739944,
+          "empirical_rate": 0.36363636363636365
+        },
+        {
+          "lower": 0.6000000000000001,
+          "upper": 0.7000000000000001,
+          "count": 6,
+          "mean_confidence": 0.6080681627441648,
+          "empirical_rate": 0.5
+        },
+        {
+          "lower": 0.7000000000000001,
+          "upper": 0.8,
+          "count": 4,
+          "mean_confidence": 0.7222879383910943,
+          "empirical_rate": 0.25
+        },
+        {
+          "lower": 0.8,
+          "upper": 0.9,
+          "count": 14,
+          "mean_confidence": 0.8884720273965961,
+          "empirical_rate": 0.42857142857142855
+        },
+        {
+          "lower": 0.9,
+          "upper": 1.0,
+          "count": 24,
+          "mean_confidence": 0.9780965377458415,
+          "empirical_rate": 0.20833333333333334
+        }
+      ],
+      "ece": 0.36366548008790256,
+      "brier": 0.373636233658665,
+      "mean_probability": 0.5910981468290644,
+      "buy_hit_rate": 0.2857142857142857,
+      "illustrative_expectancy": -0.07142857142857142,
+      "notes": [
+        "illustrative_expectancy uses synthetic payoff +1/-0.5 without fees; NOT live or shadow PnL evidence",
+        "confidence is not accuracy; see calibration / ECE / Brier"
+      ]
+    },
+    "synthetic": true,
+    "notes": [
+      "generated 500 SYNTHETIC examples \u2192 artifacts/decision/synthetic_train.jsonl",
+      "SYNTHETIC DATA IS NOT PROFITABILITY EVIDENCE",
+      "time-aware split: train=300 valid=100 test=100 (chronological; no shuffle)",
+      "rules model has no learned weights"
+    ],
+    "schema": {
+      "name": "hit_plus10_before_minus5",
+      "definition": "1 iff price reaches +10% before -5% within 3600s after latency-adjusted entry; else 0",
+      "take_profit_pct": 10.0,
+      "stop_pct": 5.0,
+      "horizon_seconds": 3600.0,
+      "entry_rule": "Simulated entry uses price at detection_ts + latency_seconds, never the observed wallet entry price",
+      "leakage_risks": [
+        "Must not use future META scores or post-entry volumes as features",
+        "Must not use wallet entry price as our fill",
+        "Random shuffle train/test is forbidden; use time-aware splits"
+      ],
+      "unavailable_features": [
+        "wallet historical PnL / win rate (smart_money tracks mints only)",
+        "copyability after realistic latency (no fill-time price journal yet)",
+        "SOL regime / broad memecoin regime (not collected)",
+        "dev transaction graph (creator_pct is a proxy only)",
+        "social velocity (META marks UNVERIFIED without social provider)"
+      ]
+    }
+  },
+  "logistic": {
+    "model_kind": "logistic",
+    "model_path": "artifacts/decision/model_logistic.v1.json",
+    "model_version": "logistic.v1",
+    "feature_schema_version": "features.v1",
+    "n_train": 300,
+    "n_valid": 100,
+    "n_test": 100,
+    "valid": {
+      "n": 100,
+      "threshold": 0.65,
+      "confusion": {
+        "tp": 0,
+        "fp": 0,
+        "tn": 74,
+        "fn": 26,
+        "precision": 0.0,
+        "recall": 0.0,
+        "accuracy": 0.74,
+        "false_positive_rate": 0.0,
+        "false_negative_rate": 1.0
+      },
+      "calibration": [
+        {
+          "lower": 0.0,
+          "upper": 0.1,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.1,
+          "upper": 0.2,
+          "count": 10,
+          "mean_confidence": 0.196319337323686,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.2,
+          "upper": 0.30000000000000004,
+          "count": 66,
+          "mean_confidence": 0.2534198758211621,
+          "empirical_rate": 0.24242424242424243
+        },
+        {
+          "lower": 0.30000000000000004,
+          "upper": 0.4,
+          "count": 24,
+          "mean_confidence": 0.31770638011354696,
+          "empirical_rate": 0.4166666666666667
+        },
+        {
+          "lower": 0.4,
+          "upper": 0.5,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.5,
+          "upper": 0.6000000000000001,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.6000000000000001,
+          "upper": 0.7000000000000001,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.7000000000000001,
+          "upper": 0.8,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.8,
+          "upper": 0.9,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.9,
+          "upper": 1.0,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        }
+      ],
+      "ece": 0.050639520547084316,
+      "brier": 0.1850265128076142,
+      "mean_probability": 0.2631385830015869,
+      "buy_hit_rate": 0.0,
+      "illustrative_expectancy": 0.0,
+      "notes": [
+        "illustrative_expectancy uses synthetic payoff +1/-0.5 without fees; NOT live or shadow PnL evidence",
+        "confidence is not accuracy; see calibration / ECE / Brier"
+      ]
+    },
+    "test": {
+      "n": 100,
+      "threshold": 0.65,
+      "confusion": {
+        "tp": 0,
+        "fp": 0,
+        "tn": 74,
+        "fn": 26,
+        "precision": 0.0,
+        "recall": 0.0,
+        "accuracy": 0.74,
+        "false_positive_rate": 0.0,
+        "false_negative_rate": 1.0
+      },
+      "calibration": [
+        {
+          "lower": 0.0,
+          "upper": 0.1,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.1,
+          "upper": 0.2,
+          "count": 7,
+          "mean_confidence": 0.1959046176724113,
+          "empirical_rate": 0.14285714285714285
+        },
+        {
+          "lower": 0.2,
+          "upper": 0.30000000000000004,
+          "count": 67,
+          "mean_confidence": 0.24620640687330536,
+          "empirical_rate": 0.23880597014925373
+        },
+        {
+          "lower": 0.30000000000000004,
+          "upper": 0.4,
+          "count": 26,
+          "mean_confidence": 0.32525640136746203,
+          "empirical_rate": 0.34615384615384615
+        },
+        {
+          "lower": 0.4,
+          "upper": 0.5,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.5,
+          "upper": 0.6000000000000001,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.6000000000000001,
+          "upper": 0.7000000000000001,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.7000000000000001,
+          "upper": 0.8,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.8,
+          "upper": 0.9,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.9,
+          "upper": 1.0,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        }
+      ],
+      "ece": 0.014104951486643254,
+      "brier": 0.18654808207216816,
+      "mean_probability": 0.26323828019772355,
+      "buy_hit_rate": 0.0,
+      "illustrative_expectancy": 0.0,
+      "notes": [
+        "illustrative_expectancy uses synthetic payoff +1/-0.5 without fees; NOT live or shadow PnL evidence",
+        "confidence is not accuracy; see calibration / ECE / Brier"
+      ]
+    },
+    "synthetic": true,
+    "notes": [
+      "generated 500 SYNTHETIC examples \u2192 artifacts/decision/synthetic_train.jsonl",
+      "SYNTHETIC DATA IS NOT PROFITABILITY EVIDENCE",
+      "time-aware split: train=300 valid=100 test=100 (chronological; no shuffle)",
+      "selected candidate: L2 logistic regression"
+    ],
+    "schema": {
+      "name": "hit_plus10_before_minus5",
+      "definition": "1 iff price reaches +10% before -5% within 3600s after latency-adjusted entry; else 0",
+      "take_profit_pct": 10.0,
+      "stop_pct": 5.0,
+      "horizon_seconds": 3600.0,
+      "entry_rule": "Simulated entry uses price at detection_ts + latency_seconds, never the observed wallet entry price",
+      "leakage_risks": [
+        "Must not use future META scores or post-entry volumes as features",
+        "Must not use wallet entry price as our fill",
+        "Random shuffle train/test is forbidden; use time-aware splits"
+      ],
+      "unavailable_features": [
+        "wallet historical PnL / win rate (smart_money tracks mints only)",
+        "copyability after realistic latency (no fill-time price journal yet)",
+        "SOL regime / broad memecoin regime (not collected)",
+        "dev transaction graph (creator_pct is a proxy only)",
+        "social velocity (META marks UNVERIFIED without social provider)"
+      ]
+    }
+  },
+  "stumps": {
+    "model_kind": "stumps",
+    "model_path": "artifacts/decision/model_stumps.v1.json",
+    "model_version": "stumps.v1",
+    "feature_schema_version": "features.v1",
+    "n_train": 300,
+    "n_valid": 100,
+    "n_test": 100,
+    "valid": {
+      "n": 100,
+      "threshold": 0.65,
+      "confusion": {
+        "tp": 26,
+        "fp": 74,
+        "tn": 0,
+        "fn": 0,
+        "precision": 0.26,
+        "recall": 1.0,
+        "accuracy": 0.26,
+        "false_positive_rate": 1.0,
+        "false_negative_rate": 0.0
+      },
+      "calibration": [
+        {
+          "lower": 0.0,
+          "upper": 0.1,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.1,
+          "upper": 0.2,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.2,
+          "upper": 0.30000000000000004,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.30000000000000004,
+          "upper": 0.4,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.4,
+          "upper": 0.5,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.5,
+          "upper": 0.6000000000000001,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.6000000000000001,
+          "upper": 0.7000000000000001,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.7000000000000001,
+          "upper": 0.8,
+          "count": 100,
+          "mean_confidence": 0.7489436168894085,
+          "empirical_rate": 0.26
+        },
+        {
+          "lower": 0.8,
+          "upper": 0.9,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.9,
+          "upper": 1.0,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        }
+      ],
+      "ece": 0.48894361688940846,
+      "brier": 0.42777780930025505,
+      "mean_probability": 0.7489436168894085,
+      "buy_hit_rate": 0.26,
+      "illustrative_expectancy": -0.11,
+      "notes": [
+        "illustrative_expectancy uses synthetic payoff +1/-0.5 without fees; NOT live or shadow PnL evidence",
+        "confidence is not accuracy; see calibration / ECE / Brier"
+      ]
+    },
+    "test": {
+      "n": 100,
+      "threshold": 0.65,
+      "confusion": {
+        "tp": 26,
+        "fp": 74,
+        "tn": 0,
+        "fn": 0,
+        "precision": 0.26,
+        "recall": 1.0,
+        "accuracy": 0.26,
+        "false_positive_rate": 1.0,
+        "false_negative_rate": 0.0
+      },
+      "calibration": [
+        {
+          "lower": 0.0,
+          "upper": 0.1,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.1,
+          "upper": 0.2,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.2,
+          "upper": 0.30000000000000004,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.30000000000000004,
+          "upper": 0.4,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.4,
+          "upper": 0.5,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.5,
+          "upper": 0.6000000000000001,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.6000000000000001,
+          "upper": 0.7000000000000001,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.7000000000000001,
+          "upper": 0.8,
+          "count": 100,
+          "mean_confidence": 0.7506532723216034,
+          "empirical_rate": 0.26
+        },
+        {
+          "lower": 0.8,
+          "upper": 0.9,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        },
+        {
+          "lower": 0.9,
+          "upper": 1.0,
+          "count": 0,
+          "mean_confidence": 0.0,
+          "empirical_rate": 0.0
+        }
+      ],
+      "ece": 0.4906532723216034,
+      "brier": 0.43214393478764274,
+      "mean_probability": 0.7506532723216034,
+      "buy_hit_rate": 0.26,
+      "illustrative_expectancy": -0.11,
+      "notes": [
+        "illustrative_expectancy uses synthetic payoff +1/-0.5 without fees; NOT live or shadow PnL evidence",
+        "confidence is not accuracy; see calibration / ECE / Brier"
+      ]
+    },
+    "synthetic": true,
+    "notes": [
+      "generated 500 SYNTHETIC examples \u2192 artifacts/decision/synthetic_train.jsonl",
+      "SYNTHETIC DATA IS NOT PROFITABILITY EVIDENCE",
+      "time-aware split: train=300 valid=100 test=100 (chronological; no shuffle)",
+      "stump ensemble comparison candidate"
+    ],
+    "schema": {
+      "name": "hit_plus10_before_minus5",
+      "definition": "1 iff price reaches +10% before -5% within 3600s after latency-adjusted entry; else 0",
+      "take_profit_pct": 10.0,
+      "stop_pct": 5.0,
+      "horizon_seconds": 3600.0,
+      "entry_rule": "Simulated entry uses price at detection_ts + latency_seconds, never the observed wallet entry price",
+      "leakage_risks": [
+        "Must not use future META scores or post-entry volumes as features",
+        "Must not use wallet entry price as our fill",
+        "Random shuffle train/test is forbidden; use time-aware splits"
+      ],
+      "unavailable_features": [
+        "wallet historical PnL / win rate (smart_money tracks mints only)",
+        "copyability after realistic latency (no fill-time price journal yet)",
+        "SOL regime / broad memecoin regime (not collected)",
+        "dev transaction graph (creator_pct is a proxy only)",
+        "social velocity (META marks UNVERIFIED without social provider)"
+      ]
+    }
+  }
+}

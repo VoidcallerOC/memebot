@@ -1,0 +1,6 @@
+{
+  "buy_threshold": 0.65,
+  "feature_schema_version": "features.v1",
+  "kind": "rules",
+  "model_version": "rules.v1"
+}
