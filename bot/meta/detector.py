@@ -42,6 +42,35 @@ PROVIDER_NOTES = (
 )
 
 
+def prepare_snapshot_for_scoring(
+    snap: TokenSnapshot,
+    history: ObservationHistory,
+    *,
+    now: Optional[float] = None,
+    rpc_url: str = "",
+    session: Optional[requests.Session] = None,
+    attach_holders: bool = True,
+) -> dict:
+    """Apply the same per-token enrichment MetaDetector.evaluate uses before scoring.
+
+    Order matches production META:
+      1. optional holder concentration (RPC; skipped if already on snap)
+      2. ObservationHistory reconstructed windows (4h; never interpolated)
+      3. caller runs score_snapshot()
+
+    Does not invent social/wallet windows — absent providers stay UNVERIFIED.
+    """
+    now = now if now is not None else time.time()
+    holders_attached = False
+    if attach_holders:
+        holders_attached = attach_holder_concentration(snap, rpc_url, session)
+    windows = history.attach_reconstructed_windows(snap, now)
+    return {
+        "holders_attached": bool(holders_attached),
+        "windows_attached": dict(windows),
+    }
+
+
 def score_snapshot(snap: TokenSnapshot) -> MetaSignal:
     themes = classify_narratives(snap)
     narrative_vel, narrative_fresh, catalyst = score_narrative(snap, themes)
@@ -139,7 +168,13 @@ class MetaDetector:
         coverage = {w: 0 for w in ("5m", "1h", "4h", "6h", "24h")}
         signals: list[MetaSignal] = []
         for snap in snapshots:
-            self.history.attach_reconstructed_windows(snap, now)
+            # Holders are attached in collect_live / pipeline before evaluate.
+            # Re-attach is a no-op when fields already present (shared-context safe).
+            prepare_snapshot_for_scoring(
+                snap, self.history, now=now,
+                rpc_url=self.cfg.rpc_url, session=self.session,
+                attach_holders=True,
+            )
             for window, item in snap.market.items():
                 if window in coverage and item.volume_usd is not None:
                     coverage[window] += 1

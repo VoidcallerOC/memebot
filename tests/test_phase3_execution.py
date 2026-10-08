@@ -130,7 +130,9 @@ def test_live_entry_opens_from_confirmed_raw_fill_and_persists_full_record(monke
     bot.cfg = cfg()
     bot.portfolio = Portfolio()
     bot.strategy = types.SimpleNamespace(find_candidates=lambda: [types.SimpleNamespace(mint=MINT)])
-    bot.screener = types.SimpleNamespace(screen=lambda _mint: types.SimpleNamespace(passed=True, price_usd=1.0, symbol="TEST"))
+    bot.screener = types.SimpleNamespace(
+        screen=lambda _mint, **kwargs: types.SimpleNamespace(passed=True, price_usd=1.0, symbol="TEST")
+    )
     bot.risk = types.SimpleNamespace(position_size_usd=lambda: 5.0)
     bot.executor = types.SimpleNamespace(swap=lambda *args, **kwargs: SwapResult(
         ok=True, simulated=False, in_amount=1, out_amount=1, tx_signature="sig-fill",

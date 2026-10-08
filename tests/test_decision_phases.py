@@ -266,7 +266,9 @@ def test_main_dry_run_gates_on_decision_shadow(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(bot.strategy, "find_candidates", lambda: [Cand()])
     monkeypatch.setattr(
         bot.screener, "screen",
-        lambda mint: TokenSafety(mint=mint, passed=True, liquidity_usd=50_000, price_usd=0.01, symbol="C"),
+        lambda mint, **kwargs: TokenSafety(
+            mint=mint, passed=True, liquidity_usd=50_000, price_usd=0.01, symbol="C",
+        ),
     )
     calls = []
     monkeypatch.setattr(
@@ -309,7 +311,9 @@ def test_main_live_armed_does_not_use_decision_gate(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(bot.strategy, "find_candidates", lambda: [Cand()])
     monkeypatch.setattr(
         bot.screener, "screen",
-        lambda mint: TokenSafety(mint=mint, passed=True, liquidity_usd=50_000, price_usd=0.01, symbol="L"),
+        lambda mint, **kwargs: TokenSafety(
+            mint=mint, passed=True, liquidity_usd=50_000, price_usd=0.01, symbol="L",
+        ),
     )
     from bot.jupiter import SwapResult, TransactionStatus
     monkeypatch.setattr(

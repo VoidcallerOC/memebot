@@ -71,8 +71,10 @@ class TradingBot:
         self._reconciliation_required = False
         self.decision_shadow = None
         if cfg.decision_shadow_enabled and DecisionShadowBridge is not None:
+            # Share the bot HTTP session so safety + META + decision reuse one client.
             self.decision_shadow = DecisionShadowBridge(
                 cfg, self.risk, self.portfolio, screener=self.screener,
+                session=self.session,
             )
             log.info(
                 "decision shadow ENABLED (dry-run journal/gate only; never authorizes live)"
@@ -145,13 +147,17 @@ class TradingBot:
         for candidate in self.strategy.find_candidates():
             if self.portfolio.has(candidate.mint):
                 continue
-            safety = self.screener.screen(candidate.mint)
+            # One DexScreener TokenSnapshot per candidate for safety + decision parity.
+            market_snap = self._candidate_market_snapshot(candidate.mint)
+            safety = self.screener.screen(candidate.mint, snapshot=market_snap)
             decision_shadow = getattr(self, "decision_shadow", None)
             if not safety.passed or safety.price_usd <= 0:
                 # Still journal counterfactual when shadow is on (rejected by safety).
                 if decision_shadow is not None and not self.cfg.is_armed:
                     try:
-                        decision_shadow.evaluate_candidate(safety)
+                        decision_shadow.evaluate_candidate(
+                            safety, snapshot=market_snap,
+                        )
                     except Exception as exc:
                         log.debug("decision shadow journal failed: %s", exc)
                 continue
@@ -159,7 +165,9 @@ class TradingBot:
             # Phase 7/11: decision engine gates dry-run paper only; never live.
             if decision_shadow is not None and not self.cfg.is_armed:
                 try:
-                    eng = decision_shadow.evaluate_candidate(safety)
+                    eng = decision_shadow.evaluate_candidate(
+                        safety, snapshot=market_snap,
+                    )
                 except Exception as exc:
                     log.error("decision shadow failed closed: %s", exc)
                     continue
@@ -219,6 +227,33 @@ class TradingBot:
             self.notifier.buy(safety.symbol, size_usd, opened.entry_price, result.simulated)
             self._save()
             return
+
+    def _candidate_market_snapshot(self, mint: str):
+        """Fetch one META TokenSnapshot for this candidate (DexScreener + holders).
+
+        Shared by SafetyScreener and DecisionShadowBridge so they observe the
+        same market data. Returns None on provider failure (callers fail closed).
+        """
+        try:
+            from .meta.adapters import attach_holder_concentration, snapshot_from_dexscreener
+        except Exception as exc:  # pragma: no cover - package always present in tree
+            log.debug("meta adapters unavailable: %s", exc)
+            return None
+        now = time.time()
+        session = getattr(self, "session", None)
+        try:
+            snap = snapshot_from_dexscreener(mint, session, now=now)
+        except Exception as exc:
+            log.debug("candidate DexScreener snapshot failed for %s: %s", mint[:6], exc)
+            return None
+        if snap is None:
+            return None
+        try:
+            rpc = getattr(getattr(self, "cfg", None), "rpc_url", "") or ""
+            attach_holder_concentration(snap, rpc, session)
+        except Exception as exc:
+            log.debug("holder attach failed for %s: %s", mint[:6], exc)
+        return snap
 
     def _sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
         if mint not in self.portfolio.positions:
