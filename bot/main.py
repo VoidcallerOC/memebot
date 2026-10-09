@@ -133,9 +133,12 @@ class TradingBot:
         for mint in list(self.portfolio.positions.keys()):
             pos = self.portfolio.positions[mint]
             price = _price_usd(self.jup, mint)
+            # None means the quote failed. A successful quote can still be 0.
             if price is None:
-                log.warning("%s: no price/route — attempting emergency exit", pos.symbol)
-                self._sell(mint, 1.0, price or 0.0, "no_route_exit")
+                log.warning(
+                    "%s: exit quote unavailable — holding position and cost basis",
+                    pos.symbol,
+                )
                 continue
             for action in self.risk.evaluate_exit(pos.entry_price, price, pos.ladder_filled):
                 if action.reason.startswith("take_profit:"):
@@ -260,6 +263,12 @@ class TradingBot:
             return
         pos = self.portfolio.positions[mint]
         symbol = pos.symbol
+        if price is None:
+            log.warning(
+                "%s: refusing %s without an exit mark; position unchanged",
+                symbol, reason,
+            )
+            return
         if self.cfg.is_armed:
             if not self._settle_live_sell(pos, fraction, price, reason):
                 return
