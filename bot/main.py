@@ -26,6 +26,7 @@ from .jupiter import (
 )
 from .preflight import run_preflight
 from .portfolio import Portfolio
+from .paths import log_resolved_paths, with_resolved_data_paths
 from .process_lock import ProcessLock
 from .reconcile import reconcile_wallet
 from .risk import RiskManager
@@ -453,10 +454,15 @@ class TradingBot:
 def main() -> int:
     _setup_logging()
     try:
-        cfg = load_config()
+        cfg = with_resolved_data_paths(load_config())
     except ValueError as exc:
         log.error("%s", exc)
         return 2
+    log_resolved_paths(
+        state_file=cfg.state_file,
+        process_lock_file=cfg.process_lock_file,
+        decision_shadow_file=cfg.decision_shadow_file,
+    )
     process_lock = ProcessLock(cfg.process_lock_file)
     if not process_lock.acquire():
         log.error("another memebot instance is running or process lock is unavailable")

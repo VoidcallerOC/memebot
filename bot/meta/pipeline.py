@@ -12,6 +12,7 @@ Never calls the swap executor.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Callable, Optional
 
@@ -49,10 +50,17 @@ class MetaPipeline:
         log.info("meta pipeline snapshot: %d/%d tokens persisted", len(snapshots), len(mints))
         return self.detector.evaluate(snapshots, persist=True, persist_raw=True, now=now)
 
-    def run_forever(self, cycles: Optional[int] = None) -> None:
-        """Blocking observational loop. Does not start the trading bot."""
+    def run_forever(self, cycles: Optional[int] = None,
+                    stop_event: Optional[threading.Event] = None) -> None:
+        """Blocking observational loop. Does not start the trading bot.
+
+        When ``stop_event`` is set (e.g. by a SIGTERM handler) the loop exits
+        after the current tick has finished writing; the inter-tick sleep wakes
+        immediately.
+        """
+        stop_event = stop_event if stop_event is not None else threading.Event()
         seen = 0
-        while cycles is None or seen < cycles:
+        while (cycles is None or seen < cycles) and not stop_event.is_set():
             started = time.time()
             try:
                 report = self.snapshot_universe(now=started)
@@ -63,6 +71,10 @@ class MetaPipeline:
             seen += 1
             if cycles is not None and seen >= cycles:
                 break
+            if stop_event.is_set():
+                break
             sleep_for = self.interval - (time.time() - started)
             if sleep_for > 0:
-                time.sleep(sleep_for)
+                stop_event.wait(sleep_for)
+        if stop_event.is_set():
+            log.info("meta pipeline stop requested; exiting after %d tick(s)", seen)
