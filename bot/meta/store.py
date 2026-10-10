@@ -66,16 +66,25 @@ def read_observations_from(path: str, offset: int) -> tuple[list[dict[str, Any]]
     return rows, consumed
 
 
-def stream_observations_from(path: str, offset: int, on_row: Callable[[dict[str, Any]], None]) -> int:
+def stream_observations_from(path: str, offset: int, on_row: Callable[[dict[str, Any]], None],
+                             on_raw: Optional[Callable[[bytes], None]] = None) -> int:
     """Same consumption rules as ``read_observations_from``, but hands each row
     to ``on_row`` instead of building a list (bounded memory on full reloads).
-    Returns the new offset."""
+    Returns the new offset.
+
+    ``on_raw``, when given, receives exactly the bytes that are consumed (every
+    complete line, parsed or skipped, and a consumed unterminated JSON tail),
+    in file order, from the same read that produced the rows: the
+    concatenation of everything passed to it is bytes [offset, return value).
+    """
     consumed = offset
     with open(path, "rb") as fh:
         fh.seek(offset)
         for raw in iter(fh.readline, b""):
             if raw.endswith(b"\n"):
                 consumed += len(raw)
+                if on_raw is not None:
+                    on_raw(raw)
                 row = _parse_line(raw)
                 if row is not None:
                     on_row(row)
@@ -83,6 +92,8 @@ def stream_observations_from(path: str, offset: int, on_row: Callable[[dict[str,
             # Unterminated tail: only ever the last chunk before EOF.
             row = _parse_line(raw)
             if row is not None:
+                if on_raw is not None:
+                    on_raw(raw)
                 on_row(row)
                 consumed += len(raw)
             break

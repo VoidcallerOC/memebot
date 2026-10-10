@@ -517,18 +517,20 @@ def test_partial_refresh_error_leaves_state_unchanged(tmp_path, monkeypatch):
     _append(path, make_stream(6, hours=2, mints=1))
     h = ObservationHistory(str(path))
     h.load()
-    before = (len(h.load()), h._offset, h.stats())
+    before = (len(h.load()), h._offset, h.stats(), h.fingerprint())
     monkeypatch.setattr(history_module, "_REFRESH_LIST_MAX_BYTES", 0)  # force streaming path
     _append(path, make_stream(7, hours=1, start=T0 + 3 * 3600, mints=1))
 
-    def boom(path_, start, on_row):
+    def boom(path_, start, on_row, on_raw=None):
+        if on_raw is not None:
+            on_raw(b'{"half": "applied"}\n')
         on_row({"kind": MARKET_ROW, "observed_at": T0 + 9e5, "mint": _mint(0)})
         raise OSError("disk read error")
 
     monkeypatch.setattr(history_module, "stream_observations_from", boom)
     with pytest.raises(OSError):
         h.refresh()
-    assert (len(h.load()), h._offset, h.stats()) == before
+    assert (len(h.load()), h._offset, h.stats(), h.fingerprint()) == before
 
 
 # ---------------------------------------------------------------------------
