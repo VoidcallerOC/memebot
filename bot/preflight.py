@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from typing import Any, Callable, Optional
 
 from .config import MAX_EXPERIMENT_USD, Config, load_config
 from .jupiter import JupiterClient, SwapExecutor
+from .paths import with_resolved_data_paths
 from .process_lock import process_lock_available
 from .reconcile import fetch_sol_balance, get_wallet_pubkey
 from .risk import RiskManager
@@ -287,11 +289,26 @@ def run_preflight(
     )
 
 
+EXIT_CONFIG_INVALID = 2
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    """Standalone preflight CLI.
+
+    Exit codes: 0 eligible, 1 not eligible, 2 invalid path configuration
+    (e.g. a relative MEMEBOT_DATA_DIR; same code bot.main uses for this case).
+    Persistence paths are resolved exactly as bot.main resolves them, so the
+    conflicting-process check probes the same absolute lock file and the
+    journal check targets the same state path, regardless of the CWD.
+    """
     parser = argparse.ArgumentParser(description="Run the read-only safety preflight")
     parser.add_argument("--allocation-usd", type=float, default=None)
     args = parser.parse_args(argv)
-    cfg = load_config()
+    try:
+        cfg = with_resolved_data_paths(load_config())
+    except ValueError as exc:
+        print(f"preflight: invalid path configuration: {exc}", file=sys.stderr)
+        return EXIT_CONFIG_INVALID
     result = run_preflight(cfg, proposed_allocation_usd=args.allocation_usd)
     print(result.to_json())
     return 0 if result.eligible else 1

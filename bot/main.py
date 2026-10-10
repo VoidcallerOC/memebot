@@ -462,6 +462,7 @@ def main() -> int:
         state_file=cfg.state_file,
         process_lock_file=cfg.process_lock_file,
         decision_shadow_file=cfg.decision_shadow_file,
+        decision_model_path=cfg.decision_model_path,
     )
     process_lock = ProcessLock(cfg.process_lock_file)
     if not process_lock.acquire():

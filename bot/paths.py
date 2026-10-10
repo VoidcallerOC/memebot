@@ -48,22 +48,39 @@ def resolve_data_path(path: str) -> str:
     return str(data_dir() / p)
 
 
+def resolve_repo_path(path: str) -> str:
+    """Return ``path`` unchanged if absolute, else anchored under REPO_ROOT.
+
+    For code artifacts shipped with the repository (e.g. the decision model
+    under ``artifacts/``). Never anchored at the CWD or at MEMEBOT_DATA_DIR.
+    """
+    p = Path(os.path.expanduser(str(path)))
+    if p.is_absolute():
+        return str(p)
+    return str(REPO_ROOT / p)
+
+
 def meta_lock_path() -> str:
     raw = (os.getenv(META_LOCK_ENV) or "").strip() or DEFAULT_META_LOCK_FILE
     return resolve_data_path(raw)
 
 
 def with_resolved_data_paths(cfg: Any) -> Any:
-    """Return a copy of a (frozen) Config with absolute persistence paths.
+    """Return a copy of a (frozen) Config with absolute file paths.
 
-    Only persistence paths are touched: state_file, process_lock_file,
-    decision_shadow_file. Trading / risk / live settings are copied verbatim.
+    Persistence paths (state_file, process_lock_file, decision_shadow_file)
+    resolve under data_dir(); the code-artifact path decision_model_path
+    resolves under REPO_ROOT. Trading / risk / live settings are copied
+    verbatim.
     """
     changes = {}
     for name in ("state_file", "process_lock_file", "decision_shadow_file"):
         value = getattr(cfg, name, None)
         if value:
             changes[name] = resolve_data_path(value)
+    model_path = getattr(cfg, "decision_model_path", None)
+    if model_path:
+        changes["decision_model_path"] = resolve_repo_path(model_path)
     return dataclasses.replace(cfg, **changes) if changes else cfg
 
 
