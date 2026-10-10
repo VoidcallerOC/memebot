@@ -82,7 +82,10 @@ def _parse_out_amount_usd(raw: object) -> float | None:
         return None
     if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
         return None
-    price = amount / 1_000_000
+    try:
+        price = amount / 1_000_000
+    except OverflowError:
+        return None
     if not math.isfinite(price):
         return None
     return float(price)
