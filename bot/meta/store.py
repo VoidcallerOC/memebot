@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Optional
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Optional
 
 
 def append_observation(path: str, payload: dict[str, Any]) -> None:
@@ -62,20 +62,64 @@ def read_observations_from(path: str, offset: int) -> tuple[list[dict[str, Any]]
     complete lines are skipped, exactly like ``load_observations``.
     """
     rows: list[dict[str, Any]] = []
+    consumed = stream_observations_from(path, offset, rows.append)
+    return rows, consumed
+
+
+def stream_observations_from(path: str, offset: int, on_row: Callable[[dict[str, Any]], None],
+                             on_raw: Optional[Callable[[bytes], None]] = None) -> int:
+    """Same consumption rules as ``read_observations_from``, but hands each row
+    to ``on_row`` instead of building a list (bounded memory on full reloads).
+    Returns the new offset.
+
+    ``on_raw``, when given, receives exactly the bytes that are consumed (every
+    complete line, parsed or skipped, and a consumed unterminated JSON tail),
+    in file order, from the same read that produced the rows: the
+    concatenation of everything passed to it is bytes [offset, return value).
+    """
     consumed = offset
     with open(path, "rb") as fh:
         fh.seek(offset)
         for raw in iter(fh.readline, b""):
             if raw.endswith(b"\n"):
                 consumed += len(raw)
+                if on_raw is not None:
+                    on_raw(raw)
                 row = _parse_line(raw)
                 if row is not None:
-                    rows.append(row)
+                    on_row(row)
                 continue
             # Unterminated tail: only ever the last chunk before EOF.
             row = _parse_line(raw)
             if row is not None:
-                rows.append(row)
+                if on_raw is not None:
+                    on_raw(raw)
+                on_row(row)
                 consumed += len(raw)
             break
-    return rows, consumed
+    return consumed
+
+
+def iter_observation_rows(fh: BinaryIO, end: int, split_points: Iterable[int] = ()) -> Iterator[dict[str, Any]]:
+    """Yield the rows a sequence of ``read_observations_from`` calls produced.
+
+    ``fh`` is an open binary handle positioned at byte 0; only bytes before
+    ``end`` are read (bytes appended after the caller's cursor are ignored).
+    Lines split at every newline and additionally at each offset in
+    ``split_points`` (positions where an unterminated, JSON-object tail was
+    consumed by an earlier read), so the result is row-for-row identical to
+    what the incremental reads returned. Streams one line at a time.
+    """
+    stops = sorted(p for p in split_points if 0 < p < end)
+    stops.append(end)
+    consumed = 0
+    for stop in stops:
+        while consumed < stop:
+            raw = fh.readline(stop - consumed)
+            if not raw:
+                return
+            consumed += len(raw)
+            row = _parse_line(raw)
+            if row is not None:
+                yield row
+
