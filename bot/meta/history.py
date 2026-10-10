@@ -17,7 +17,8 @@ import time
 from typing import Any, Optional
 
 from .model import MarketWindow, TokenSnapshot, Score, ok, unverified
-from .store import append_observation, load_observations
+from .store import append_observation, read_observations_from
+from ..paths import resolve_data_path
 
 MARKET_ROW = "market_snapshot"
 SIGNAL_ROW = "signal"
@@ -27,10 +28,12 @@ DEFAULT_OBSERVATIONS_FILE = "meta_observations.jsonl"
 HOUR = 3600.0
 WINDOW_TOLERANCE_SECONDS = 600.0
 RECONSTRUCTED_WINDOWS = {"4h": 4}
+_HEAD_BYTES = 64
 
 
 def default_observations_path() -> str:
-    return os.getenv("META_OBSERVATIONS_FILE", DEFAULT_OBSERVATIONS_FILE).strip() or DEFAULT_OBSERVATIONS_FILE
+    raw = os.getenv("META_OBSERVATIONS_FILE", DEFAULT_OBSERVATIONS_FILE).strip() or DEFAULT_OBSERVATIONS_FILE
+    return resolve_data_path(raw)
 
 
 class ObservationHistory:
@@ -38,20 +41,85 @@ class ObservationHistory:
         self.path = path or default_observations_path()
         self.tolerance = float(tolerance_seconds)
         self._rows: Optional[list[dict[str, Any]]] = None
+        # Incremental-read cursor: (st_dev, st_ino) of the file we read, the
+        # byte offset just past the last consumed complete line, and the first
+        # bytes of the file (detects copy-truncate followed by regrowth).
+        self._file_id: Optional[tuple[int, int]] = None
+        self._offset = 0
+        self._head = b""
 
     # -- storage ------------------------------------------------------------
 
     def load(self, force: bool = False) -> list[dict[str, Any]]:
         if self._rows is None or force:
-            self._rows = load_observations(self.path)
+            self._full_reload()
+        return self._rows  # type: ignore[return-value]
+
+    def refresh(self) -> list[dict[str, Any]]:
+        """Pick up rows appended by another process since the last read.
+
+        Reads only new complete lines from the remembered byte offset. A torn
+        last line is left until it is completed. If the file was replaced
+        (inode change), truncated (size < offset) or rewritten (head bytes
+        differ), the whole file is reloaded. Never interpolates or invents rows.
+        """
+        if self._rows is None:
+            return self.load()
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            if self._file_id is not None or self._rows:
+                self._rows = []
+                self._file_id, self._offset, self._head = None, 0, b""
+            return self._rows
+        if ((st.st_dev, st.st_ino) != self._file_id or st.st_size < self._offset
+                or not self._head_matches()):
+            return self._full_reload()
+        if st.st_size > self._offset:
+            rows, self._offset = read_observations_from(self.path, self._offset)
+            self._rows.extend(rows)
+            if len(self._head) < _HEAD_BYTES:
+                self._head = self._read_head()
         return self._rows
+
+    def _full_reload(self) -> list[dict[str, Any]]:
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            self._rows = []
+            self._file_id, self._offset, self._head = None, 0, b""
+            return self._rows
+        rows, offset = read_observations_from(self.path, 0)
+        self._rows = rows
+        self._file_id = (st.st_dev, st.st_ino)
+        self._offset = offset
+        self._head = self._read_head()
+        return self._rows
+
+    def _read_head(self) -> bytes:
+        try:
+            with open(self.path, "rb") as fh:
+                return fh.read(min(_HEAD_BYTES, self._offset))
+        except OSError:
+            return b""
+
+    def _head_matches(self) -> bool:
+        if not self._head:
+            return True
+        try:
+            with open(self.path, "rb") as fh:
+                return fh.read(len(self._head)) == self._head
+        except OSError:
+            return False
 
     def append(self, kind: str, payload: dict[str, Any], recorded_at: Optional[float] = None) -> dict[str, Any]:
         row = {"kind": kind, "recorded_at": recorded_at if recorded_at is not None else time.time()}
         row.update(payload)
         append_observation(self.path, row)
         if self._rows is not None:
-            self._rows.append(row)
+            # Read our own row back through the cursor so the cache and the
+            # byte offset stay consistent (no double counting on refresh).
+            self.refresh()
         return row
 
     def append_market_snapshot(self, snap: TokenSnapshot, recorded_at: Optional[float] = None) -> dict[str, Any]:

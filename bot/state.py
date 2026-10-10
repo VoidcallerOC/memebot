@@ -27,15 +27,39 @@ def save_state(path: str, portfolio: Portfolio, risk: RiskManager) -> None:
         "portfolio": portfolio.to_dict(),
         "risk": risk.to_dict(),
     }
+    tmp = None
     try:
         directory = os.path.dirname(os.path.abspath(path))
         os.makedirs(directory, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())  # data on disk before it becomes visible
         os.replace(tmp, path)  # atomic on POSIX and Windows
+        tmp = None
+        _fsync_dir(directory)  # make the rename itself durable
     except Exception as exc:
         log.error("failed to save state to %s: %s", path, exc)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _fsync_dir(directory: str) -> None:
+    """fsync a directory so a rename inside it survives power loss (POSIX)."""
+    try:
+        dfd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return  # e.g. Windows cannot open directories; replace is still atomic
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
 
 
 def load_state(path: str, portfolio: Portfolio, risk: RiskManager) -> bool:

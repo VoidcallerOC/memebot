@@ -6,6 +6,7 @@ import types
 
 from bot.config import Config
 from bot.jupiter import JupiterClient, SwapExecutor
+from bot.paths import resolve_data_path
 import bot.main as main_module
 
 
@@ -51,8 +52,11 @@ def test_live_startup_blocks_when_preflight_fails(monkeypatch):
         main_module, "TradingBot", lambda _cfg: (_ for _ in ()).throw(AssertionError("bot must not start"))
     )
 
+    monkeypatch.delenv("MEMEBOT_DATA_DIR", raising=False)
     assert main_module.main() == 4
-    assert calls == [("lock-init", ".test-lock"), "lock-acquire", "lock-release"]
+    # PR1: relative lock paths are anchored under MEMEBOT_DATA_DIR (default:
+    # repo root) so the single-instance lock no longer depends on the CWD.
+    assert calls == [("lock-init", resolve_data_path(".test-lock")), "lock-acquire", "lock-release"]
 
 
 def test_live_allocation_above_twenty_is_rejected_before_execution(monkeypatch):

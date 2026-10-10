@@ -178,6 +178,13 @@ class DecisionShadowBridge:
         if self._engine is None:
             raise RuntimeError("DecisionShadowBridge not enabled")
         now = now if now is not None else time.time()
+        # The collector (bot.meta run) appends to the observation file from
+        # another process. Pick up its new rows every evaluation so the
+        # reconstructed 4h window keeps working beyond the first ~70 minutes.
+        try:
+            self._history.refresh()
+        except OSError as exc:
+            log.warning("decision shadow: observation history refresh failed: %s", exc)
         snap, meta_signal, source = build_meta_context(
             safety,
             now=now,

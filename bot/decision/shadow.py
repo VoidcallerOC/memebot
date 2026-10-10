@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from ..paths import resolve_data_path
 from .engine import EngineResult
 from .labels import OutcomeLabel, PriceTick, label_path
 from .schema import DEFAULT_DETECTION_LATENCY_SECONDS
@@ -102,13 +103,17 @@ class ShadowRecord:
 
 class ShadowJournal:
     def __init__(self, path: Optional[str] = None):
-        self.path = path or os.getenv("DECISION_SHADOW_FILE", DEFAULT_SHADOW_FILE)
+        self.path = path or resolve_data_path(
+            os.getenv("DECISION_SHADOW_FILE", DEFAULT_SHADOW_FILE).strip() or DEFAULT_SHADOW_FILE
+        )
 
     def append(self, record: ShadowRecord) -> None:
         path = Path(self.path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record.to_dict(), sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def load(self) -> list[dict[str, Any]]:
         path = Path(self.path)

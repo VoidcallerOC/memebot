@@ -152,10 +152,16 @@ class MetaDetector:
             snapshots.append(snap)
         return snapshots
 
-    def scan_live(self, now: Optional[float] = None) -> MetaReport:
+    def scan_live(self, now: Optional[float] = None, persist: bool = True) -> MetaReport:
+        """Collect and evaluate the live universe.
+
+        ``persist`` controls whether signal/theme rows are appended to the
+        observation history. The ad-hoc ``python -m bot.meta report`` CLI passes
+        ``persist=False`` so reports never pollute the collector's history.
+        """
         now = now if now is not None else time.time()
         snapshots = self.collect_live(now)
-        return self.evaluate(snapshots, persist=True, persist_raw=False, now=now)
+        return self.evaluate(snapshots, persist=persist, persist_raw=False, now=now)
 
     # -- evaluation ---------------------------------------------------------
 
