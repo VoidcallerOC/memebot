@@ -1,11 +1,14 @@
-"""Missing exit quotes must not book a zero-price sale.
+"""Exit quotes must be executable before they can change a position.
 
-A failed fetch is ``None`` from ``_price_usd``. A successful quote can still
-return a numeric 0, and that mark stays on the existing exit path.
+A missing quote is ``None`` from ``_price_usd``. A malformed outAmount
+(non-canonical text, above uint64, negative, non-finite, empty, non-numeric,
+or wrong type) is rejected the same way: no sale and no PnL. Canonical
+``"0"`` and int ``0`` stay on the exit path.
 """
 from __future__ import annotations
 
 import json
+import math
 import types
 from datetime import date
 from pathlib import Path
@@ -269,6 +272,454 @@ def test_daily_halt_persists_across_load_and_resets_on_utc_date_roll(monkeypatch
     assert rolled_load.trading_halted() is False
     assert rolled_load.realized_pnl_today == 0.0
     assert json.loads(path.read_text())["risk"]["halted_today"] is True
+
+
+def _bind_quotes(bot, payloads):
+    """Drive ``_price_usd`` through real parsing, not a patched return value."""
+    seq = iter(payloads)
+
+    def quote(input_mint, output_mint, amount):
+        assert input_mint == MINT
+        assert output_mint == USDC_MINT
+        assert amount == 1_000_000
+        return next(seq)
+
+    bot.jup = types.SimpleNamespace(quote=quote)
+    return bot
+
+
+def _watch_sales(bot):
+    calls = []
+    original = bot.portfolio.sell_fraction
+
+    def wrapped(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    bot.portfolio.sell_fraction = wrapped
+    return calls
+
+
+def _assert_held(bot, *, tokens, size_usd, realized):
+    pos = bot.portfolio.positions[MINT]
+    assert pos.tokens == tokens
+    assert pos.size_usd == size_usd
+    assert pos.entry_price == 1.0
+    assert pos.realized_pnl == pytest.approx(realized)
+    assert bot.portfolio.realized_pnl == pytest.approx(realized)
+    assert bot.risk.realized_pnl_today == pytest.approx(realized)
+    assert bot.portfolio.pending_intents == []
+    return pos
+
+
+@pytest.mark.parametrize(
+    ("quote", "kind", "price"),
+    [
+        (None, main_module.ExitQuoteKind.MISSING, None),
+        ({}, main_module.ExitQuoteKind.MISSING, None),
+        ({"error": "no route"}, main_module.ExitQuoteKind.MISSING, None),
+        ({"outAmount": "-1000000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "-1"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "-0"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": " -0 "}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "-000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "-00"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "+0"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "+1500000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "8_00000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "1_600_000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "0.0"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "1e6"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "1E6"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "00"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": " 0 "}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": " 1500000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "1500000 "}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "9" * 20}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "9" * 314}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "9" * 315}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": str(2**64)}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": 2**64}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "nan"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "NaN"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "inf"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "+inf"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "-inf"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": ""}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "   "}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "nope"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "1.5"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": None}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": True}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": False}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": 1.5}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": float("nan")}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": float("inf")}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": float("-inf")}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": 0.0}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": -0.0}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": ["1000000"]}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": {"raw": "1000000"}}, main_module.ExitQuoteKind.MALFORMED, None),
+        ("-1000000", main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "9" * 400}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "0"}, main_module.ExitQuoteKind.PRICE, 0.0),
+        ({"outAmount": 0}, main_module.ExitQuoteKind.PRICE, 0.0),
+        ({"outAmount": "1"}, main_module.ExitQuoteKind.PRICE, 1 / 1_000_000),
+        ({"outAmount": 1}, main_module.ExitQuoteKind.PRICE, 1 / 1_000_000),
+        ({"outAmount": "1500000"}, main_module.ExitQuoteKind.PRICE, 1.5),
+        ({"outAmount": 1_600_000}, main_module.ExitQuoteKind.PRICE, 1.6),
+        (
+            {"outAmount": str(2**64 - 1)},
+            main_module.ExitQuoteKind.PRICE,
+            (2**64 - 1) / 1_000_000,
+        ),
+        (
+            {"outAmount": 2**64 - 1},
+            main_module.ExitQuoteKind.PRICE,
+            (2**64 - 1) / 1_000_000,
+        ),
+    ],
+)
+def test_exit_quote_kinds_stay_distinct(quote, kind, price):
+    got_kind, got_price = main_module._classify_exit_quote(quote)
+    assert got_kind is kind
+    if price is None:
+        assert got_price is None
+    else:
+        assert got_price == price
+    client = types.SimpleNamespace(quote=lambda *_a, **_k: quote)
+    assert main_module._price_usd(client, MINT) == price
+
+
+def test_negative_quote_cannot_stop_out_or_book_loss():
+    """The reported bug: outAmount "-1000000" used to mark the token at -1."""
+    bot = _bot()
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [{"outAmount": "-1000000"}] * 3)
+
+    assert main_module._price_usd(bot.jup, MINT) is None
+    bot._manage_positions()
+    bot._manage_positions()
+
+    _assert_held(bot, tokens=100.0, size_usd=100.0, realized=0.0)
+    assert sales == []
+    assert bot.risk.trading_halted() is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"outAmount": "nan"},
+        {"outAmount": "inf"},
+        {"outAmount": "-inf"},
+        {"outAmount": float("nan")},
+        {"outAmount": float("inf")},
+        {"outAmount": float("-inf")},
+        {"outAmount": "9" * 400},
+        {"outAmount": "9" * 314},
+        {"outAmount": "9" * 20},
+        {"outAmount": "9" * 315},
+        {"outAmount": str(2**64)},
+        {"outAmount": 2**64},
+        {"outAmount": "-0"},
+        {"outAmount": " -0 "},
+        {"outAmount": "-000"},
+        {"outAmount": "-00"},
+        {"outAmount": "+0"},
+        {"outAmount": "+1500000"},
+        {"outAmount": "8_00000"},
+        {"outAmount": "1_600_000"},
+        {"outAmount": "0.0"},
+        {"outAmount": "1e6"},
+        {"outAmount": "00"},
+        {"outAmount": " 0 "},
+        {"outAmount": " 1500000"},
+        {"outAmount": ""},
+        {"outAmount": "not-a-number"},
+        {"outAmount": None},
+        {"outAmount": True},
+        {"outAmount": False},
+        {"outAmount": 1.5},
+        {"outAmount": 0.0},
+        {"outAmount": -0.0},
+        {"outAmount": ["1000000"]},
+        "-1000000",
+        {"outAmount": "-1000000"},
+    ],
+)
+def test_malformed_quote_holds_position_and_cost_basis(payload):
+    bot = _bot()
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [payload, payload])
+
+    bot._manage_positions()
+    bot._manage_positions()
+
+    _assert_held(bot, tokens=100.0, size_usd=100.0, realized=0.0)
+    assert sales == []
+    assert bot.risk.trading_halted() is False
+
+
+def test_missing_quote_body_holds_through_price_usd():
+    bot = _bot()
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [None, {"error": "no route"}])
+
+    bot._manage_positions()
+    bot._manage_positions()
+
+    _assert_held(bot, tokens=100.0, size_usd=100.0, realized=0.0)
+    assert sales == []
+
+
+def test_direct_malformed_marks_never_reach_sell_fraction():
+    bot = _bot()
+    sales = _watch_sales(bot)
+    _open(bot)
+    bad_marks = (
+        -1.0,
+        -0.01,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        None,
+        True,
+        False,
+        " -1000000",
+        "",
+        object(),
+    )
+
+    for mark in bad_marks:
+        bot._sell(MINT, 1.0, mark, "stop_loss")
+
+    _assert_held(bot, tokens=100.0, size_usd=100.0, realized=0.0)
+    assert sales == []
+
+
+def test_partial_exit_remainder_survives_later_malformed_quote():
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [
+        {"outAmount": "1600000"},
+        {"outAmount": "-1000000"},
+        {"outAmount": "nan"},
+        {"outAmount": None},
+        {"outAmount": float("inf")},
+    ])
+
+    bot._manage_positions()
+    _assert_held(bot, tokens=50.0, size_usd=50.0, realized=30.0)
+    booked = bot.portfolio.realized_pnl
+
+    bot._manage_positions()
+    bot._manage_positions()
+    bot._manage_positions()
+    bot._manage_positions()
+
+    _assert_held(bot, tokens=50.0, size_usd=50.0, realized=booked)
+    assert len(sales) == 1
+    assert len(alerts) == 1
+    assert alerts[0][2] == 1.6
+    assert alerts[0][3] == "take_profit:50"
+    assert bot.risk.trading_halted() is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["-0", "9" * 20],
+)
+def test_partial_exit_remainder_survives_noncanonical_quote(bad):
+    """A booked partial stays put when the next outAmount is not canonical."""
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [
+        {"outAmount": "1600000"},
+        {"outAmount": bad},
+        {"outAmount": bad},
+    ])
+
+    bot._manage_positions()
+    _assert_held(bot, tokens=50.0, size_usd=50.0, realized=30.0)
+    booked = bot.portfolio.realized_pnl
+
+    bot._manage_positions()
+    bot._manage_positions()
+
+    _assert_held(bot, tokens=50.0, size_usd=50.0, realized=booked)
+    assert math.isfinite(booked)
+    assert len(sales) == 1
+    assert len(alerts) == 1
+    assert alerts[0][2] == 1.6
+    assert alerts[0][3] == "take_profit:50"
+
+
+def test_python_int_zero_quote_still_stop_losses_through_parser():
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    _open(bot)
+    _bind_quotes(bot, [{"outAmount": 0}, {"outAmount": 0}])
+
+    assert main_module._price_usd(bot.jup, MINT) == 0.0
+    bot._manage_positions()
+
+    assert MINT not in bot.portfolio.positions
+    assert bot.portfolio.realized_pnl == pytest.approx(-100.0)
+    assert alerts and alerts[0][2] == 0.0
+    assert alerts[0][3] == "stop_loss"
+
+
+def test_canonical_one_raw_unit_follows_stop_loss():
+    """``"1"`` is a real raw amount (price 1e-6), so exit rules still apply."""
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [{"outAmount": "1"}, {"outAmount": "1"}])
+
+    price = main_module._price_usd(bot.jup, MINT)
+    assert price == 1 / 1_000_000
+    assert math.isfinite(price)
+    bot._manage_positions()
+
+    assert MINT not in bot.portfolio.positions
+    assert bot.portfolio.realized_pnl == pytest.approx(100 * price - 100)
+    assert math.isfinite(bot.portfolio.realized_pnl)
+    assert len(sales) == 1
+    assert alerts and alerts[0][2] == price
+    assert alerts[0][3] == "stop_loss"
+
+
+@pytest.mark.parametrize("raw", [str(2**64 - 1), 2**64 - 1])
+def test_uint64_max_quote_is_finite_and_follows_exit_rules(raw):
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [{"outAmount": raw}, {"outAmount": raw}])
+
+    price = main_module._price_usd(bot.jup, MINT)
+    assert price == (2**64 - 1) / 1_000_000
+    assert math.isfinite(price)
+    assert price >= 0
+    bot._manage_positions()
+
+    assert MINT not in bot.portfolio.positions
+    assert sales
+    assert all(call[2] == price for call in sales)
+    assert math.isfinite(bot.portfolio.realized_pnl)
+    assert bot.portfolio.realized_pnl == pytest.approx(100 * price - 100)
+    assert alerts
+    assert alerts[0][3].startswith("take_profit:")
+
+
+def test_legitimate_zero_quote_still_stop_losses_through_parser():
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    _open(bot)
+    _bind_quotes(bot, [{"outAmount": "0"}, {"outAmount": "0"}])
+
+    assert main_module._price_usd(bot.jup, MINT) == 0.0
+    bot._manage_positions()
+
+    assert MINT not in bot.portfolio.positions
+    assert bot.portfolio.realized_pnl == pytest.approx(-100.0)
+    assert bot.risk.realized_pnl_today == pytest.approx(-100.0)
+    assert alerts and alerts[0][2] == 0.0
+    assert alerts[0][3] == "stop_loss"
+
+
+def test_valid_positive_quote_exits_only_when_risk_rules_say_so():
+    hold = _bot()
+    hold_sales = _watch_sales(hold)
+    _open(hold)
+    _bind_quotes(hold, [{"outAmount": "1100000"}])
+    hold._manage_positions()
+    _assert_held(hold, tokens=100.0, size_usd=100.0, realized=0.0)
+    assert hold_sales == []
+
+    take_profit = _bot()
+    alerts = []
+    take_profit.notifier.sell = lambda *args: alerts.append(args)
+    _open(take_profit)
+    _bind_quotes(take_profit, [{"outAmount": "1600000"}])
+    take_profit._manage_positions()
+    _assert_held(take_profit, tokens=50.0, size_usd=50.0, realized=30.0)
+    assert alerts[0][3] == "take_profit:50"
+
+    stop = _bot()
+    stop_alerts = []
+    stop.notifier.sell = lambda *args: stop_alerts.append(args)
+    _open(stop)
+    _bind_quotes(stop, [{"outAmount": "800000"}])
+    stop._manage_positions()
+    assert MINT not in stop.portfolio.positions
+    assert stop.portfolio.realized_pnl == pytest.approx(-20.0)
+    assert stop_alerts[0][2] == 0.8
+    assert stop_alerts[0][3] == "stop_loss"
+
+
+def test_armed_malformed_quote_does_not_settle_or_book():
+    bot = _bot(_cfg(live_trading=True, wallet_private_key="test-only-sentinel"))
+    assert bot.cfg.is_armed is True
+    swaps = []
+    bot.executor = types.SimpleNamespace(
+        swap=lambda *args, **kwargs: swaps.append((args, kwargs)),
+    )
+    _open(bot, size_usd=5.0, tokens=5.0)
+    _bind_quotes(bot, [{"outAmount": "-1000000"}, {"outAmount": "nan"}])
+
+    bot._manage_positions()
+    bot._manage_positions()
+    bot._sell(MINT, 1.0, -1.0, "stop_loss")
+    bot._sell(MINT, 1.0, float("nan"), "stop_loss")
+    bot._sell(MINT, 1.0, float("inf"), "stop_loss")
+
+    pos = bot.portfolio.positions[MINT]
+    assert pos.tokens == 5.0
+    assert pos.size_usd == 5.0
+    assert pos.entry_price == 1.0
+    assert bot.portfolio.realized_pnl == 0.0
+    assert bot.portfolio.pending_intents == []
+    assert bot._reconciliation_required is False
+    assert swaps == []
+    assert MAX_EXPERIMENT_USD == 20.0
+
+
+@pytest.mark.parametrize("mark", [-1.0, float("nan"), float("inf"), float("-inf"), False])
+def test_leaked_non_executable_mark_does_not_sell(monkeypatch, mark):
+    """A bad mark must be refused even if ``_price_usd`` failed to collapse it."""
+    bot = _bot()
+    sales = _watch_sales(bot)
+    _open(bot)
+    _stub_price(monkeypatch, mark)
+
+    bot._manage_positions()
+
+    _assert_held(bot, tokens=100.0, size_usd=100.0, realized=0.0)
+    assert sales == []
+    assert bot.risk.trading_halted() is False
+
+
+def test_malformed_sol_quote_does_not_size_a_negative_entry():
+    bot = _bot()
+    bot.jup = types.SimpleNamespace(quote=lambda *_a, **_k: {"outAmount": "-1000000"})
+    lamports = bot._usd_to_lamports(2.0)
+    assert lamports == int(2.0 / 150.0 * 1_000_000_000)
+    assert lamports > 0
 
 
 def test_quote_request_uses_usdc_not_a_zero_fill():
