@@ -144,6 +144,8 @@ class Config:
     # When enabled in dry-run, paper entries are gated on BUY + risk ALLOW and
     # every candidate is journaled (including rejects/counterfactuals).
     decision_shadow_enabled: bool = False
+    # Relative DECISION_MODEL_PATH resolves against the repo root (code
+    # artifact), never the CWD or MEMEBOT_DATA_DIR; absolute paths are used as-is.
     decision_model_path: str = "artifacts/decision/model_logistic.v1.json"
     decision_shadow_file: str = "decision_shadow.jsonl"
 

@@ -47,31 +47,35 @@ def _parse_line(raw: bytes) -> Optional[dict[str, Any]]:
 def read_observations_from(path: str, offset: int) -> tuple[list[dict[str, Any]], int]:
     """Read complete rows starting at byte ``offset``.
 
-    Returns ``(rows, new_offset)``. Only newline-terminated lines are consumed,
-    so a torn last line (a writer mid-append) is left for the next call. The
-    one exception is an unterminated tail that already parses as a JSON object:
-    a proper prefix of a JSON object line can never itself be a JSON object, so
-    such a tail is complete and only its newline is missing (e.g. hand-written
-    fixtures); it is consumed so behaviour matches ``load_observations``.
-    Undecodable complete lines are skipped, exactly like ``load_observations``.
+    Returns ``(rows, new_offset)``. The file is streamed line by line from
+    ``offset`` (binary ``seek`` + ``readline``), so only the newly appended
+    bytes are read and at most one line is buffered at a time; the remaining
+    file is never loaded into memory as a whole. This is also the full-reload
+    path (``offset == 0``).
+
+    Only newline-terminated lines are consumed, so a torn last line (a writer
+    mid-append) is left for the next call. The one exception is an
+    unterminated tail that already parses as a JSON object: a proper prefix of
+    a JSON object line can never itself be a JSON object, so such a tail is
+    complete and only its newline is missing (e.g. hand-written fixtures); it
+    is consumed so behaviour matches ``load_observations``. Undecodable
+    complete lines are skipped, exactly like ``load_observations``.
     """
     rows: list[dict[str, Any]] = []
+    consumed = offset
     with open(path, "rb") as fh:
         fh.seek(offset)
-        data = fh.read()
-    if not data:
-        return rows, offset
-    end = data.rfind(b"\n")
-    complete = data[: end + 1] if end >= 0 else b""
-    tail = data[end + 1:] if end >= 0 else data
-    for raw in complete.split(b"\n"):
-        row = _parse_line(raw)
-        if row is not None:
-            rows.append(row)
-    consumed = len(complete)
-    if tail:
-        row = _parse_line(tail)
-        if row is not None:
-            rows.append(row)
-            consumed += len(tail)
-    return rows, offset + consumed
+        for raw in iter(fh.readline, b""):
+            if raw.endswith(b"\n"):
+                consumed += len(raw)
+                row = _parse_line(raw)
+                if row is not None:
+                    rows.append(row)
+                continue
+            # Unterminated tail: only ever the last chunk before EOF.
+            row = _parse_line(raw)
+            if row is not None:
+                rows.append(row)
+                consumed += len(raw)
+            break
+    return rows, consumed

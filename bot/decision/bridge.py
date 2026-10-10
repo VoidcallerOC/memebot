@@ -22,6 +22,7 @@ from ..meta.adapters import snapshot_from_dexscreener
 from ..meta.detector import prepare_snapshot_for_scoring, score_snapshot
 from ..meta.history import ObservationHistory
 from ..meta.model import MetaSignal, TokenSnapshot
+from ..paths import REPO_ROOT, resolve_repo_path
 from ..portfolio import Portfolio
 from ..risk import RiskManager
 from ..safety import SafetyScreener, TokenSafety
@@ -148,19 +149,28 @@ class DecisionShadowBridge:
         self._history = history if history is not None else ObservationHistory()
         if not self.enabled:
             return
-        model_path = getattr(cfg, "decision_model_path", "") or ""
+        configured = (getattr(cfg, "decision_model_path", "") or "").strip()
+        model_path = resolve_repo_path(configured) if configured else ""
         model: Optional[LocalModel] = None
         if model_path and Path(model_path).exists():
             try:
                 model = LocalModel.load(model_path)
                 log.info("decision shadow: loaded model %s", model_path)
             except Exception as exc:
-                log.error("decision shadow: corrupted/unreadable model (%s) — NO TRADE mode", exc)
+                log.error(
+                    "decision shadow: corrupted/unreadable model at %s (%s) — NO TRADE mode, "
+                    "all decisions REJECT. Fix: point DECISION_MODEL_PATH at a valid model "
+                    "file (absolute, or relative to the repo root %s).",
+                    model_path, exc, REPO_ROOT,
+                )
                 model = None
         else:
-            log.warning(
-                "decision shadow enabled but model missing at %r — decisions REJECT",
-                model_path,
+            log.error(
+                "decision shadow enabled but model file not found at %s "
+                "(DECISION_MODEL_PATH=%r) — NO TRADE mode, all decisions REJECT. "
+                "Fix: set DECISION_MODEL_PATH to an existing model file, either absolute "
+                "or relative to the repo root %s (not the CWD or MEMEBOT_DATA_DIR).",
+                model_path or "<empty>", configured, REPO_ROOT,
             )
         firewall = RiskFirewall(cfg, risk=risk, screener=screener, portfolio=portfolio)
         self._engine = DecisionEngine(model, firewall)
