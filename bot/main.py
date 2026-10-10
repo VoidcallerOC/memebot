@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import signal
 import sys
 import time
@@ -52,8 +53,9 @@ class ExitQuoteKind(Enum):
     """How a Jupiter quote may be used as an exit mark.
 
     ``MISSING`` is no quote body or no outAmount (timeout, error, empty).
-    ``MALFORMED`` is an outAmount that is not a finite price >= 0.
-    ``PRICE`` is an executable mark, including a legitimate numeric 0.0.
+    ``MALFORMED`` is an outAmount that is not a canonical raw integer in
+    ``0 .. 2**64-1``. ``PRICE`` is an executable mark, including a
+    legitimate numeric 0.0 from canonical ``"0"`` or int ``0``.
     """
 
     MISSING = "missing"
@@ -61,26 +63,38 @@ class ExitQuoteKind(Enum):
     PRICE = "price"
 
 
+# Jupiter ``outAmount`` is the raw token amount in smallest units, not a
+# decimal: ``JupiterClient.quote`` sends ``amount`` as that integer's decimal
+# string, and ``SwapExecutor`` reads ``outAmount`` with ``int()``. A USDC
+# quote of 1_000_000 raw input units is priced as ``outAmount / 1_000_000``.
+# Solana SPL amounts are u64, and this client never shows a wider integer,
+# so only 0 through 2**64-1 is executable.
+_MAX_OUT_AMOUNT_RAW = 2**64 - 1
+_CANONICAL_OUT_AMOUNT = re.compile(r"^(0|[1-9][0-9]*)$")
+
+
 def _parse_out_amount_usd(raw: object) -> float | None:
     """USD value of a USDC ``outAmount``, or None when it is not executable.
 
-    Raw units are scaled by 1_000_000 (USDC decimals). Integer zero is a
-    legitimate quote and returns 0.0. Negatives, non-finite results, empty
-    values, non-numeric text, and non-integral types are rejected.
+    Accept only a canonical decimal integer string (``^(0|[1-9][0-9]*)$``)
+    or a real Python ``int`` (bool is not an int here), each in
+    ``0 .. 2**64-1``. Signed zero, a leading ``+``, underscores, surrounding
+    whitespace, decimals, and scientific notation are rejected as written —
+    they are not stripped or rewritten into a price. Canonical ``"0"`` and
+    int ``0`` return 0.0.
     """
-    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+    if isinstance(raw, str):
+        if _CANONICAL_OUT_AMOUNT.fullmatch(raw) is None:
+            return None
+        try:
+            amount = int(raw, 10)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    elif isinstance(raw, int) and not isinstance(raw, bool):
+        amount = raw
+    else:
         return None
-    try:
-        if isinstance(raw, str):
-            text = raw.strip()
-            if text == "":
-                return None
-            amount = int(text, 10)
-        else:
-            amount = raw
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+    if amount < 0 or amount > _MAX_OUT_AMOUNT_RAW:
         return None
     try:
         price = amount / 1_000_000
@@ -115,9 +129,10 @@ def _classify_exit_quote(quote: object) -> tuple[ExitQuoteKind, float | None]:
 def _price_usd(jup: JupiterClient, mint: str) -> float | None:
     """USD mark for 1 token unit, or None when that mark must not be traded.
 
-    None covers a missing quote and a malformed outAmount (negative, NaN,
-    infinity, empty, non-numeric, or wrong type). A parsed 0.0 is returned
-    as 0.0 so a legitimate zero quote still follows the exit rules.
+    None covers a missing quote and a malformed outAmount (not a canonical
+    raw integer in 0 .. 2**64-1). A parsed 0.0 from canonical ``"0"`` or
+    int ``0`` is returned as 0.0 so a legitimate zero quote still follows
+    the exit rules.
     """
     quote = jup.quote(mint, USDC_MINT, 1_000_000)
     kind, price = _classify_exit_quote(quote)

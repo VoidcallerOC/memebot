@@ -1,12 +1,14 @@
 """Exit quotes must be executable before they can change a position.
 
 A missing quote is ``None`` from ``_price_usd``. A malformed outAmount
-(negative, non-finite, empty, non-numeric, or wrong type) is rejected the
-same way: no sale and no PnL. A successful numeric 0 stays on the exit path.
+(non-canonical text, above uint64, negative, non-finite, empty, non-numeric,
+or wrong type) is rejected the same way: no sale and no PnL. Canonical
+``"0"`` and int ``0`` stay on the exit path.
 """
 from __future__ import annotations
 
 import json
+import math
 import types
 from datetime import date
 from pathlib import Path
@@ -318,6 +320,26 @@ def _assert_held(bot, *, tokens, size_usd, realized):
         ({"error": "no route"}, main_module.ExitQuoteKind.MISSING, None),
         ({"outAmount": "-1000000"}, main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": "-1"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "-0"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": " -0 "}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "-000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "-00"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "+0"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "+1500000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "8_00000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "1_600_000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "0.0"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "1e6"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "1E6"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "00"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": " 0 "}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": " 1500000"}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "1500000 "}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "9" * 20}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "9" * 314}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": "9" * 315}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": str(2**64)}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": 2**64}, main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": "nan"}, main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": "NaN"}, main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": "inf"}, main_module.ExitQuoteKind.MALFORMED, None),
@@ -334,14 +356,28 @@ def _assert_held(bot, *, tokens, size_usd, realized):
         ({"outAmount": float("nan")}, main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": float("inf")}, main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": float("-inf")}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": 0.0}, main_module.ExitQuoteKind.MALFORMED, None),
+        ({"outAmount": -0.0}, main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": ["1000000"]}, main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": {"raw": "1000000"}}, main_module.ExitQuoteKind.MALFORMED, None),
         ("-1000000", main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": "9" * 400}, main_module.ExitQuoteKind.MALFORMED, None),
         ({"outAmount": "0"}, main_module.ExitQuoteKind.PRICE, 0.0),
         ({"outAmount": 0}, main_module.ExitQuoteKind.PRICE, 0.0),
+        ({"outAmount": "1"}, main_module.ExitQuoteKind.PRICE, 1 / 1_000_000),
+        ({"outAmount": 1}, main_module.ExitQuoteKind.PRICE, 1 / 1_000_000),
         ({"outAmount": "1500000"}, main_module.ExitQuoteKind.PRICE, 1.5),
         ({"outAmount": 1_600_000}, main_module.ExitQuoteKind.PRICE, 1.6),
+        (
+            {"outAmount": str(2**64 - 1)},
+            main_module.ExitQuoteKind.PRICE,
+            (2**64 - 1) / 1_000_000,
+        ),
+        (
+            {"outAmount": 2**64 - 1},
+            main_module.ExitQuoteKind.PRICE,
+            (2**64 - 1) / 1_000_000,
+        ),
     ],
 )
 def test_exit_quote_kinds_stay_distinct(quote, kind, price):
@@ -381,12 +417,32 @@ def test_negative_quote_cannot_stop_out_or_book_loss():
         {"outAmount": float("inf")},
         {"outAmount": float("-inf")},
         {"outAmount": "9" * 400},
+        {"outAmount": "9" * 314},
+        {"outAmount": "9" * 20},
+        {"outAmount": "9" * 315},
+        {"outAmount": str(2**64)},
+        {"outAmount": 2**64},
+        {"outAmount": "-0"},
+        {"outAmount": " -0 "},
+        {"outAmount": "-000"},
+        {"outAmount": "-00"},
+        {"outAmount": "+0"},
+        {"outAmount": "+1500000"},
+        {"outAmount": "8_00000"},
+        {"outAmount": "1_600_000"},
+        {"outAmount": "0.0"},
+        {"outAmount": "1e6"},
+        {"outAmount": "00"},
+        {"outAmount": " 0 "},
+        {"outAmount": " 1500000"},
         {"outAmount": ""},
         {"outAmount": "not-a-number"},
         {"outAmount": None},
         {"outAmount": True},
         {"outAmount": False},
         {"outAmount": 1.5},
+        {"outAmount": 0.0},
+        {"outAmount": -0.0},
         {"outAmount": ["1000000"]},
         "-1000000",
         {"outAmount": "-1000000"},
@@ -473,6 +529,100 @@ def test_partial_exit_remainder_survives_later_malformed_quote():
     assert alerts[0][2] == 1.6
     assert alerts[0][3] == "take_profit:50"
     assert bot.risk.trading_halted() is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["-0", "9" * 20],
+)
+def test_partial_exit_remainder_survives_noncanonical_quote(bad):
+    """A booked partial stays put when the next outAmount is not canonical."""
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [
+        {"outAmount": "1600000"},
+        {"outAmount": bad},
+        {"outAmount": bad},
+    ])
+
+    bot._manage_positions()
+    _assert_held(bot, tokens=50.0, size_usd=50.0, realized=30.0)
+    booked = bot.portfolio.realized_pnl
+
+    bot._manage_positions()
+    bot._manage_positions()
+
+    _assert_held(bot, tokens=50.0, size_usd=50.0, realized=booked)
+    assert math.isfinite(booked)
+    assert len(sales) == 1
+    assert len(alerts) == 1
+    assert alerts[0][2] == 1.6
+    assert alerts[0][3] == "take_profit:50"
+
+
+def test_python_int_zero_quote_still_stop_losses_through_parser():
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    _open(bot)
+    _bind_quotes(bot, [{"outAmount": 0}, {"outAmount": 0}])
+
+    assert main_module._price_usd(bot.jup, MINT) == 0.0
+    bot._manage_positions()
+
+    assert MINT not in bot.portfolio.positions
+    assert bot.portfolio.realized_pnl == pytest.approx(-100.0)
+    assert alerts and alerts[0][2] == 0.0
+    assert alerts[0][3] == "stop_loss"
+
+
+def test_canonical_one_raw_unit_follows_stop_loss():
+    """``"1"`` is a real raw amount (price 1e-6), so exit rules still apply."""
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [{"outAmount": "1"}, {"outAmount": "1"}])
+
+    price = main_module._price_usd(bot.jup, MINT)
+    assert price == 1 / 1_000_000
+    assert math.isfinite(price)
+    bot._manage_positions()
+
+    assert MINT not in bot.portfolio.positions
+    assert bot.portfolio.realized_pnl == pytest.approx(100 * price - 100)
+    assert math.isfinite(bot.portfolio.realized_pnl)
+    assert len(sales) == 1
+    assert alerts and alerts[0][2] == price
+    assert alerts[0][3] == "stop_loss"
+
+
+@pytest.mark.parametrize("raw", [str(2**64 - 1), 2**64 - 1])
+def test_uint64_max_quote_is_finite_and_follows_exit_rules(raw):
+    bot = _bot()
+    alerts = []
+    bot.notifier.sell = lambda *args: alerts.append(args)
+    sales = _watch_sales(bot)
+    _open(bot)
+    _bind_quotes(bot, [{"outAmount": raw}, {"outAmount": raw}])
+
+    price = main_module._price_usd(bot.jup, MINT)
+    assert price == (2**64 - 1) / 1_000_000
+    assert math.isfinite(price)
+    assert price >= 0
+    bot._manage_positions()
+
+    assert MINT not in bot.portfolio.positions
+    assert sales
+    assert all(call[2] == price for call in sales)
+    assert math.isfinite(bot.portfolio.realized_pnl)
+    assert bot.portfolio.realized_pnl == pytest.approx(100 * price - 100)
+    assert alerts
+    assert alerts[0][3].startswith("take_profit:")
 
 
 def test_legitimate_zero_quote_still_stop_losses_through_parser():
