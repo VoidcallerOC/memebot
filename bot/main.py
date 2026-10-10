@@ -10,9 +10,11 @@ Run with: ``python -m bot.main``
 from __future__ import annotations
 
 import logging
+import math
 import signal
 import sys
 import time
+from enum import Enum
 
 import requests
 
@@ -46,14 +48,82 @@ def _setup_logging() -> None:
     )
 
 
-def _price_usd(jup: JupiterClient, mint: str) -> float | None:
-    quote = jup.quote(mint, USDC_MINT, 1_000_000)
-    if not quote:
+class ExitQuoteKind(Enum):
+    """How a Jupiter quote may be used as an exit mark.
+
+    ``MISSING`` is no quote body or no outAmount (timeout, error, empty).
+    ``MALFORMED`` is an outAmount that is not a finite price >= 0.
+    ``PRICE`` is an executable mark, including a legitimate numeric 0.0.
+    """
+
+    MISSING = "missing"
+    MALFORMED = "malformed"
+    PRICE = "price"
+
+
+def _parse_out_amount_usd(raw: object) -> float | None:
+    """USD value of a USDC ``outAmount``, or None when it is not executable.
+
+    Raw units are scaled by 1_000_000 (USDC decimals). Integer zero is a
+    legitimate quote and returns 0.0. Negatives, non-finite results, empty
+    values, non-numeric text, and non-integral types are rejected.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
         return None
     try:
-        return int(quote["outAmount"]) / 1_000_000
-    except (KeyError, ValueError):
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text == "":
+                return None
+            amount = int(text, 10)
+        else:
+            amount = raw
+    except (TypeError, ValueError, OverflowError):
         return None
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+        return None
+    price = amount / 1_000_000
+    if not math.isfinite(price):
+        return None
+    return float(price)
+
+
+def _is_executable_mark(price: object) -> bool:
+    """True only for a finite USD mark >= 0, including a legitimate 0.0."""
+    if isinstance(price, bool) or not isinstance(price, (int, float)):
+        return False
+    return math.isfinite(price) and price >= 0
+
+
+def _classify_exit_quote(quote: object) -> tuple[ExitQuoteKind, float | None]:
+    """Split a Jupiter quote into missing, malformed, or an executable price."""
+    if quote is None:
+        return ExitQuoteKind.MISSING, None
+    if not isinstance(quote, dict):
+        return ExitQuoteKind.MALFORMED, None
+    if "outAmount" not in quote:
+        return ExitQuoteKind.MISSING, None
+    price = _parse_out_amount_usd(quote["outAmount"])
+    if price is None or not _is_executable_mark(price):
+        return ExitQuoteKind.MALFORMED, None
+    return ExitQuoteKind.PRICE, price
+
+
+def _price_usd(jup: JupiterClient, mint: str) -> float | None:
+    """USD mark for 1 token unit, or None when that mark must not be traded.
+
+    None covers a missing quote and a malformed outAmount (negative, NaN,
+    infinity, empty, non-numeric, or wrong type). A parsed 0.0 is returned
+    as 0.0 so a legitimate zero quote still follows the exit rules.
+    """
+    quote = jup.quote(mint, USDC_MINT, 1_000_000)
+    kind, price = _classify_exit_quote(quote)
+    if kind is ExitQuoteKind.MALFORMED:
+        log.warning("malformed exit quote for %s — not an executable price", mint)
+        return None
+    if kind is not ExitQuoteKind.PRICE or not _is_executable_mark(price):
+        return None
+    return float(price)
 
 
 class TradingBot:
@@ -133,12 +203,19 @@ class TradingBot:
         for mint in list(self.portfolio.positions.keys()):
             pos = self.portfolio.positions[mint]
             price = _price_usd(self.jup, mint)
-            # None means the quote failed. A successful quote can still be 0.
-            if price is None:
-                log.warning(
-                    "%s: exit quote unavailable — holding position and cost basis",
-                    pos.symbol,
-                )
+            # Missing and malformed quotes are not marks. Numeric 0.0 is.
+            # Refuse anything else before exit rules or portfolio accounting.
+            if not _is_executable_mark(price):
+                if price is None:
+                    log.warning(
+                        "%s: exit quote unavailable — holding position and cost basis",
+                        pos.symbol,
+                    )
+                else:
+                    log.warning(
+                        "%s: malformed exit quote — holding position and cost basis",
+                        pos.symbol,
+                    )
                 continue
             for action in self.risk.evaluate_exit(pos.entry_price, price, pos.ladder_filled):
                 if action.reason.startswith("take_profit:"):
@@ -263,9 +340,9 @@ class TradingBot:
             return
         pos = self.portfolio.positions[mint]
         symbol = pos.symbol
-        if price is None:
+        if not _is_executable_mark(price):
             log.warning(
-                "%s: refusing %s without an exit mark; position unchanged",
+                "%s: refusing %s without an executable exit mark; position unchanged",
                 symbol, reason,
             )
             return
