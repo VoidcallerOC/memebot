@@ -62,6 +62,8 @@ class FakeJup:
             "outputMint": output_mint,
             "inAmount": str(amount),
             "outAmount": str(out_raw),
+            "otherAmountThreshold": str(out_raw),  # zero-slippage fake
+            "swapMode": "ExactIn",
         }
 
 

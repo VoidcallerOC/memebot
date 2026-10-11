@@ -29,10 +29,16 @@ TOKENS_PER_LAMPORT = 1000     # raw token units per lamport on the buy leg
 
 
 class RouteJup:
-    """Jupiter-shaped ExactIn quotes with programmable buy/sell legs."""
+    """Jupiter-shaped ExactIn quotes with programmable buy/sell legs.
 
-    def __init__(self, *, sell_ratio=Fraction(98, 100), buy=None, sell=None):
+    ``otherAmountThreshold`` = ``outAmount`` reduced by ``slippage_bps``
+    (default 0 here, so threshold == outAmount; slippage-specific cases live
+    in tests/test_p1_roundtrip_min_out.py).
+    """
+
+    def __init__(self, *, sell_ratio=Fraction(98, 100), buy=None, sell=None, slippage_bps=0):
         self.sell_ratio = sell_ratio
+        self.slippage_bps = slippage_bps
         self.buy = buy      # callable(default_quote, amount) -> response, or Exception
         self.sell = sell
         self.calls = []
@@ -52,10 +58,14 @@ class RouteJup:
             q["outAmount"] = str(150 * 10 ** 6 * amount // 10 ** 9)
             return q
         if input_mint == SOL_MINT:
-            q["outAmount"] = str(amount * TOKENS_PER_LAMPORT)
+            out = amount * TOKENS_PER_LAMPORT
+            q["outAmount"] = str(out)
+            q["otherAmountThreshold"] = str(out * (10_000 - self.slippage_bps) // 10_000)
             return self._leg(self.buy, q, amount)
         if output_mint == SOL_MINT:
-            q["outAmount"] = str(math.floor(Fraction(amount, TOKENS_PER_LAMPORT) * self.sell_ratio))
+            out = math.floor(Fraction(amount, TOKENS_PER_LAMPORT) * self.sell_ratio)
+            q["outAmount"] = str(out)
+            q["otherAmountThreshold"] = str(out * (10_000 - self.slippage_bps) // 10_000)
             return self._leg(self.sell, q, amount)
         raise AssertionError((input_mint, output_mint))
 
@@ -79,7 +89,8 @@ _DROP = object()
 
 
 def sell_out(value):
-    return with_fields(outAmount=value)
+    # Expected and slippage-minimum output both set to ``value``.
+    return with_fields(outAmount=value, otherAmountThreshold=value)
 
 
 def paper_cfg():
@@ -237,8 +248,10 @@ def test_threshold_constant_is_ten_percent():
 # -- exact request/echo validation ------------------------------------------
 
 def test_sell_quote_receives_exact_buy_out_amount():
-    jup = RouteJup(buy=with_fields(outAmount="987654321"),
-                   sell=lambda q, a: dict(q, outAmount=str(PLANNED)))
+    # threshold == outAmount here; the threshold-vs-outAmount case is in
+    # tests/test_p1_roundtrip_min_out.py.
+    jup = RouteJup(buy=with_fields(outAmount="987654321", otherAmountThreshold="987654321"),
+                   sell=lambda q, a: dict(q, outAmount=str(PLANNED), otherAmountThreshold=str(PLANNED)))
     assert gate(make_bot(jup)) is True
     assert jup.route_calls() == [(SOL_MINT, MINT, PLANNED), (MINT, SOL_MINT, 987654321)]
 
