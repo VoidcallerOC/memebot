@@ -20,7 +20,7 @@ WORKDIR /app
 # Nothing is resolved or upgraded at build time.
 COPY requirements.txt ./
 COPY requirements/ci-py3.11.lock requirements/ci-py3.11.lock
-RUN python -c "import platform, sys; l = platform.libc_ver(); ok = sys.version_info[:2] == (3, 11) and platform.machine() == 'x86_64' and l[0] == 'glibc' and tuple(int(x) for x in l[1].split('.')[:2]) >= (2, 28); sys.exit(0 if ok else 'unsupported runtime target: %s %s %s' % (sys.version.split()[0], platform.machine(), l))" \\
+RUN python -c "import platform, sys; l = platform.libc_ver(); ok = sys.version_info[:2] == (3, 11) and platform.machine() == 'x86_64' and l[0] == 'glibc' and tuple(int(x) for x in l[1].split('.')[:2]) >= (2, 28); sys.exit(0 if ok else 'unsupported runtime target: %s %s %s' % (sys.version.split()[0], platform.machine(), l))" \
     && python -m pip install --no-cache-dir --disable-pip-version-check \
         --require-hashes --no-deps --only-binary :all: -r requirements/ci-py3.11.lock \
     && python -m pip check \
