@@ -1,0 +1,106 @@
+# Test-only CI. Runs the pytest suite offline on Python 3.11 and 3.13.
+#
+# Safety properties (keep them when editing):
+#   * Triggered by pull_request / push to main / manual dispatch only — never
+#     pull_request_target, so fork PRs run without secrets and with a
+#     read-only token.
+#   * GITHUB_TOKEN is contents: read; checkout does not persist it.
+#   * No secrets are referenced. LIVE_TRADING=false and an empty
+#     WALLET_PRIVATE_KEY mean Config.is_armed is False.
+#   * Tests run inside a fresh network namespace (no network at all), from
+#     a clean environment (env -i). Nothing starts bot.main or bot.meta.
+#   * The job fails if the tests modified the checkout.
+#   * Third-party actions are pinned to full commit SHAs.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  LIVE_TRADING: "false"
+  WALLET_PRIVATE_KEY: ""
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  tests:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies (requirements.txt)
+        run: |
+          python -m pip install -r requirements.txt
+          python -VV
+          python -m pip freeze
+
+      - name: Run test suite offline (network namespace, clean env)
+        run: |
+          set -euo pipefail
+          PY="$(command -v python)"
+          # Root creates an empty network namespace (no interfaces except lo),
+          # then drops back to the runner user before any repo code runs.
+          offline() {
+            sudo unshare --net -- \
+              setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups -- \
+              env -i PATH="$(dirname "$PY"):/usr/bin:/bin" HOME="$HOME" \
+                LIVE_TRADING=false WALLET_PRIVATE_KEY= PYTHONDONTWRITEBYTECODE=1 \
+                "$@"
+          }
+          # 1. Prove the sandbox has no network and is unprivileged.
+          offline "$PY" -c '
+          import os, socket, sys
+          assert os.geteuid() != 0, "tests must not run as root"
+          assert os.environ.get("LIVE_TRADING") == "false" and os.environ.get("WALLET_PRIVATE_KEY") == ""
+          try:
+              socket.create_connection(("1.1.1.1", 443), timeout=3)
+          except OSError as exc:
+              print("network isolated:", type(exc).__name__)
+          else:
+              sys.exit("network is reachable inside the test sandbox")
+          '
+          # 2. The regression suites must be collected (guards against
+          #    discovery silently dropping them).
+          offline "$PY" -m pytest --collect-only -q -p no:cacheprovider > "$RUNNER_TEMP/collected.txt"
+          for f in test_snapshot_eq_stale test_pr3_history_contract test_pr3_history_windowing \
+                   test_pr1_data_integrity test_bridge_4h_window_regression test_live_gates; do
+            grep -q "^tests/$f.py::" "$RUNNER_TEMP/collected.txt" || { echo "::error::tests/$f.py not collected"; exit 1; }
+          done
+          tail -n 1 "$RUNNER_TEMP/collected.txt"
+          # 3. Full suite.
+          offline "$PY" -m pytest -q -p no:cacheprovider -rs
+
+      - name: Checkout unchanged by tests
+        run: |
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            git status --porcelain --untracked-files=all
+            echo "::error::tests modified the working tree"
+            exit 1
+          fi
