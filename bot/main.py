@@ -9,6 +9,7 @@ Run with: ``python -m bot.main``
 """
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import re
@@ -88,10 +89,16 @@ _CANONICAL_OUT_AMOUNT = re.compile(r"^(0|[1-9][0-9]*)$")
 #              success without fill data); ``outcome`` records the status
 #   failed     terminal: evidence shows the sell did NOT execute; the position
 #              is untouched and normal exit management (retry) resumes
-#   settled    terminal: the sell executed and was booked exactly once
+#   confirmed_unbooked
+#              the sell is proven on chain and its verified fill evidence
+#              (actual in/out, fee) is persisted, but its accounting is not
+#              yet; booked exactly once from that stored evidence (also after
+#              a crash, at startup) with no further chain lookup
+#   settled    terminal: the sell executed and was booked exactly once; the
+#              booking and this status are persisted in the same atomic write
 # Open intents freeze sells of that mint and block new entries; they never
 # stop stop-loss / take-profit management of other positions.
-OPEN_SELL_INTENT_STATUSES = frozenset({"pending", "unresolved", "blocked"})
+OPEN_SELL_INTENT_STATUSES = frozenset({"pending", "unresolved", "blocked", "confirmed_unbooked"})
 TERMINAL_SELL_INTENTS_KEPT = 50
 # A Solana transaction's recent blockhash is valid for 150 slots (~60-90 s;
 # solana.com docs "Transactions" / "Confirmation & Expiration"). After this
@@ -517,12 +524,13 @@ class TradingBot:
             if self._sell_frozen(mint):
                 log.error("%s: refusing %s; an earlier live sell is unresolved", symbol, reason)
                 return
-            if not self._settle_live_sell(pos, fraction, price, reason):
-                return
+            # Settles and books atomically (or leaves an open intent).
+            self._settle_live_sell(pos, fraction, price, reason)
+            return
         self._book_sell(mint, fraction, price, reason)
 
     def _book_sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
-        """Portfolio/risk accounting for one executed sell (the only booking path)."""
+        """Paper-sell accounting (live sells book via ``_book_confirmed_sell``)."""
         symbol = self.portfolio.positions[mint].symbol
         was_halted = self.risk.trading_halted()
         pnl = self.portfolio.sell_fraction(mint, fraction, price, reason)
@@ -531,6 +539,94 @@ class TradingBot:
         if self.risk.trading_halted() and not was_halted:
             self.notifier.halt(-self.risk.realized_pnl_today)
         self._save()
+
+    def _apply_sell_accounting(self, mint: str, fraction: float, price: float, reason: str):
+        """Live-sell portfolio + daily-risk accounting, in memory only.
+
+        All-or-nothing: if anything raises, positions, realized P&L and the
+        daily risk state are restored before re-raising, so memory never holds
+        a half-booked sell that a later save could persist.
+        """
+        symbol = self.portfolio.positions[mint].symbol
+        saved = (
+            copy.deepcopy(self.portfolio.positions),
+            self.portfolio.realized_pnl,
+            self.risk.to_dict(),
+        )
+        try:
+            was_halted = self.risk.trading_halted()
+            pnl = self.portfolio.sell_fraction(mint, fraction, price, reason)
+            self.risk.record_realized_pnl(pnl)
+            newly_halted = self.risk.trading_halted() and not was_halted
+        except BaseException:
+            self.portfolio.positions, self.portfolio.realized_pnl = saved[0], saved[1]
+            self.risk.load_dict(saved[2])
+            raise
+        return symbol, pnl, newly_halted
+
+    def _notify_sell(self, symbol, fraction, price, reason, pnl, newly_halted) -> None:
+        self.notifier.sell(symbol, fraction, price, reason, pnl)
+        if newly_halted:
+            self.notifier.halt(-self.risk.realized_pnl_today)
+
+    @staticmethod
+    def _confirmed_fill_problem(intent: dict) -> str | None:
+        """Why stored fill evidence cannot settle ``intent``, or None if it can."""
+        def positive_int(value):
+            return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+        raw_amount = intent.get("raw_amount")
+        if not positive_int(raw_amount):
+            return "intent has no positive integer raw_amount"
+        if not intent.get("tx_signature"):
+            return "confirmed sell has no transaction signature"
+        if intent.get("actual_in_amount") != raw_amount or not positive_int(
+            intent.get("actual_in_amount")
+        ):
+            return "on-chain input amount does not match the intent raw_amount"
+        if not positive_int(intent.get("actual_out_amount")):
+            return "on-chain output amount missing or not positive"
+        return None
+
+    def _record_confirmed_fill(self, intent: dict, fill, detail: str) -> None:
+        """Persist verified fill evidence before any accounting (crash-safe)."""
+        intent["status"] = "confirmed_unbooked"
+        intent["resolution"] = detail
+        intent["actual_in_amount"] = fill.actual_in_amount
+        intent["actual_out_amount"] = fill.actual_out_amount
+        intent["fee_lamports"] = fill.fee_lamports
+        intent["confirmed_at"] = time.time()
+        self._save()
+
+    def _book_confirmed_sell(self, intent: dict) -> bool:
+        """Book a ``confirmed_unbooked`` intent exactly once from its evidence.
+
+        Accounting (position, realized P&L, daily risk) and the intent's
+        transition to ``settled`` are persisted in ONE atomic state write, so a
+        crash leaves either the unbooked intent (booked on the next run) or the
+        booked, settled one; never both or neither. Returns True if booked.
+        """
+        if intent.get("status") != "confirmed_unbooked" or intent.get("booked_at") is not None:
+            return False
+        mint = intent.get("mint")
+        problem = self._confirmed_fill_problem(intent)
+        if problem is None and mint not in self.portfolio.positions:
+            problem = "position no longer tracked"
+        if problem is not None:
+            reason = f"confirmed sell cannot be booked: {problem}; operator action required"
+            if intent.get("resolution") != reason:
+                intent["resolution"] = reason
+                self._save()
+            log.error("live sell for %s %s", str(mint)[:8], reason)
+            return False
+        fraction, price, reason = intent["fraction"], intent["requested_price"], intent["reason"]
+        symbol, pnl, newly_halted = self._apply_sell_accounting(mint, fraction, price, reason)
+        intent["status"] = "settled"
+        intent["booked_at"] = time.time()
+        intent["booked_pnl"] = pnl
+        self._save()  # one atomic write: accounting + settled intent together
+        self._notify_sell(symbol, fraction, price, reason, pnl, newly_halted)
+        return True
 
     def _settle_live_sell(self, pos, fraction: float, price: float, reason: str) -> bool:
         tokens_to_sell = min(pos.original_tokens * fraction, pos.tokens)
@@ -584,9 +680,20 @@ class TradingBot:
             log.error("live sell confirmed without fill data for %s", pos.symbol)
             self._save()
             return False
-        intent["status"] = "settled"
-        self._save()
-        return True
+        intent["actual_in_amount"] = result.actual_in_amount
+        intent["actual_out_amount"] = result.actual_out_amount
+        intent["fee_lamports"] = result.fee_lamports
+        problem = self._confirmed_fill_problem(intent)
+        if problem is not None:
+            # Validated before anything bookable is persisted.
+            intent["status"] = "unresolved"
+            intent["resolution"] = f"confirmed fill does not prove the intended sell: {problem}"
+            self._reconciliation_required = True
+            log.error("live sell for %s not booked: %s", pos.symbol, problem)
+            self._save()
+            return False
+        self._record_confirmed_fill(intent, result, "confirmed at submit with on-chain fill")
+        return self._book_confirmed_sell(intent)
 
     # -- live sell intent resolution -----------------------------------------
 
@@ -608,10 +715,13 @@ class TradingBot:
           error; or the blockhash window has passed
           (``SELL_INTENT_EXPIRY_SECONDS``), the signature is not confirmed and
           the wallet still holds the tokens.
-        * EXECUTED (-> ``settled``, booked once): the signature is confirmed
-          without error AND ``getTransaction`` gives a complete fill whose
-          ``actual_in_amount`` equals the intent's ``raw_amount``. It is booked
-          by the same accounting as an on-time confirmed live sell.
+        * EXECUTED (-> ``confirmed_unbooked`` -> ``settled``, booked once): the
+          signature is confirmed without error AND ``getTransaction`` gives a
+          complete fill whose ``actual_in_amount`` equals the intent's
+          ``raw_amount``. The evidence is persisted first; booking and the
+          ``settled`` transition then share one atomic save. A
+          ``confirmed_unbooked`` intent found later (e.g. after a crash) is
+          booked from its stored evidence without another chain lookup.
         * Anything else stays open (the mint stays frozen, entries stay
           blocked) with an explicit operator-visible reason. No fill, price or
           P&L is ever invented.
@@ -620,6 +730,12 @@ class TradingBot:
         balances: dict = {}
         changed = False
         for intent in self._open_sell_intents():
+            if intent.get("status") == "confirmed_unbooked":
+                # Proven on chain with stored evidence: book it, no chain lookup.
+                if self._book_confirmed_sell(intent):
+                    log.warning("live sell intent for %s booked from stored fill evidence",
+                                str(intent.get("mint"))[:8])
+                continue
             if "created_at" not in intent and "first_seen_at" not in intent:
                 intent["first_seen_at"] = now  # legacy intent: start its clock now
                 changed = True
@@ -636,17 +752,11 @@ class TradingBot:
                 continue
             if verdict == "executed" and fill is not None:
                 mint = intent["mint"]
-                intent["status"] = "settled"
-                intent["resolution"] = detail
                 intent["resolved_at"] = now
-                intent["actual_in_amount"] = fill.actual_in_amount
-                intent["actual_out_amount"] = fill.actual_out_amount
-                intent["fee_lamports"] = fill.fee_lamports
-                self._save()  # status flips before booking: never booked twice
-                self._book_sell(
-                    mint, intent["fraction"], intent["requested_price"], intent["reason"],
-                )
-                log.warning("live sell intent for %s settled from on-chain fill", mint[:8])
+                # Evidence is persisted first, then booking + settled in one save.
+                self._record_confirmed_fill(intent, fill, detail)
+                if self._book_confirmed_sell(intent):
+                    log.warning("live sell intent for %s settled from on-chain fill", mint[:8])
                 continue
             if intent.get("resolution") != detail:
                 intent["resolution"] = detail
