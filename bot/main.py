@@ -76,10 +76,12 @@ class ExitQuoteKind(Enum):
 _MAX_OUT_AMOUNT_RAW = 2**64 - 1
 _CANONICAL_OUT_AMOUNT = re.compile(r"^(0|[1-9][0-9]*)$")
 
-# Pre-buy sellability gate: the quoted SOL -> token -> SOL round trip for the
-# exact planned entry may lose at most this fraction of the input lamports.
-# Exactly 10% passes; anything worse is rejected. Compared in integers
-# (sell_out * 10 >= lamports * 9); deliberately a constant, not a config knob,
+# Pre-buy sellability gate: the slippage-adjusted SOL -> token -> SOL round
+# trip for the exact planned entry may lose at most this fraction of the input
+# lamports. Both legs use Jupiter's ExactIn ``otherAmountThreshold`` (minimum
+# output after ``slippageBps``), never the optimistic ``outAmount``. Exactly
+# 10% passes; anything worse is rejected. Compared in integers
+# (sell_min_out * 10 >= lamports * 9); deliberately a constant, not a config knob,
 # so nothing can loosen it. A quote is a routing estimate, not a simulation:
 # passing this gate does NOT guarantee a future sell will succeed.
 MAX_ROUNDTRIP_LOSS = Fraction(1, 10)
@@ -179,12 +181,17 @@ def _price_usd(jup: JupiterClient, mint: str, decimals: int | None) -> float | N
 def _validated_route_out(
     quote: object, input_mint: str, output_mint: str, in_amount: int,
 ) -> tuple[int | None, str]:
-    """Raw ``outAmount`` of an ExactIn quote that matches the request exactly.
+    """Slippage-adjusted minimum output of an ExactIn quote, or a reason.
 
-    Returns ``(out_raw, "")`` or ``(None, reason)``. The quote must be a dict
-    with the requested ``inputMint``/``outputMint``, ``inAmount`` equal to the
-    requested raw amount, a positive canonical integer ``outAmount`` (via
-    ``parse_raw_amount``), and ``swapMode`` ExactIn when present.
+    Returns ``(min_out_raw, "")`` or ``(None, reason)``. The quote must be a
+    dict with the requested ``inputMint``/``outputMint``, ``inAmount`` equal
+    to the requested raw amount, ``swapMode`` ExactIn when present, and both
+    ``outAmount`` and ``otherAmountThreshold`` positive canonical integers
+    (via ``parse_raw_amount``) with ``otherAmountThreshold <= outAmount``.
+    Per Jupiter's Swap API (v1 ``QuoteResponse``), ``otherAmountThreshold`` is
+    the minimum acceptable output: ``outAmount`` after ``slippageBps``. A
+    missing, malformed or contradictory threshold is rejected; it never
+    falls back to ``outAmount``.
     """
     if quote is None:
         return None, "no route"
@@ -199,7 +206,12 @@ def _validated_route_out(
     out_raw = parse_raw_amount(quote.get("outAmount"))
     if out_raw is None or out_raw <= 0:
         return None, "quote outAmount missing, malformed or not positive"
-    return out_raw, ""
+    min_out = parse_raw_amount(quote.get("otherAmountThreshold"))
+    if min_out is None or min_out <= 0:
+        return None, "quote otherAmountThreshold missing, malformed or not positive"
+    if min_out > out_raw:
+        return None, "quote otherAmountThreshold exceeds outAmount"
+    return min_out, ""
 
 
 class TradingBot:
@@ -548,12 +560,16 @@ class TradingBot:
 
         1. Buy quote SOL -> ``mint`` for exactly ``lamports``; it must echo
            ``inputMint == SOL``, ``outputMint == mint``, ``inAmount ==
-           lamports`` and give a positive canonical integer ``outAmount``
-           (raw token units; no decimals needed or guessed).
-        2. Sell quote ``mint`` -> SOL for exactly that raw ``outAmount``,
-           validated the same way (``outAmount`` in lamports).
-        3. Pass iff ``sell_out * 10 >= lamports * 9`` (round-trip loss
-           <= ``MAX_ROUNDTRIP_LOSS`` = 10%), compared in integers.
+           lamports`` and give positive canonical integer ``outAmount`` and
+           ``otherAmountThreshold`` (threshold <= outAmount; raw token units,
+           no decimals needed or guessed).
+        2. Sell quote ``mint`` -> SOL for exactly the buy's
+           ``otherAmountThreshold`` (the fewest tokens the buy may deliver
+           after slippage), validated the same way (amounts in lamports).
+        3. Pass iff ``sell_min_out * 10 >= lamports * 9`` where
+           ``sell_min_out`` is the sell quote's ``otherAmountThreshold``
+           (slippage-adjusted round-trip loss <= ``MAX_ROUNDTRIP_LOSS`` = 10%),
+           compared in integers. ``outAmount`` is never used as a fallback.
 
         Any missing/no-route/None quote, provider exception or timeout
         (``JupiterClient.quote`` returns None on its HTTP timeout), malformed,
@@ -579,24 +595,24 @@ class TradingBot:
         except Exception as exc:
             log.warning("sell-route check %s: buy quote failed (%s)", short, type(exc).__name__)
             return False
-        token_raw, reason = _validated_route_out(buy_quote, SOL_MINT, mint, lamports)
-        if token_raw is None:
+        token_min, reason = _validated_route_out(buy_quote, SOL_MINT, mint, lamports)
+        if token_min is None:
             log.warning("sell-route check %s: buy quote rejected: %s", short, reason)
             return False
         try:
-            sell_quote = jup.quote(mint, SOL_MINT, token_raw)
+            sell_quote = jup.quote(mint, SOL_MINT, token_min)
         except Exception as exc:
             log.warning("sell-route check %s: sell quote failed (%s)", short, type(exc).__name__)
             return False
-        sell_out, reason = _validated_route_out(sell_quote, mint, SOL_MINT, token_raw)
-        if sell_out is None:
+        sell_min_out, reason = _validated_route_out(sell_quote, mint, SOL_MINT, token_min)
+        if sell_min_out is None:
             log.warning("sell-route check %s: sell quote rejected: %s", short, reason)
             return False
         keep = MAX_ROUNDTRIP_LOSS.denominator - MAX_ROUNDTRIP_LOSS.numerator
-        if sell_out * MAX_ROUNDTRIP_LOSS.denominator < lamports * keep:
+        if sell_min_out * MAX_ROUNDTRIP_LOSS.denominator < lamports * keep:
             log.warning(
-                "sell-route check %s: round trip returns %d of %d lamports (> %d%% loss)",
-                short, sell_out, lamports,
+                "sell-route check %s: min round trip returns %d of %d lamports (> %d%% loss)",
+                short, sell_min_out, lamports,
                 MAX_ROUNDTRIP_LOSS.numerator * 100 // MAX_ROUNDTRIP_LOSS.denominator,
             )
             return False
