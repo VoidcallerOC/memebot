@@ -26,6 +26,12 @@ class Position:
     actual_in_amount: int | None = None
     actual_out_amount: int | None = None
     fee_lamports: int | None = None
+    # Live positions only: exact integer raw holding (smallest token units)
+    # and the raw amount bought, seeded from the verified entry fill and
+    # decremented only by confirmed, settled sells. None for paper and for
+    # legacy positions persisted before these fields existed.
+    raw_tokens: int | None = None
+    raw_tokens_initial: int | None = None
 
     @property
     def original_tokens(self) -> float:
@@ -54,6 +60,8 @@ class Position:
             "actual_in_amount": self.actual_in_amount,
             "actual_out_amount": self.actual_out_amount,
             "fee_lamports": self.fee_lamports,
+            "raw_tokens": self.raw_tokens,
+            "raw_tokens_initial": self.raw_tokens_initial,
         }
 
     @classmethod
@@ -72,6 +80,8 @@ class Position:
             actual_in_amount=d.get("actual_in_amount"),
             actual_out_amount=d.get("actual_out_amount"),
             fee_lamports=d.get("fee_lamports"),
+            raw_tokens=d.get("raw_tokens"),
+            raw_tokens_initial=d.get("raw_tokens_initial"),
         )
 
 
@@ -99,8 +109,14 @@ class Portfolio:
         return len(self.positions)
 
     def sell_fraction(self, mint: str, fraction: float, current_price: float,
-                      reason: str) -> float:
+                      reason: str, *, raw_sold: int | None = None) -> float:
+        """Book a sell. ``raw_sold`` (live) is the exact confirmed raw amount
+        sold: the quantity booked is ``raw_sold / 10**decimals`` and the raw
+        holding is decremented exactly; ``tokens`` is re-derived from it.
+        Without ``raw_sold`` (paper / legacy) the float path is unchanged."""
         pos = self.positions[mint]
+        if raw_sold is not None:
+            return self._sell_raw(pos, raw_sold, current_price, reason)
         tokens_to_sell = min(pos.original_tokens * fraction, pos.tokens)
         if tokens_to_sell <= 0:
             return 0.0
@@ -119,6 +135,36 @@ class Portfolio:
 
         if pos.tokens <= 1e-9 or reason == "stop_loss":
             self._close(mint, current_price)
+        return pnl
+
+    def _sell_raw(self, pos: Position, raw_sold: int, current_price: float,
+                  reason: str) -> float:
+        dec = pos.token_decimals
+        raw = pos.raw_tokens
+        if (
+            isinstance(raw_sold, bool) or not isinstance(raw_sold, int)
+            or isinstance(raw, bool) or not isinstance(raw, int)
+            or isinstance(dec, bool) or not isinstance(dec, int) or not 0 <= dec <= 18
+            or not 0 < raw_sold <= raw
+        ):
+            raise ValueError(
+                f"invalid exact raw sell for {pos.symbol}: sold={raw_sold!r} held={raw!r} decimals={dec!r}"
+            )
+        tokens_to_sell = raw_sold / (10 ** dec)
+        proceeds = tokens_to_sell * current_price
+        cost_basis = tokens_to_sell * pos.entry_price
+        pnl = proceeds - cost_basis
+
+        pos.raw_tokens = raw - raw_sold
+        pos.tokens = pos.raw_tokens / (10 ** dec)
+        pos.size_usd -= cost_basis
+        pos.realized_pnl += pnl
+        self.realized_pnl += pnl
+
+        log.info("SELL  %s %d raw (%s): proceeds $%.2f, pnl $%.2f",
+                 pos.symbol, raw_sold, reason, proceeds, pnl)
+        if pos.raw_tokens == 0 or reason == "stop_loss":
+            self._close(pos.mint, current_price)
         return pnl
 
     def _close(self, mint: str, current_price: float) -> None:

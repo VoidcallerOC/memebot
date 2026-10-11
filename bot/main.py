@@ -80,6 +80,59 @@ class ExitQuoteKind(Enum):
 _MAX_OUT_AMOUNT_RAW = 2**64 - 1
 _CANONICAL_OUT_AMOUNT = re.compile(r"^(0|[1-9][0-9]*)$")
 
+def _exact_fraction(fraction: object) -> Fraction | None:
+    """Sell fraction as an exact rational, or None if invalid.
+
+    Policy: a real number in (0, 1] (bools, NaN, inf and anything else are
+    rejected) converted through its shortest round-trip decimal string,
+    ``Fraction(repr(float(f)))``, so a configured ``0.3`` is exactly 3/10
+    (not the binary double 0.29999999999999998889...). Binary-exact values
+    such as the default ladder's 0.5 / 0.25 and the stop-loss 1.0 are
+    unchanged by this conversion.
+    """
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+        return None
+    value = float(fraction)
+    if not math.isfinite(value) or value <= 0 or value > 1:
+        return None
+    return Fraction(repr(value))
+
+
+def exact_raw_sell_amount(pos, fraction: object) -> tuple[int | None, str]:
+    """Exact integer raw units to sell for ``fraction`` of the ORIGINAL buy.
+
+    ``floor(raw_tokens_initial * fraction)`` (exact rational arithmetic,
+    rounding toward zero so a sell never exceeds what the rule allows),
+    capped at the current ``raw_tokens``; a full exit (fraction 1, the
+    stop-loss) therefore sells exactly the current raw holding. Returns
+    ``(None, reason)`` — and the caller refuses before submitting — for
+    unverified decimals, a missing/malformed/inconsistent raw holding (e.g.
+    a legacy position persisted before raw tracking), an invalid fraction,
+    or a result of zero. Never derived from float token counts.
+    """
+    if valid_token_decimals(getattr(pos, "token_decimals", None)) is None:
+        return None, "token decimals unverified"
+    raw = getattr(pos, "raw_tokens", None)
+    initial = getattr(pos, "raw_tokens_initial", None)
+    if (
+        isinstance(raw, bool) or not isinstance(raw, int)
+        or isinstance(initial, bool) or not isinstance(initial, int)
+    ):
+        return None, (
+            "no exact raw holding recorded (legacy or unverified position); operator "
+            "action required: close or re-verify this position outside the bot"
+        )
+    if not 0 < raw <= initial:
+        return None, f"raw holding inconsistent (held={raw}, bought={initial})"
+    frac = _exact_fraction(fraction)
+    if frac is None:
+        return None, f"invalid sell fraction {fraction!r}"
+    amount = min(initial * frac.numerator // frac.denominator, raw)
+    if amount <= 0:
+        return None, "sell amount rounds to zero raw units"
+    return amount, ""
+
+
 # Live sell intents (armed only). A sell intent is written before the swap and
 # moves through these statuses (see ``TradingBot._resolve_sell_intents``):
 #   pending    written before the swap; still pending only after a crash
@@ -464,6 +517,8 @@ class TradingBot:
                     actual_in_amount=result.actual_in_amount,
                     actual_out_amount=result.actual_out_amount,
                     fee_lamports=result.fee_lamports,
+                    raw_tokens=result.actual_out_amount,
+                    raw_tokens_initial=result.actual_out_amount,
                 )
             else:
                 self.portfolio.open(
@@ -517,22 +572,32 @@ class TradingBot:
             if self._sell_frozen(mint):
                 log.error("%s: refusing %s; an earlier live sell is unresolved", symbol, reason)
                 return
-            if not self._settle_live_sell(pos, fraction, price, reason):
+            raw_sold = self._settle_live_sell(pos, fraction, price, reason)
+            if not raw_sold:
                 return
+            self._book_sell(mint, fraction, price, reason, raw_sold=raw_sold)
+            return
         self._book_sell(mint, fraction, price, reason)
 
-    def _book_sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
-        """Portfolio/risk accounting for one executed sell (the only booking path)."""
+    def _book_sell(self, mint: str, fraction: float, price: float, reason: str,
+                   *, raw_sold: int | None = None) -> None:
+        """Portfolio/risk accounting for one executed sell (the only booking path).
+
+        ``raw_sold`` is the exact confirmed raw amount for live positions that
+        track a raw holding; paper and legacy positions use the float path.
+        """
         symbol = self.portfolio.positions[mint].symbol
         was_halted = self.risk.trading_halted()
-        pnl = self.portfolio.sell_fraction(mint, fraction, price, reason)
+        pnl = self.portfolio.sell_fraction(mint, fraction, price, reason, raw_sold=raw_sold)
         self.risk.record_realized_pnl(pnl)
         self.notifier.sell(symbol, fraction, price, reason, pnl)
         if self.risk.trading_halted() and not was_halted:
             self.notifier.halt(-self.risk.realized_pnl_today)
         self._save()
 
-    def _settle_live_sell(self, pos, fraction: float, price: float, reason: str) -> bool:
+    def _settle_live_sell(self, pos, fraction: float, price: float, reason: str) -> int | bool:
+        """Submit an armed sell; return the exact raw amount sold once it is
+        confirmed with a matching fill, else False (position untouched)."""
         tokens_to_sell = min(pos.original_tokens * fraction, pos.tokens)
         decimals = pos.token_decimals
         intent = {
@@ -553,13 +618,18 @@ class TradingBot:
             log.error("live sell fail-closed for %s: missing decimals or size", pos.symbol)
             self._save()
             return False
-        raw_amount = int(tokens_to_sell * (10 ** decimals))
+        raw_amount, refusal = exact_raw_sell_amount(pos, fraction)
         intent["raw_amount"] = raw_amount
-        if raw_amount <= 0:
+        if raw_amount is None:
+            # Definitive pre-submit refusal: nothing sent, so no chain
+            # uncertainty and no reconciliation; the intent is cleared by the
+            # resolver and the exit is re-evaluated (and refused) next tick.
             intent["status"] = "blocked"
-            self._reconciliation_required = True
+            intent["error"] = refusal
+            log.error("live sell refused before submit for %s: %s", pos.symbol, refusal)
             self._save()
             return False
+        tokens_to_sell = raw_amount / (10 ** valid_token_decimals(decimals))
         result = self.executor.swap(
             pos.mint, SOL_MINT, raw_amount,
             allocation_usd=min(tokens_to_sell * price, self.cfg.max_position_usd()),
@@ -584,9 +654,18 @@ class TradingBot:
             log.error("live sell confirmed without fill data for %s", pos.symbol)
             self._save()
             return False
+        if result.actual_in_amount != raw_amount:
+            intent["status"] = "unresolved"
+            self._reconciliation_required = True
+            log.error(
+                "live sell fill for %s sold %s raw, intended %s; not booked",
+                pos.symbol, result.actual_in_amount, raw_amount,
+            )
+            self._save()
+            return False
         intent["status"] = "settled"
         self._save()
-        return True
+        return raw_amount
 
     # -- live sell intent resolution -----------------------------------------
 
@@ -643,8 +722,11 @@ class TradingBot:
                 intent["actual_out_amount"] = fill.actual_out_amount
                 intent["fee_lamports"] = fill.fee_lamports
                 self._save()  # status flips before booking: never booked twice
+                pos = self.portfolio.positions[mint]
+                exact = isinstance(pos.raw_tokens, int) and not isinstance(pos.raw_tokens, bool)
                 self._book_sell(
                     mint, intent["fraction"], intent["requested_price"], intent["reason"],
+                    raw_sold=intent["raw_amount"] if exact else None,
                 )
                 log.warning("live sell intent for %s settled from on-chain fill", mint[:8])
                 continue

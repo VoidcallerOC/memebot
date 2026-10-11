@@ -207,8 +207,8 @@ def test_armed_exit_with_malformed_sell_quote_is_safe(mutate, monkeypatch):
     executor = SwapExecutor(bot.cfg, jup=jup, session=object())
     spy = SignerSpy(executor, monkeypatch)
     bot.executor = executor
-    bot.portfolio.open(MINT, "A", 1.0, 2.0, 2.0, token_decimals=6)
-    bot.portfolio.open(MINT2, "B", 1.0, 2.0, 2.0, token_decimals=6)
+    bot.portfolio.open(MINT, "A", 1.0, 2.0, 2.0, token_decimals=6, raw_tokens=2_000_000, raw_tokens_initial=2_000_000)
+    bot.portfolio.open(MINT2, "B", 1.0, 2.0, 2.0, token_decimals=6, raw_tokens=2_000_000, raw_tokens_initial=2_000_000)
 
     bot._manage_positions()  # must not raise
 
@@ -234,7 +234,7 @@ def test_armed_exit_with_valid_quote_still_reaches_execution():
         ok=False, simulated=False, in_amount=amt, out_amount=out,
         status=TransactionStatus.CONFIRMED_FAILURE, error="test stop")
     bot.executor = executor
-    bot.portfolio.open(MINT, "A", 1.0, 2.0, 2.0, token_decimals=6)
+    bot.portfolio.open(MINT, "A", 1.0, 2.0, 2.0, token_decimals=6, raw_tokens=2_000_000, raw_tokens_initial=2_000_000)
     bot._manage_positions()
     assert reached == [2_000_000]
     assert bot.portfolio.positions[MINT].tokens == 2.0
