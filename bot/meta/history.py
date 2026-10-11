@@ -26,7 +26,7 @@ import operator
 import os
 import time
 from collections.abc import Sequence
-from itertools import islice
+from itertools import islice, zip_longest
 from typing import Any, Callable, Iterable, Iterator, NoReturn, Optional
 
 from .model import MarketWindow, TokenSnapshot, Score, ok, unverified
@@ -66,6 +66,7 @@ _DIGEST_SIZE = 32
 MEMORY_SAFETY_MARGIN_SECONDS = HOUR
 _TS_KEYS = {MARKET_ROW: "observed_at", THEME_ROW: "recorded_at"}
 _NEG_INF = float("-inf")
+_MISSING = object()  # zip_longest fill value in ObservationRows.__eq__
 
 
 def default_observations_path() -> str:
@@ -397,9 +398,12 @@ class ObservationRows(Sequence):
 
         * Same pin (``a == a`` or two snapshots of one history/cursor): one
           hash-only verification pass, no parsing; True if it verifies.
-        * Otherwise the snapshot(s) are iterated to the end (no
-          short-circuit on the first differing row, so a mismatch anywhere in
-          the consumed bytes still raises) and compared row by row.
+        * Otherwise both operands are iterated to exhaustion with
+          zip_longest (no short-circuit on the first differing row and no
+          early stop when one side runs out, in either operand order), so a
+          mismatch anywhere in either snapshot's consumed bytes, including
+          trailing unparseable lines after its last row, raises; rows are
+          compared pairwise as they stream.
         * A length mismatch still verifies before returning False.
         * Not a list/snapshot: NotImplemented (nothing is read).
         """
@@ -414,9 +418,17 @@ class ObservationRows(Sequence):
             if isinstance(other, ObservationRows):
                 other._validate()
             return False
+        # zip_longest (not zip) so BOTH sides run to exhaustion: zip stops as
+        # soon as `self` ends and would leave `other` suspended after its last
+        # parsed row, so consumed bytes after that row (unparseable/blank
+        # lines) in a later fingerprint chunk would never be verified. A
+        # snapshot verifies each chunk before yielding any row from it and
+        # re-checks its row count once exhausted, so a fully drained iterator
+        # means every pinned byte was verified. Rows are streamed pairwise;
+        # nothing is retained.
         equal = True
-        for a, b in zip(self, other):  # consumes self (and other) fully: verified
-            if equal and not a == b:
+        for a, b in zip_longest(self, other, fillvalue=_MISSING):
+            if equal and (a is _MISSING or b is _MISSING or not a == b):
                 equal = False
         return equal
 
