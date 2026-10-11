@@ -21,7 +21,9 @@ log = logging.getLogger(__name__)
 STATE_VERSION = 1
 
 
-def save_state(path: str, portfolio: Portfolio, risk: RiskManager) -> None:
+def save_state(path: str, portfolio: Portfolio, risk: RiskManager) -> bool:
+    """Atomically write state. Returns True once durable, False on failure
+    (logged; the previous file is left intact). Never raises."""
     data = {
         "version": STATE_VERSION,
         "portfolio": portfolio.to_dict(),
@@ -39,6 +41,7 @@ def save_state(path: str, portfolio: Portfolio, risk: RiskManager) -> None:
         os.replace(tmp, path)  # atomic on POSIX and Windows
         tmp = None
         _fsync_dir(directory)  # make the rename itself durable
+        return True
     except Exception as exc:
         log.error("failed to save state to %s: %s", path, exc)
         if tmp is not None:
@@ -46,6 +49,7 @@ def save_state(path: str, portfolio: Portfolio, risk: RiskManager) -> None:
                 os.unlink(tmp)
             except OSError:
                 pass
+        return False
 
 
 def _fsync_dir(directory: str) -> None:

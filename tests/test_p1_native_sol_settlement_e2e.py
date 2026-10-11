@@ -64,8 +64,9 @@ RPC = "https://rpc.test"
 SWAP_URL = "https://jupiter.test/swap"
 SENTINEL = "test-only-sentinel"
 
-FULL = 274_425 / 10**8      # 0.00274425 tokens; stop-loss (1.0) sells 274,425 raw
-DOUBLE = 2 * 274_425 / 10**8  # 0.0054885 tokens; first TP rung (0.5) sells 274,425 raw
+RAW_DOUBLE = 2 * IN_RAW     # 548,850 raw bought; the first TP rung (0.5) sells 274,425
+FULL = IN_RAW / 10**8       # float tokens are DERIVED from the exact raw holding
+DOUBLE = RAW_DOUBLE / 10**8
 ENTRY = 700.0
 SL_MARK = 350.0             # -50%: stop-loss, fraction 1.0
 TP_MARK = 1120.0            # +60%: only the 50% rung, fraction 0.5
@@ -270,10 +271,15 @@ def run(bot, ticks):
     return len(done)
 
 
-def open_position(bot, w, mint=MINT, tokens=FULL, entry=ENTRY):
+def open_position(bot, w, mint=MINT, raw=IN_RAW, entry=ENTRY):
+    """A live position exactly as the armed entry path records it: the raw
+    holding is the verified entry fill's integer raw output (never derived
+    from a float); ``tokens`` is derived from it."""
+    tokens = raw / 10**8
     bot.portfolio.open(mint, mint[:4], entry, tokens * entry, tokens, token_decimals=8,
                        entry_signature="entry-" + mint[:4], actual_in_amount=1,
-                       actual_out_amount=round(tokens * 10**8), fee_lamports=5000)
+                       actual_out_amount=raw, fee_lamports=5000,
+                       raw_tokens=raw, raw_tokens_initial=raw)
     w.wallet[mint] = tokens
     bot._save()
 
@@ -291,7 +297,8 @@ def position(state, mint=MINT):
     return next((p for p in state["portfolio"]["positions"] if p["mint"] == mint), None)
 
 
-def assert_booked_once(w, *, pnl=SL_PNL, remaining=None, mint=MINT, sig=SIG, sends=1):
+def assert_booked_once(w, *, pnl=SL_PNL, remaining_raw=None, mint=MINT, sig=SIG, sends=1,
+                       risk_pnl=None):
     """Exactly-once invariants read from the persisted state file only."""
     state = persisted(w)
     mine = intents_of(state, mint)
@@ -299,30 +306,43 @@ def assert_booked_once(w, *, pnl=SL_PNL, remaining=None, mint=MINT, sig=SIG, sen
     assert len(settled) == 1, mine
     intent = settled[0]
     assert intent["tx_signature"] == sig
-    assert intent["raw_amount"] == IN_RAW
+    assert intent["raw_amount"] == IN_RAW and intent["booked_raw"] == IN_RAW
+    assert intent["booked_pnl"] == pytest.approx(pnl)
     assert (intent["actual_in_amount"], intent["actual_out_amount"], intent["fee_lamports"]) == (
         IN_RAW, OUT_LAMPORTS, FEE)
     assert not [i for i in mine if i["status"] in main_module.OPEN_SELL_INTENT_STATUSES]
     assert state["portfolio"]["realized_pnl"] == pytest.approx(pnl)
-    assert state["risk"]["realized_pnl_today"] == pytest.approx(pnl)
+    assert state["risk"]["realized_pnl_today"] == pytest.approx(pnl if risk_pnl is None else risk_pnl)
     pos = position(state, mint)
-    if remaining is None:
+    if remaining_raw is None:
         assert pos is None
     else:
-        assert pos["tokens"] == pytest.approx(remaining)
+        assert pos["raw_tokens"] == remaining_raw                      # exact integer
+        assert pos["raw_tokens"] == pos["raw_tokens_initial"] - IN_RAW  # decremented once
+        assert pos["tokens"] == remaining_raw / 10**8                   # derived from raw
         assert pos["realized_pnl"] == pytest.approx(pnl)
     assert w.sends.count(sig) == sends
     return state
 
 
-def assert_never_terminal_unbooked(w, mint=MINT, full_tokens=FULL):
-    """A terminal (settled) intent must have its accounting persisted with it."""
+def assert_never_terminal_unbooked(w, mint=MINT, risk_before=0.0):
+    """Read from disk: every settled intent's accounting is persisted with it,
+    and nothing is booked without a settled intent (raw holding, position,
+    portfolio P&L and daily-risk P&L all agree with the settled intents)."""
     state = persisted(w)
-    for intent in intents_of(state, mint):
-        if intent["status"] == "settled":
-            pos = position(state, mint)
-            assert pos is None or pos["tokens"] < full_tokens - 1e-12, (
-                "settled intent persisted without its booking (terminal-but-unbooked)", state)
+    settled = [i for i in intents_of(state, mint) if i["status"] == "settled"]
+    pos = position(state, mint)
+    booked_raw = sum(i.get("booked_raw") or 0 for i in settled)
+    booked_pnl = sum(i.get("booked_pnl") or 0.0 for i in settled)
+    assert all("booked_at" in i for i in settled), ("settled without booking marker", state)
+    if pos is not None:
+        assert pos["raw_tokens"] == pos["raw_tokens_initial"] - booked_raw, (
+            "raw holding disagrees with settled intents (terminal-but-unbooked)", state)
+        assert pos["tokens"] == pos["raw_tokens"] / 10**8
+    else:
+        assert settled, ("position gone without a settled sell", state)
+    assert state["portfolio"]["realized_pnl"] == pytest.approx(booked_pnl)
+    assert state["risk"]["realized_pnl_today"] == pytest.approx(risk_before + booked_pnl)
 
 
 # -- fixture and real parser path ------------------------------------------------
@@ -339,11 +359,12 @@ def test_fixture_pinned_and_parsed_through_real_rpc_path(world):
     assert tx["meta"]["err"] is None and tx["version"] == 0
 
 
-def test_main_sizing_maps_to_fixture_raw():
-    assert FULL == 0.00274425 and DOUBLE == 0.0054885
-    assert int(min(FULL * 1.0, FULL) * 10**8) == IN_RAW
-    assert int(min(DOUBLE * 0.5, DOUBLE) * 10**8) == IN_RAW
-    assert int(min(0.00274424 * 1.0, 0.00274424) * 10**8) == IN_RAW - 1
+def test_exact_sizing_maps_to_fixture_raw():
+    def pos(raw):
+        return types.SimpleNamespace(token_decimals=8, raw_tokens=raw, raw_tokens_initial=raw)
+    assert main_module.exact_raw_sell_amount(pos(IN_RAW), 1.0) == (IN_RAW, "")
+    assert main_module.exact_raw_sell_amount(pos(RAW_DOUBLE), 0.5) == (IN_RAW, "")
+    assert main_module.exact_raw_sell_amount(pos(IN_RAW - 1), 1.0) == (IN_RAW - 1, "")
 
 
 # -- on-time path (_settle_live_sell) ------------------------------------------
@@ -373,19 +394,24 @@ def test_on_time_stop_loss_settles_once_and_restart_does_not_rebook(world):
 
 def test_on_time_partial_take_profit_settles_once_restart_reconciles_clean(world):
     bot = boot(world)
-    open_position(bot, world, tokens=DOUBLE)
+    open_position(bot, world, raw=RAW_DOUBLE)
     world.sig_queue = [SIG]
     world.on_send[SIG] = lands(MINT, FULL)
     world.marks[MINT] = TP_MARK
     bot._tick()
     tp_pnl = FULL * (TP_MARK - ENTRY)
-    state = assert_booked_once(world, pnl=tp_pnl, remaining=FULL)
+    state = assert_booked_once(world, pnl=tp_pnl, remaining_raw=IN_RAW)
+    (intent,) = intents_of(state)
+    # submitted == intended == fill-validated == decremented, all exact ints
+    assert bot.jup.quotes == [(MINT, SOL_MINT, IN_RAW)]
+    assert intent["raw_amount"] == intent["actual_in_amount"] == intent["booked_raw"] == IN_RAW
+    assert RAW_DOUBLE - position(state)["raw_tokens"] == IN_RAW
     assert position(state)["ladder_filled"] == [50.0]
 
     bot2 = boot(world)
     assert run(bot2, 3) == 3                 # reconcile: tracked 0.00274425 == wallet
     assert bot2.notifier.sells == [] and world.sends == [SIG]
-    assert_booked_once(world, pnl=tp_pnl, remaining=FULL)
+    assert_booked_once(world, pnl=tp_pnl, remaining_raw=IN_RAW)
 
 
 # -- delayed path (_resolve_sell_intents) -----------------------------------------
@@ -439,13 +465,16 @@ def test_restart_with_unresolved_intent_books_once_at_startup(world):
 # -- mismatched / unprovable fills stay unresolved -----------------------------
 
 @pytest.mark.parametrize("path", ["on_time", "delayed"])
-@pytest.mark.parametrize("variant", ["raw_mismatch", "no_transaction"])
+@pytest.mark.parametrize("variant", ["raw_mismatch", "no_transaction", "malformed_meta"])
 def test_bad_evidence_stays_unresolved_frozen_without_pnl(world, path, variant):
-    tokens = 0.00274424 if variant == "raw_mismatch" else FULL   # intent raw 274,424 vs fill 274,425
+    raw = IN_RAW - 1 if variant == "raw_mismatch" else IN_RAW   # intent raw 274,424 vs fill 274,425
+    tokens = raw / 10**8
     if variant == "no_transaction":
         world.txs[SIG] = None                  # confirmed signature, getTransaction null
+    if variant == "malformed_meta":
+        world.txs[SIG] = dict(fixture_result(), meta="corrupted")  # documented edit: unparseable meta
     bot = boot(world)
-    open_position(bot, world, tokens=tokens)
+    open_position(bot, world, raw=raw)
     bot.risk.record_realized_pnl(-0.5)          # earlier loss today; must survive untouched
     bot._save()
     world.sig_queue = [SIG]
@@ -461,6 +490,7 @@ def test_bad_evidence_stays_unresolved_frozen_without_pnl(world, path, variant):
     mine = intents_of(state)
     assert [i["status"] for i in mine] == ["unresolved"]
     assert position(state)["tokens"] == tokens
+    assert position(state)["raw_tokens"] == raw == position(state)["raw_tokens_initial"]
     assert state["portfolio"]["realized_pnl"] == 0.0
     assert state["risk"]["realized_pnl_today"] == pytest.approx(-0.5)
     assert bot.notifier.sells == [] and world.sends == [SIG]   # frozen: never re-sold
@@ -510,7 +540,7 @@ def test_other_positions_still_get_exits_while_one_mint_is_frozen(world):
     world.txs[SIG2] = fixture_result(MINT2)    # documented edit: fixture with the mint renamed
     bot = boot(world)
     open_position(bot, world)
-    open_position(bot, world, mint=MINT2, tokens=DOUBLE)
+    open_position(bot, world, mint=MINT2, raw=RAW_DOUBLE)
     world.sig_queue = [SIG, SIG2]
     world.on_send[SIG2] = lands(MINT2, FULL)    # MINT's sale never lands: outcome stays unknown
     world.marks[MINT] = SL_MARK
@@ -523,7 +553,7 @@ def test_other_positions_still_get_exits_while_one_mint_is_frozen(world):
     assert world.sends == [SIG, SIG2]
     assert bot.entry_scans == []                # entries blocked while MINT is unresolved
     tp_pnl = FULL * (TP_MARK - ENTRY)
-    assert_booked_once(world, mint=MINT2, sig=SIG2, pnl=tp_pnl, remaining=FULL)
+    assert_booked_once(world, mint=MINT2, sig=SIG2, pnl=tp_pnl, remaining_raw=IN_RAW)
     state = persisted(world)
     assert [i["status"] for i in intents_of(state)] == ["unresolved"]
     assert position(state)["tokens"] == FULL
@@ -536,26 +566,29 @@ def _crash_after_save(monkeypatch, k):
     count = [0]
 
     def save(*a, **kw):
-        real(*a, **kw)              # durable (fsync + os.replace) before the crash
+        ok = real(*a, **kw)         # durable (fsync + os.replace) before the crash
         count[0] += 1
         if count[0] == k:
             raise SystemExit(f"crash after save {k}")
+        return ok
 
     monkeypatch.setattr(main_module, "save_state", save)
     return count
 
 
-def _settle_with_crash(world, monkeypatch, path, k):
+def _settle_with_crash(world, monkeypatch, path, k, raw=IN_RAW, mark=SL_MARK):
     """One lifetime: open, sell, and die right after the k-th save of the
     settling tick. Returns True if the crash point was reached."""
     real = main_module.save_state
     bot = boot(world)
-    open_position(bot, world)
+    open_position(bot, world, raw=raw)
     world.sig_queue = [SIG, SIG]
     world.on_send[SIG] = lands(MINT, FULL, visible=path == "on_time")
-    world.marks[MINT] = SL_MARK
+    world.marks[MINT] = mark
     if path == "delayed":
         bot._tick()                     # TIMEOUT: unresolved intent persisted
+        state = persisted(world)        # no decrement while the outcome is unknown
+        assert position(state)["raw_tokens"] == raw and state["portfolio"]["realized_pnl"] == 0.0
         show(world)
     _crash_after_save(monkeypatch, k)
     try:
@@ -568,28 +601,48 @@ def _settle_with_crash(world, monkeypatch, path, k):
     return crashed
 
 
+@pytest.mark.parametrize("kind", ["stop_loss_full", "take_profit_partial"])
 @pytest.mark.parametrize("path", ["on_time", "delayed"])
-def test_crash_after_every_save_never_loses_or_double_books(world, monkeypatch, tmp_path, path):
+def test_crash_after_every_save_never_loses_or_double_books(world, monkeypatch, tmp_path, path, kind):
     """Sweep: the process dies right after the k-th durable save of the settling
     tick, for every k. A fresh process then loads the file (production
     constructor) and runs startup + ticks. From persisted state alone: the sale
     is booked exactly once, never terminal-but-unbooked, never re-sold."""
+    raw, mark = (IN_RAW, SL_MARK) if kind == "stop_loss_full" else (RAW_DOUBLE, TP_MARK)
+    expect = (dict(pnl=SL_PNL) if kind == "stop_loss_full"
+              else dict(pnl=FULL * (TP_MARK - ENTRY), remaining_raw=IN_RAW))
     k = 1
     while True:
-        (tmp_path / f"{path}-{k}").mkdir()
-        world.__init__(tmp_path / f"{path}-{k}")      # fresh chain/wallet/state per crash point
-        if not _settle_with_crash(world, monkeypatch, path, k):
+        (tmp_path / f"{path}-{kind}-{k}").mkdir()
+        world.__init__(tmp_path / f"{path}-{kind}-{k}")  # fresh chain/wallet/state per crash point
+        if not _settle_with_crash(world, monkeypatch, path, k, raw=raw, mark=mark):
             break
         assert_never_terminal_unbooked(world)
+        if path == "on_time" and k == 1:
+            # the pre-send intent is durable with its exact raw amount before
+            # anything was quoted, signed or sent
+            (intent,) = intents_of(persisted(world))
+            assert (intent["status"], intent["raw_amount"]) == ("pending", IN_RAW)
+            assert world.signs == [] and world.sends == []
         world.now += main_module.SELL_INTENT_EXPIRY_SECONDS + 1  # past any expiry window
         run(boot(world), 4)
         assert_never_terminal_unbooked(world)
-        assert_booked_once(world)
+        if path == "on_time" and k == 1 and kind == "take_profit_partial":
+            # Died before anything was sent. Pre-existing exit-management
+            # behaviour (unchanged here): the TP rung is marked filled before
+            # the sell, so it is not retried. Nothing sold, nothing booked.
+            state = persisted(world)
+            assert [i["status"] for i in intents_of(state)] == ["failed"]
+            assert position(state)["raw_tokens"] == RAW_DOUBLE
+            assert position(state)["ladder_filled"] == [50.0]
+            assert state["portfolio"]["realized_pnl"] == 0.0 and world.sends == []
+        else:
+            assert_booked_once(world, **expect)
         k += 1
     # saves in the settling tick: on-time = pending, confirmed_unbooked, settled;
     # delayed = confirmed_unbooked, settled (main: pending, settled, booked / settled, booked)
     assert k - 1 == {"on_time": 3, "delayed": 2}[path]
-    assert_booked_once(world)                          # the uncrashed run as well
+    assert_booked_once(world, **expect)                # the uncrashed run as well
 
 
 def test_crash_after_send_before_signature_persisted_stays_frozen(world):
