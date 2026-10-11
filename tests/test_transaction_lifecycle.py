@@ -100,8 +100,22 @@ def install_fake_live_modules(monkeypatch, status):
         def pubkey(self):
             return "PUBKEY"
 
+    # Model the decoded transaction as v0 (solders 0.29 shape) so it passes
+    # the legacy/v0 version gate; assertions below are unchanged.
+    class Message:
+        pass
+
+    class MessageV0:
+        pass
+
+    class Legacy:
+        Legacy = object()
+
     class RawTx:
-        message = object()
+        message = MessageV0()
+
+        def version(self):
+            return 0
 
         @classmethod
         def from_bytes(cls, _raw):
@@ -135,12 +149,16 @@ def install_fake_live_modules(monkeypatch, status):
         "solders": types.ModuleType("solders"),
         "solders.keypair": types.ModuleType("solders.keypair"),
         "solders.transaction": types.ModuleType("solders.transaction"),
+        "solders.message": types.ModuleType("solders.message"),
         "solana": types.ModuleType("solana"),
         "solana.rpc": types.ModuleType("solana.rpc"),
         "solana.rpc.api": types.ModuleType("solana.rpc.api"),
     }
     modules["solders.keypair"].Keypair = FakeKeypair
     modules["solders.transaction"].VersionedTransaction = Versioned
+    modules["solders.transaction"].Legacy = Legacy
+    modules["solders.message"].Message = Message
+    modules["solders.message"].MessageV0 = MessageV0
     modules["solana.rpc.api"].Client = FakeClient
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
