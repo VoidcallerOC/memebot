@@ -1,4 +1,6 @@
-# Test-only CI. Runs the pytest suite offline on Python 3.11 and 3.13.
+# Test-only CI. Runs the pytest suite offline on Python 3.11 and 3.13, and
+# builds (never pushes or runs) the Docker image to prove the runtime install
+# from the canonical lock still works.
 #
 # Safety properties (keep them when editing):
 #   * Triggered by pull_request / push to main / manual dispatch only — never
@@ -11,6 +13,9 @@
 #     a clean environment (env -i). Nothing starts bot.main or bot.meta.
 #   * The job fails if the tests modified the checkout.
 #   * Third-party actions are pinned to full commit SHAs.
+#   * The image job never pushes, never logs in to a registry, and never runs
+#     the image ENTRYPOINT (bot.main); it only runs `python -m pip ...` inside
+#     the built image with --network none as the image's non-root user.
 name: CI
 
 on:
@@ -136,3 +141,61 @@ jobs:
             echo "::error::tests modified the working tree"
             exit 1
           fi
+
+  runtime-image:
+    name: docker build (runtime lock)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Runtime install paths use the canonical lock
+        run: |
+          set -euo pipefail
+          for f in Dockerfile deploy/memebot.service deploy/README.md; do
+            grep -q 'requirements/ci-py3.11.lock' "$f" || { echo "::error::$f does not install requirements/ci-py3.11.lock"; exit 1; }
+          done
+          if grep -nE 'pip install[^\\]*-r requirements\.txt' Dockerfile deploy/memebot.service deploy/README.md; then
+            echo "::error::a runtime install path resolves requirements.txt instead of the lock"
+            exit 1
+          fi
+
+      - name: Build image (no push; entrypoint not run)
+        run: docker build --pull --tag memebot:ci .
+
+      - name: Installed set equals the lock (offline, entrypoint overridden)
+        run: |
+          set -euo pipefail
+          docker image inspect memebot:ci --format 'user={{.Config.User}} entrypoint={{json .Config.Entrypoint}}'
+          run_py() {
+            docker run --rm -i --network none --entrypoint python \
+              -e LIVE_TRADING=false -e WALLET_PRIVATE_KEY= memebot:ci "$@"
+          }
+          run_py -VV
+          run_py -m pip check
+          run_py - requirements/ci-py3.11.lock <<'PY'
+          import os, platform, re, sys
+          from importlib.metadata import distributions
+          assert os.geteuid() != 0, "image must run as a non-root user"
+          assert sys.version_info[:2] == (3, 11) and platform.machine() == "x86_64"
+          norm = lambda n: re.sub(r"[-_.]+", "-", n).lower()
+          locked = {}
+          for line in open(sys.argv[1]):
+              m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)", line)
+              if m:
+                  locked[norm(m.group(1))] = m.group(2)
+          installed = {norm(d.metadata["Name"]): d.version for d in distributions()}
+          for tool in ("pip", "setuptools", "wheel"):
+              installed.pop(tool, None)
+          drift = sorted(set(locked.items()) ^ set(installed.items()))
+          if drift:
+              for name, ver in drift:
+                  side = "lock" if locked.get(name) == ver else "installed"
+                  print(f"::error::image dependency drift ({side} only): {name}=={ver}")
+              sys.exit(1)
+          import numpy, requests, solana, solders, base58, dotenv  # noqa: F401
+          print(f"image installed set == lock ({len(locked)} packages)")
+          PY

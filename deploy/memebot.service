@@ -2,7 +2,11 @@
 # Install (as root):
 #   git clone https://github.com/VoidcallerOC/memebot.git /opt/memebot
 #   cd /opt/memebot
-#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#   # Precondition: Linux x86_64, glibc >= 2.28, CPython 3.11 — the lock was
+#   # resolved for exactly that target. The first command refuses anything
+#   # else; then the hash-locked set is installed (no resolution/upgrades).
+#   # See deploy/README.md.
+#   python3.11 -m venv .venv && .venv/bin/python -c "import platform, sys; l = platform.libc_ver(); ok = sys.version_info[:2] == (3, 11) and platform.machine() == 'x86_64' and l[0] == 'glibc' and tuple(int(x) for x in l[1].split('.')[:2]) >= (2, 28); sys.exit(0 if ok else 'unsupported runtime target: %s %s %s' % (sys.version.split()[0], platform.machine(), l))" && .venv/bin/python -m pip install --require-hashes --no-deps --only-binary :all: -r requirements/ci-py3.11.lock && .venv/bin/python -m pip check
 #   cp config.example.env .env && $EDITOR .env
 #   useradd --system --home /opt/memebot memebot && chown -R memebot:memebot /opt/memebot
 #   cp deploy/memebot.service /etc/systemd/system/
