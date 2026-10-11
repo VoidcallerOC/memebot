@@ -139,6 +139,33 @@ def sol_price_usd(jup: Any) -> Optional[float]:
     return float(price)
 
 
+def unsupported_tx_version(tx: Any) -> Optional[str]:
+    """Refusal reason unless ``tx`` is a legacy or v0 transaction, else None.
+
+    Positive allowlist on the decoded solders object (0.29): legacy is a
+    ``solders.message.Message`` with ``version() == Legacy.Legacy``; v0 is a
+    ``MessageV0`` with ``version() == 0``. Anything else (e.g. ``MessageV1``
+    / version 1, which ``get_confirmed_transaction`` cannot fetch with
+    ``maxSupportedTransactionVersion: 0``), any disagreement between message
+    type and version, or any error is refused. Never raises.
+    """
+    try:
+        from solders.message import Message, MessageV0
+        from solders.transaction import Legacy
+        message = tx.message
+        version = tx.version()
+    except Exception as exc:  # noqa: BLE001 - fail closed on anything odd
+        return f"refused before signing: unsupported transaction version (unreadable: {exc})"
+    if type(message) is Message and version == Legacy.Legacy:
+        return None
+    if (
+        type(message) is MessageV0 and isinstance(version, int)
+        and not isinstance(version, bool) and version == 0
+    ):
+        return None
+    return f"refused before signing: unsupported transaction version {version!r}"
+
+
 class TransactionStatus(str, Enum):
     SUBMITTED = "submitted"
     CONFIRMED_SUCCESS = "confirmed_success"
@@ -346,8 +373,24 @@ class SwapExecutor:
                 headers=self.jup._headers(), timeout=HTTP_TIMEOUT,
             )
             swap_resp.raise_for_status()
-            raw = __import__("base64").b64decode(swap_resp.json()["swapTransaction"])
-            tx = VersionedTransaction.from_bytes(raw)
+            swap_tx_b64 = swap_resp.json()["swapTransaction"]
+            try:
+                raw = __import__("base64").b64decode(swap_tx_b64, validate=True)
+                tx = VersionedTransaction.from_bytes(raw)
+            except Exception as exc:
+                log.error("live swap refused before signing: undecodable transaction: %s", exc)
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    status=TransactionStatus.CONFIRMED_FAILURE,
+                    error="refused before signing: undecodable swap transaction",
+                )
+            version_error = unsupported_tx_version(tx)
+            if version_error is not None:
+                log.error("live swap %s", version_error)
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    status=TransactionStatus.CONFIRMED_FAILURE, error=version_error,
+                )
             signed = VersionedTransaction(tx.message, [keypair])
             signature = send_raw_transaction(self.session, self.cfg.rpc_url, bytes(signed))
             log.info("LIVE swap submitted: %s", signature)

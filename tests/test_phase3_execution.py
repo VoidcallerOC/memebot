@@ -87,8 +87,22 @@ def install_solders(monkeypatch):
     class FakeKeypair:
         def pubkey(self):
             return WALLET
+    # Model the decoded transaction as v0 (solders 0.29 shape) so it passes
+    # the legacy/v0 version gate; assertions below are unchanged.
+    class Message:
+        pass
+
+    class MessageV0:
+        pass
+
+    class Legacy:
+        Legacy = object()
+
     class RawTx:
-        message = object()
+        message = MessageV0()
+
+        def version(self):
+            return 0
         @classmethod
         def from_bytes(cls, _raw):
             return cls()
@@ -102,9 +116,13 @@ def install_solders(monkeypatch):
         "solders": types.ModuleType("solders"),
         "solders.keypair": types.ModuleType("solders.keypair"),
         "solders.transaction": types.ModuleType("solders.transaction"),
+        "solders.message": types.ModuleType("solders.message"),
     }
     modules["solders.keypair"].Keypair = FakeKeypair
     modules["solders.transaction"].VersionedTransaction = Versioned
+    modules["solders.transaction"].Legacy = Legacy
+    modules["solders.message"].Message = Message
+    modules["solders.message"].MessageV0 = MessageV0
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     return FakeKeypair()
