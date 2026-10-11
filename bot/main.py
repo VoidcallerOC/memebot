@@ -21,6 +21,10 @@ from fractions import Fraction
 import requests
 
 from .alerts import Notifier
+from .chain import (
+    extract_fill, fetch_wallet_token_balances, get_confirmed_transaction,
+    get_signature_status,
+)
 from .config import Config, load_config
 from .jupiter import (
     JupiterClient, LAMPORTS_PER_SOL, SOL_MINT, USDC_MINT, USDC_RAW_PER_USD,
@@ -75,6 +79,26 @@ class ExitQuoteKind(Enum):
 # so only 0 through 2**64-1 is executable.
 _MAX_OUT_AMOUNT_RAW = 2**64 - 1
 _CANONICAL_OUT_AMOUNT = re.compile(r"^(0|[1-9][0-9]*)$")
+
+# Live sell intents (armed only). A sell intent is written before the swap and
+# moves through these statuses (see ``TradingBot._resolve_sell_intents``):
+#   pending    written before the swap; still pending only after a crash
+#   blocked    refused before any send (missing decimals / zero size)
+#   unresolved the swap did not confirm a settled fill (any non-success, or
+#              success without fill data); ``outcome`` records the status
+#   failed     terminal: evidence shows the sell did NOT execute; the position
+#              is untouched and normal exit management (retry) resumes
+#   settled    terminal: the sell executed and was booked exactly once
+# Open intents freeze sells of that mint and block new entries; they never
+# stop stop-loss / take-profit management of other positions.
+OPEN_SELL_INTENT_STATUSES = frozenset({"pending", "unresolved", "blocked"})
+TERMINAL_SELL_INTENTS_KEPT = 50
+# A Solana transaction's recent blockhash is valid for 150 slots (~60-90 s;
+# solana.com docs "Transactions" / "Confirmation & Expiration"). After this
+# conservative wall-clock window an unconfirmed transaction can no longer land,
+# so an unchanged on-chain balance is evidence the sell did not execute.
+SELL_INTENT_EXPIRY_SECONDS = 300
+
 
 # Pre-buy sellability gate: the slippage-adjusted SOL -> token -> SOL round
 # trip for the exact planned entry may lose at most this fraction of the input
@@ -249,6 +273,10 @@ class TradingBot:
         if self.notifier.enabled:
             self.notifier.startup(mode)
         if self.cfg.is_armed:
+            if self._open_sell_intents():
+                # Settle/clear persisted intents on evidence first, so a sell
+                # that landed before a restart is booked, not left as drift.
+                self._resolve_sell_intents()
             reconciliation = reconcile_wallet(
                 self.cfg, self.portfolio, self.session, self.notifier
             )
@@ -268,11 +296,16 @@ class TradingBot:
         self._summary()
 
     def _tick(self) -> None:
-        if any(
-            intent.get("status") in {"pending", "unresolved", "blocked"}
-            for intent in getattr(self.portfolio, "pending_intents", [])
-        ):
-            self._reconciliation_required = True
+        if self._open_sell_intents():
+            if not self.cfg.is_armed:
+                log.error(
+                    "trading halted: %d persisted live sell intent(s) need an armed "
+                    "session to resolve against the chain; operator action required",
+                    len(self._open_sell_intents()),
+                )
+                self._running = False
+                return
+            self._resolve_sell_intents()
         if self._reconciliation_required:
             reconciliation = reconcile_wallet(
                 self.cfg, self.portfolio, self.session, self.notifier
@@ -284,12 +317,25 @@ class TradingBot:
             self._reconciliation_required = False
             return
         self._manage_positions()
+        still_open = self._open_sell_intents()
+        if still_open:
+            log.error(
+                "new entries blocked: %d unresolved live sell intent(s) (%s)",
+                len(still_open), ", ".join(sorted({str(i.get("mint"))[:8] for i in still_open})),
+            )
+            return
         if self.risk.can_open_new_position(self.portfolio.open_count):
             self._seek_entry()
 
     def _manage_positions(self) -> None:
         for mint in list(self.portfolio.positions.keys()):
             pos = self.portfolio.positions[mint]
+            if self._sell_frozen(mint):
+                log.error(
+                    "%s: exits frozen by an unresolved live sell intent; no new sell "
+                    "until it is resolved (prevents a double sell)", pos.symbol,
+                )
+                continue
             decimals = self._verified_decimals(mint, pos)
             if decimals is None:
                 log.warning(
@@ -468,8 +514,16 @@ class TradingBot:
             )
             return
         if self.cfg.is_armed:
+            if self._sell_frozen(mint):
+                log.error("%s: refusing %s; an earlier live sell is unresolved", symbol, reason)
+                return
             if not self._settle_live_sell(pos, fraction, price, reason):
                 return
+        self._book_sell(mint, fraction, price, reason)
+
+    def _book_sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
+        """Portfolio/risk accounting for one executed sell (the only booking path)."""
+        symbol = self.portfolio.positions[mint].symbol
         was_halted = self.risk.trading_halted()
         pnl = self.portfolio.sell_fraction(mint, fraction, price, reason)
         self.risk.record_realized_pnl(pnl)
@@ -488,6 +542,8 @@ class TradingBot:
             "requested_price": price,
             "status": "pending",
             "tx_signature": None,
+            "created_at": time.time(),
+            "raw_amount": None,
         }
         self.portfolio.pending_intents.append(intent)
         self._save()
@@ -498,6 +554,7 @@ class TradingBot:
             self._save()
             return False
         raw_amount = int(tokens_to_sell * (10 ** decimals))
+        intent["raw_amount"] = raw_amount
         if raw_amount <= 0:
             intent["status"] = "blocked"
             self._reconciliation_required = True
@@ -508,6 +565,8 @@ class TradingBot:
             allocation_usd=min(tokens_to_sell * price, self.cfg.max_position_usd()),
         )
         intent["tx_signature"] = result.tx_signature
+        intent["outcome"] = getattr(result.status, "value", str(result.status))
+        intent["error"] = result.error
         if not result.ok or result.status != TransactionStatus.CONFIRMED_SUCCESS:
             intent["status"] = "unresolved"
             if result.status in {
@@ -528,6 +587,193 @@ class TradingBot:
         intent["status"] = "settled"
         self._save()
         return True
+
+    # -- live sell intent resolution -----------------------------------------
+
+    def _open_sell_intents(self) -> list:
+        return [
+            intent for intent in getattr(self.portfolio, "pending_intents", None) or []
+            if isinstance(intent, dict) and intent.get("status") in OPEN_SELL_INTENT_STATUSES
+        ]
+
+    def _sell_frozen(self, mint: str) -> bool:
+        return any(intent.get("mint") == mint for intent in self._open_sell_intents())
+
+    def _resolve_sell_intents(self) -> None:
+        """Resolve open live sell intents on evidence only.
+
+        * NOT EXECUTED (-> ``failed``, position untouched, exits resume):
+          refused before send (``blocked``, or ``confirmed_failure`` with no
+          signature); the signature is ``confirmed``/``finalized`` with an
+          error; or the blockhash window has passed
+          (``SELL_INTENT_EXPIRY_SECONDS``), the signature is not confirmed and
+          the wallet still holds the tokens.
+        * EXECUTED (-> ``settled``, booked once): the signature is confirmed
+          without error AND ``getTransaction`` gives a complete fill whose
+          ``actual_in_amount`` equals the intent's ``raw_amount``. It is booked
+          by the same accounting as an on-time confirmed live sell.
+        * Anything else stays open (the mint stays frozen, entries stay
+          blocked) with an explicit operator-visible reason. No fill, price or
+          P&L is ever invented.
+        """
+        now = time.time()
+        balances: dict = {}
+        changed = False
+        for intent in self._open_sell_intents():
+            if "created_at" not in intent and "first_seen_at" not in intent:
+                intent["first_seen_at"] = now  # legacy intent: start its clock now
+                changed = True
+            verdict, detail, fill = self._sell_intent_evidence(intent, now, balances)
+            if verdict == "not_executed":
+                intent["status"] = "failed"
+                intent["resolution"] = detail
+                intent["resolved_at"] = now
+                changed = True
+                log.warning(
+                    "live sell intent for %s resolved as NOT executed (%s); position "
+                    "kept, exit management resumes", str(intent.get("mint"))[:8], detail,
+                )
+                continue
+            if verdict == "executed" and fill is not None:
+                mint = intent["mint"]
+                intent["status"] = "settled"
+                intent["resolution"] = detail
+                intent["resolved_at"] = now
+                intent["actual_in_amount"] = fill.actual_in_amount
+                intent["actual_out_amount"] = fill.actual_out_amount
+                intent["fee_lamports"] = fill.fee_lamports
+                self._save()  # status flips before booking: never booked twice
+                self._book_sell(
+                    mint, intent["fraction"], intent["requested_price"], intent["reason"],
+                )
+                log.warning("live sell intent for %s settled from on-chain fill", mint[:8])
+                continue
+            if intent.get("resolution") != detail:
+                intent["resolution"] = detail
+                changed = True
+            log.error(
+                "live sell intent for %s UNRESOLVED: %s — exits for this mint frozen, "
+                "new entries blocked; other positions still managed",
+                str(intent.get("mint"))[:8], detail,
+            )
+            notifier = getattr(self, "notifier", None)
+            if not intent.get("alerted") and getattr(notifier, "enabled", False):
+                notifier.send(
+                    f"⚠️ unresolved live sell for {str(intent.get('mint'))[:8]}: {detail}"
+                )
+                intent["alerted"] = True
+                changed = True
+        terminal = [
+            i for i in self.portfolio.pending_intents
+            if not (isinstance(i, dict) and i.get("status") in OPEN_SELL_INTENT_STATUSES)
+        ]
+        if len(terminal) > TERMINAL_SELL_INTENTS_KEPT:
+            drop = {id(i) for i in terminal[:-TERMINAL_SELL_INTENTS_KEPT]}
+            self.portfolio.pending_intents = [
+                i for i in self.portfolio.pending_intents if id(i) not in drop
+            ]
+            changed = True
+        if changed:
+            self._save()
+
+    def _sell_intent_evidence(self, intent: dict, now: float, balances: dict):
+        """(verdict, detail, fill) with verdict executed / not_executed / unknown."""
+        status = intent.get("status")
+        sig = intent.get("tx_signature")
+        mint = intent.get("mint")
+        if status == "blocked":
+            return "not_executed", "refused before send", None
+        if not sig and intent.get("outcome") == TransactionStatus.CONFIRMED_FAILURE.value:
+            return "not_executed", "rejected before send (no transaction)", None
+        pos = self.portfolio.positions.get(mint)
+        if pos is None:
+            return "unknown", "position no longer tracked; operator action required", None
+        if sig:
+            try:
+                raw = get_signature_status(self.session, self.cfg.rpc_url, sig)
+            except Exception as exc:
+                return "unknown", f"signature status lookup failed: {exc}", None
+            required = (
+                {"finalized"} if self.cfg.confirmation_commitment == "finalized"
+                else {"confirmed", "finalized"}
+            )
+            if isinstance(raw, dict) and raw.get("confirmationStatus") in required:
+                if raw.get("err") is not None:
+                    return "not_executed", "transaction failed on chain", None
+                fill = self._confirmed_sell_fill(sig, mint)
+                raw_amount = intent.get("raw_amount")
+                if (
+                    fill is None
+                    or not isinstance(raw_amount, int) or isinstance(raw_amount, bool)
+                    or fill.actual_in_amount != raw_amount
+                    or not fill.actual_out_amount or fill.actual_out_amount <= 0
+                ):
+                    return (
+                        "unknown",
+                        "sell confirmed on chain but settlement data is missing or does "
+                        "not match the intent; operator action required",
+                        None,
+                    )
+                return "executed", "confirmed on chain with matching fill", fill
+        started = intent.get("created_at", intent.get("first_seen_at"))
+        if (
+            isinstance(started, bool) or not isinstance(started, (int, float))
+            or now - started < SELL_INTENT_EXPIRY_SECONDS
+        ):
+            return "unknown", "outcome not yet known; waiting for blockhash expiry", None
+        if "amounts" not in balances:
+            balances["amounts"] = self._wallet_token_amounts()
+        amounts = balances["amounts"]
+        if amounts is None:
+            return "unknown", "wallet balance unavailable", None
+        intended = self._intent_tokens(intent, pos)
+        if intended is None:
+            return "unknown", "intended sell size unknown; operator action required", None
+        held = amounts.get(mint, 0.0)
+        if held >= pos.tokens - intended / 2:
+            return "not_executed", "expired unconfirmed; wallet still holds the tokens", None
+        return (
+            "unknown",
+            "wallet balance dropped but no confirmed settlement data; operator action required",
+            None,
+        )
+
+    def _intent_tokens(self, intent: dict, pos) -> float | None:
+        raw = intent.get("raw_amount")
+        decimals = valid_token_decimals(pos.token_decimals)
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 and decimals is not None:
+            return raw / (10 ** decimals)
+        fraction = intent.get("fraction")
+        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or fraction <= 0:
+            return None
+        tokens = min(pos.original_tokens * fraction, pos.tokens)
+        return tokens if tokens > 0 else None
+
+    def _confirmed_sell_fill(self, signature: str, mint: str):
+        owner = self.cfg.burner_wallet_pubkey
+        if not owner:
+            return None
+        try:
+            tx = get_confirmed_transaction(
+                self.session, self.cfg.rpc_url, signature, self.cfg.confirmation_commitment,
+            )
+        except Exception as exc:
+            log.warning("getTransaction failed for %s: %s", signature, exc)
+            return None
+        if not tx:
+            return None
+        return extract_fill(tx, owner, mint, SOL_MINT)
+
+    def _wallet_token_amounts(self) -> dict | None:
+        owner = self.cfg.burner_wallet_pubkey
+        if not owner:
+            return None
+        try:
+            snapshot = fetch_wallet_token_balances(self.cfg, owner, self.session)
+        except Exception as exc:
+            log.warning("wallet balance fetch failed: %s", exc)
+            return None
+        return snapshot.amounts if snapshot is not None else None
 
     def _save(self) -> None:
         save_state(self.cfg.state_file, self.portfolio, self.risk)
