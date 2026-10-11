@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
 import time
+from fractions import Fraction
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
@@ -21,6 +24,89 @@ log = logging.getLogger(__name__)
 HTTP_TIMEOUT = 12
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+# Raw-unit scales. Jupiter ``amount``/``inAmount``/``outAmount`` are integers
+# in the smallest unit of their mint: SOL has 9 decimals (lamports), USDC 6.
+SOL_DECIMALS = 9
+USDC_DECIMALS = 6
+LAMPORTS_PER_SOL = 10 ** SOL_DECIMALS
+USDC_RAW_PER_USD = 10 ** USDC_DECIMALS
+# An armed SOL-funded swap may spend at most this multiple of the caller's
+# allocation (valued at an independently fetched SOL price) to absorb price
+# movement between sizing and execution. It never lifts MAX_EXPERIMENT_USD.
+LIVE_ALLOCATION_TOLERANCE = Fraction(105, 100)
+# SPL mint decimals are a u8, but 10**decimals raw units must fit in a u64
+# Jupiter amount, so anything above 18 cannot be quoted as one whole token.
+MAX_QUOTABLE_DECIMALS = 18
+_U64_MAX = 2 ** 64 - 1
+_CANONICAL_RAW_INT = re.compile(r"^(0|[1-9][0-9]*)$")
+
+
+def parse_raw_amount(raw: object) -> Optional[int]:
+    """A canonical raw integer amount in ``0 .. 2**64-1``, or None.
+
+    Accepts a canonical decimal string or a real ``int`` (not bool). Floats,
+    signs, whitespace, underscores and exponents are rejected, never coerced.
+    """
+    if isinstance(raw, str):
+        if _CANONICAL_RAW_INT.fullmatch(raw) is None:
+            return None
+        value = int(raw, 10)
+    elif isinstance(raw, int) and not isinstance(raw, bool):
+        value = raw
+    else:
+        return None
+    if value < 0 or value > _U64_MAX:
+        return None
+    return value
+
+
+def valid_token_decimals(value: object) -> Optional[int]:
+    """Verified SPL decimals as an int in ``0 .. 18``; anything else is None.
+
+    Unknown decimals are never guessed: callers treat None as "no mark".
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or value > MAX_QUOTABLE_DECIMALS:
+        return None
+    return value
+
+
+def sol_usdc_raw_per_sol(jup: Any) -> Optional[int]:
+    """USDC raw units (1e-6 USD) Jupiter returns for exactly 1 SOL, or None.
+
+    Quotes exactly ``10**9`` lamports SOL->USDC and fails closed unless the
+    quote is a dict whose ``inputMint``/``outputMint`` are SOL/USDC, whose
+    ``inAmount`` is exactly ``10**9`` and whose ``outAmount`` is a positive
+    canonical raw integer. There is no default/fallback price.
+    """
+    try:
+        quote = jup.quote(SOL_MINT, USDC_MINT, LAMPORTS_PER_SOL)
+    except Exception as exc:  # network/client failure -> no price
+        log.debug("SOL/USD quote failed: %s", exc)
+        return None
+    if not isinstance(quote, dict):
+        return None
+    if quote.get("inputMint") != SOL_MINT or quote.get("outputMint") != USDC_MINT:
+        return None
+    if parse_raw_amount(quote.get("inAmount")) != LAMPORTS_PER_SOL:
+        return None
+    out_raw = parse_raw_amount(quote.get("outAmount"))
+    if out_raw is None or out_raw <= 0:
+        return None
+    return out_raw
+
+
+def sol_price_usd(jup: Any) -> Optional[float]:
+    """Correctly scaled USD price of 1 SOL (``outAmount / 10**6``), or None."""
+    out_raw = sol_usdc_raw_per_sol(jup)
+    if out_raw is None:
+        return None
+    price = out_raw / USDC_RAW_PER_USD
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return float(price)
 
 
 class TransactionStatus(str, Enum):
@@ -118,6 +204,15 @@ class SwapExecutor:
                 status=TransactionStatus.UNKNOWN,
                 error=f"live allocation exceeds hard ${MAX_EXPERIMENT_USD:.2f} ceiling",
             )
+        if self.cfg.is_armed and input_mint == SOL_MINT:
+            exposure_error = self._armed_sol_exposure_error(amount, allocation_usd)
+            if exposure_error is not None:
+                log.error("live swap refused before signing: %s", exposure_error)
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=0,
+                    status=TransactionStatus.CONFIRMED_FAILURE,
+                    error=exposure_error,
+                )
         quote = self.jup.quote(input_mint, output_mint, amount)
         if quote is None:
             return SwapResult(
@@ -136,6 +231,36 @@ class SwapExecutor:
             quote, amount, out_amount,
             input_mint=input_mint, output_mint=output_mint,
         )
+
+    def _armed_sol_exposure_error(self, amount: object, allocation_usd: float) -> Optional[str]:
+        """Why an armed SOL-funded swap must not be signed, or None if it may.
+
+        The caller-supplied ``allocation_usd`` is not trusted for exposure:
+        the raw lamport amount is valued at an independently fetched, correctly
+        scaled SOL price and must not exceed
+        ``min(allocation_usd * 1.05, MAX_EXPERIMENT_USD)``. A missing or
+        invalid price, or a non-positive/non-integer amount, fails closed.
+        Nothing here signs, builds, or sends a transaction.
+        """
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            return "live SOL amount is not a positive integer lamport amount"
+        if not math.isfinite(allocation_usd):
+            return "live allocation is not a finite USD amount"
+        out_raw = sol_usdc_raw_per_sol(self.jup)
+        if out_raw is None:
+            return "SOL/USD price unavailable or invalid; live exposure unverifiable"
+        actual_usd = Fraction(amount, LAMPORTS_PER_SOL) * Fraction(out_raw, USDC_RAW_PER_USD)
+        limit_usd = min(
+            Fraction(allocation_usd) * LIVE_ALLOCATION_TOLERANCE,
+            Fraction(MAX_EXPERIMENT_USD),
+        )
+        if actual_usd > limit_usd:
+            return (
+                f"live SOL amount worth ${float(actual_usd):.2f} exceeds limit "
+                f"${float(limit_usd):.2f} (allocation ${allocation_usd:.2f}, "
+                f"hard ceiling ${MAX_EXPERIMENT_USD:.2f})"
+            )
+        return None
 
     def _execute_live(
         self,
