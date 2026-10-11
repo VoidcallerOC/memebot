@@ -142,6 +142,7 @@ def test_live_entry_opens_from_confirmed_raw_fill_and_persists_full_record(monke
     ))
     bot.notifier = types.SimpleNamespace(buy=lambda *args: None)
     bot._usd_to_lamports = lambda _usd: 1
+    bot._sell_route_ok = lambda _mint, _lamports: True  # gate tested in test_p1_sellability
     bot._reconciliation_required = False
     saved = []
     bot._save = lambda: saved.append(True)

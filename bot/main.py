@@ -76,6 +76,14 @@ class ExitQuoteKind(Enum):
 _MAX_OUT_AMOUNT_RAW = 2**64 - 1
 _CANONICAL_OUT_AMOUNT = re.compile(r"^(0|[1-9][0-9]*)$")
 
+# Pre-buy sellability gate: the quoted SOL -> token -> SOL round trip for the
+# exact planned entry may lose at most this fraction of the input lamports.
+# Exactly 10% passes; anything worse is rejected. Compared in integers
+# (sell_out * 10 >= lamports * 9); deliberately a constant, not a config knob,
+# so nothing can loosen it. A quote is a routing estimate, not a simulation:
+# passing this gate does NOT guarantee a future sell will succeed.
+MAX_ROUNDTRIP_LOSS = Fraction(1, 10)
+
 
 def _parse_out_amount_usd(raw: object) -> float | None:
     """USD value of a USDC ``outAmount``, or None when it is not executable.
@@ -166,6 +174,32 @@ def _price_usd(jup: JupiterClient, mint: str, decimals: int | None) -> float | N
     if kind is not ExitQuoteKind.PRICE or not _is_executable_mark(price):
         return None
     return float(price)
+
+
+def _validated_route_out(
+    quote: object, input_mint: str, output_mint: str, in_amount: int,
+) -> tuple[int | None, str]:
+    """Raw ``outAmount`` of an ExactIn quote that matches the request exactly.
+
+    Returns ``(out_raw, "")`` or ``(None, reason)``. The quote must be a dict
+    with the requested ``inputMint``/``outputMint``, ``inAmount`` equal to the
+    requested raw amount, a positive canonical integer ``outAmount`` (via
+    ``parse_raw_amount``), and ``swapMode`` ExactIn when present.
+    """
+    if quote is None:
+        return None, "no route"
+    if not isinstance(quote, dict):
+        return None, "malformed quote"
+    if quote.get("inputMint") != input_mint or quote.get("outputMint") != output_mint:
+        return None, "quote mints do not match request"
+    if "swapMode" in quote and quote["swapMode"] != "ExactIn":
+        return None, "quote is not ExactIn"
+    if parse_raw_amount(quote.get("inAmount")) != in_amount:
+        return None, "quote inAmount does not match request"
+    out_raw = parse_raw_amount(quote.get("outAmount"))
+    if out_raw is None or out_raw <= 0:
+        return None, "quote outAmount missing, malformed or not positive"
+    return out_raw, ""
 
 
 class TradingBot:
@@ -318,6 +352,14 @@ class TradingBot:
                     safety.symbol,
                 )
                 return
+            # Pre-buy sellability gate (paper and armed alike): quote-only,
+            # before any swap, signature, send, or position side effect.
+            if not self._sell_route_ok(candidate.mint, lamports):
+                log.warning(
+                    "entry skipped for %s: pre-buy sell route missing or uneconomic",
+                    safety.symbol,
+                )
+                continue
             result = self.executor.swap(
                 SOL_MINT, candidate.mint, lamports,
                 allocation_usd=size_usd,
@@ -500,6 +542,65 @@ class TradingBot:
         if lamports <= 0:
             return None
         return int(lamports)
+
+    def _sell_route_ok(self, mint: str, lamports: int) -> bool:
+        """Fail-closed, quote-only check that a planned buy can be sold back.
+
+        1. Buy quote SOL -> ``mint`` for exactly ``lamports``; it must echo
+           ``inputMint == SOL``, ``outputMint == mint``, ``inAmount ==
+           lamports`` and give a positive canonical integer ``outAmount``
+           (raw token units; no decimals needed or guessed).
+        2. Sell quote ``mint`` -> SOL for exactly that raw ``outAmount``,
+           validated the same way (``outAmount`` in lamports).
+        3. Pass iff ``sell_out * 10 >= lamports * 9`` (round-trip loss
+           <= ``MAX_ROUNDTRIP_LOSS`` = 10%), compared in integers.
+
+        Any missing/no-route/None quote, provider exception or timeout
+        (``JupiterClient.quote`` returns None on its HTTP timeout), malformed,
+        contradictory, wrong-mint, zero or negative amount returns False.
+        It never signs, builds or sends a transaction, and has no fallback.
+        Quotes are routing estimates, not simulations: a pass does NOT
+        guarantee that a later sell will succeed (e.g. Token-2022 transfer
+        hooks, freezes, or liquidity pulled after entry).
+        """
+        short = mint[:6] if isinstance(mint, str) else "?"
+        if not isinstance(mint, str) or not mint or mint == SOL_MINT:
+            log.warning("sell-route check %s: invalid mint", short)
+            return False
+        if isinstance(lamports, bool) or not isinstance(lamports, int) or lamports <= 0:
+            log.warning("sell-route check %s: invalid planned lamports", short)
+            return False
+        jup = getattr(self, "jup", None)
+        if jup is None or not callable(getattr(jup, "quote", None)):
+            log.warning("sell-route check %s: quote client unavailable", short)
+            return False
+        try:
+            buy_quote = jup.quote(SOL_MINT, mint, lamports)
+        except Exception as exc:
+            log.warning("sell-route check %s: buy quote failed (%s)", short, type(exc).__name__)
+            return False
+        token_raw, reason = _validated_route_out(buy_quote, SOL_MINT, mint, lamports)
+        if token_raw is None:
+            log.warning("sell-route check %s: buy quote rejected: %s", short, reason)
+            return False
+        try:
+            sell_quote = jup.quote(mint, SOL_MINT, token_raw)
+        except Exception as exc:
+            log.warning("sell-route check %s: sell quote failed (%s)", short, type(exc).__name__)
+            return False
+        sell_out, reason = _validated_route_out(sell_quote, mint, SOL_MINT, token_raw)
+        if sell_out is None:
+            log.warning("sell-route check %s: sell quote rejected: %s", short, reason)
+            return False
+        keep = MAX_ROUNDTRIP_LOSS.denominator - MAX_ROUNDTRIP_LOSS.numerator
+        if sell_out * MAX_ROUNDTRIP_LOSS.denominator < lamports * keep:
+            log.warning(
+                "sell-route check %s: round trip returns %d of %d lamports (> %d%% loss)",
+                short, sell_out, lamports,
+                MAX_ROUNDTRIP_LOSS.numerator * 100 // MAX_ROUNDTRIP_LOSS.denominator,
+            )
+            return False
+        return True
 
     def _verified_decimals(self, mint: str, pos=None) -> int | None:
         """Verified SPL decimals for ``mint``, or None (never guessed).

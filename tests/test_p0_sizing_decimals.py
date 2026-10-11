@@ -412,7 +412,9 @@ def test_inconsistent_mark_quote_units_give_no_mark():
 
 
 def test_live_entry_without_verified_decimals_records_nothing():
-    bot = make_bot(cfg=armed_cfg(), jup=FakeJup())
+    # TOKEN9 is priced so the pre-buy sell-route gate passes and the
+    # missing-decimals fill path is what this test exercises.
+    bot = make_bot(cfg=armed_cfg(), jup=FakeJup(prices={TOKEN9: "0.002"}, decimals={TOKEN9: 9}))
     bot.strategy = types.SimpleNamespace(find_candidates=lambda: [types.SimpleNamespace(mint=TOKEN9)])
     bot._candidate_market_snapshot = lambda _mint: None
     bot.screener = types.SimpleNamespace(screen=lambda mint, **k: TokenSafety(
