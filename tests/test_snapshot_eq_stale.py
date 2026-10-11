@@ -294,3 +294,201 @@ def test_compare_trim_fallback_do_not_modify_file_and_memory_is_bounded(tmp_path
     assert h.refresh() is snap
     assert _file_state(path) == before
     print(f"file={path.stat().st_size} same_pin_peak={peak} cross_peak={peak_cmp}")
+
+
+# ===========================================================================
+# Follow-up: distinct snapshots must be consumed to the END on both sides.
+# zip(self, other) stops as soon as `self` is exhausted, leaving `other`
+# suspended after its last parsed row, so consumed bytes after that row that
+# live in a later fingerprint chunk (segment or tail) were never verified.
+# The fixtures below put a snapshot's last valid row in segment 0 and its
+# trailing consumed (unparseable/blank) lines past the 1 MiB boundary.
+# ===========================================================================
+
+from bot.meta import history as _history_module  # noqa: E402
+from bot.meta.store import _parse_line  # noqa: E402
+
+SEG = _history_module._SEGMENT_BYTES
+assert SEG == 1 << 20
+
+
+def _junk(nbytes: int) -> bytes:
+    """Complete lines that are consumed but parse to no row: invalid JSON,
+    blank lines and a JSON non-object."""
+    unit = b"#not json " + b"x" * 52 + b"\n" + b"\n" + b"[1, 2, 3]\n"
+    return unit * (nbytes // len(unit) + 1)
+
+
+def _rows_bytes(n: int, first: str | None = None, pad: int = 0) -> bytes:
+    out = []
+    for i in range(n):
+        extra = {"pad": "p" * pad} if pad else {}
+        line = _row(i, **extra)
+        if i == 0 and first is not None:
+            line = line.replace(b'"score": "000000"', f'"score": "{first}"'.encode())
+        out.append(line)
+    return b"".join(out)
+
+
+def _rows_of(path: Path) -> list:
+    return [r for r in (_parse_line(l) for l in path.read_bytes().splitlines(keepends=True)) if r is not None]
+
+
+def _flip_byte_same_inode(path: Path, pos: int) -> None:
+    data = path.read_bytes()
+    st0 = os.stat(path)
+    assert pos >= 64
+    with open(path, "r+b") as fh:
+        fh.seek(pos)
+        fh.write(b"y" if data[pos:pos + 1] != b"y" else b"z")
+    st1 = os.stat(path)
+    new = path.read_bytes()
+    assert (st1.st_ino, st1.st_dev, st1.st_size) == (st0.st_ino, st0.st_dev, st0.st_size)
+    assert new[:64] == data[:64] and new != data
+
+
+def _junk_tail_pos(snap: ObservationRows) -> int:
+    """A byte in the snapshot's last fingerprint chunk, past its last row."""
+    pos = snap.consumed_bytes - 20
+    assert pos >= SEG and snap._pin.count >= 1
+    return pos
+
+
+def test_eq_follow_1_same_rows_different_consumed_length_trailing_stale(tmp_path):
+    """Same history, same generation, same parsed rows; `b` additionally
+    consumed >1 MiB of unparseable lines. A stale byte in that trailing
+    region must raise, not compare equal."""
+    path = tmp_path / "o.jsonl"
+    path.write_bytes(_rows_bytes(12))
+    h = ObservationHistory(str(path))
+    a = h.load()
+    with path.open("ab") as fh:
+        fh.write(_junk(SEG + 4096))
+    b = h.refresh()
+    assert b is not a and b.generation == a.generation and len(b) == len(a) == 12
+    assert b.consumed_bytes > SEG > a.consumed_bytes
+    assert a == b and b == a                    # valid: equal
+    _flip_byte_same_inode(path, _junk_tail_pos(b))
+    after = _file_state(path)
+    with pytest.raises(StaleHistoryError):
+        a == b                                  # plain zip: True (b's tail never read)
+    with pytest.raises(StaleHistoryError):
+        b == a
+    assert _file_state(path) == after
+
+
+def test_eq_follow_2_both_operand_orders_raise(tmp_path):
+    """Distinct histories/files; the stale bytes belong to one operand only.
+    Both orders and both operators raise."""
+    x_path, y_path = tmp_path / "x.jsonl", tmp_path / "y.jsonl"
+    rows = _rows_bytes(12)
+    x_path.write_bytes(rows + _junk(100)[:100 // 64 * 64])
+    y_path.write_bytes(rows + _junk(SEG + 4096))
+    x = ObservationHistory(str(x_path)).load()
+    y = ObservationHistory(str(y_path)).load()
+    assert len(x) == len(y) and x == y and y == x
+    _flip_byte_same_inode(y_path, _junk_tail_pos(y))
+    for op in (lambda: x == y, lambda: y == x, lambda: x != y, lambda: y != x):
+        with pytest.raises(StaleHistoryError):
+            op()
+    assert x == x and x == _rows_of(x_path)    # the untouched operand is still valid
+
+
+@pytest.mark.parametrize("stale_in", ["self", "other"])
+def test_eq_follow_3_early_row_mismatch_then_stale_later_segment(tmp_path, stale_in):
+    """The first parsed row differs (result would be False) and a later
+    segment of one operand is stale: equality must raise, in both orders."""
+    x_path, y_path = tmp_path / "x.jsonl", tmp_path / "y.jsonl"
+    # >1 MiB of valid rows so rows themselves span segments, then a trailing
+    # consumed region in a later chunk.
+    # The junk is > 1 MiB so the last fingerprint chunk holds no row at all
+    # (validation is per chunk, before any row of that chunk is yielded).
+    x_path.write_bytes(_rows_bytes(4500, pad=200) + _junk(SEG + 4096))
+    y_path.write_bytes(_rows_bytes(4500, first="ZZZZZZ", pad=200) + _junk(SEG + 4096))
+    assert x_path.stat().st_size > 2 * SEG and x_path.stat().st_size == y_path.stat().st_size
+    x = ObservationHistory(str(x_path)).load()
+    y = ObservationHistory(str(y_path)).load()
+    assert len(x) == len(y) == 4500
+    assert x[0] != y[0] and x != y and y != x  # valid: unequal, no exception
+    stale_path, stale_snap = (x_path, x) if stale_in == "self" else (y_path, y)
+    _flip_byte_same_inode(stale_path, _junk_tail_pos(stale_snap))
+    for op in (lambda: x == y, lambda: y == x, lambda: x != y, lambda: y != x):
+        with pytest.raises(StaleHistoryError):
+            op()
+    # length mismatch does not bypass validation either (either side stale)
+    with pytest.raises(StaleHistoryError):
+        stale_snap == [{"kind": "only one"}]
+
+
+def test_eq_follow_4_valid_distinct_snapshots_with_different_trailing_junk_are_equal(tmp_path):
+    x_path, y_path, z_path = tmp_path / "x.jsonl", tmp_path / "y.jsonl", tmp_path / "z.jsonl"
+    rows = _rows_bytes(12)
+    x_path.write_bytes(rows)
+    y_path.write_bytes(rows + b"\n\n#garbage\n")
+    z_path.write_bytes(rows + _junk(SEG + 4096))
+    before = [_file_state(p) for p in (x_path, y_path, z_path)]
+    snaps = [ObservationHistory(str(p)).load() for p in (x_path, y_path, z_path)]
+    assert len({s.consumed_bytes for s in snaps}) == 3
+    expected = _rows_of(x_path)
+    for s in snaps:
+        assert s == expected and expected == s
+        for t in snaps:
+            assert s == t and not (s != t)
+    # and unequal when a row really differs
+    w_path = tmp_path / "w.jsonl"
+    w_path.write_bytes(_rows_bytes(12, first="ZZZZZZ") + _junk(SEG + 4096))
+    w = ObservationHistory(str(w_path)).load()
+    for s in snaps:
+        assert s != w and w != s
+    assert [_file_state(p) for p in (x_path, y_path, z_path)] == before
+
+
+def test_eq_follow_5_refresh_recovery_after_trailing_stale(tmp_path):
+    path = tmp_path / "o.jsonl"
+    path.write_bytes(_rows_bytes(12))
+    h = ObservationHistory(str(path))
+    a = h.load()
+    with path.open("ab") as fh:
+        fh.write(_junk(SEG + 4096))
+    b = h.refresh()
+    _flip_byte_same_inode(path, _junk_tail_pos(b))
+    with pytest.raises(StaleHistoryError):
+        a == b
+    assert h._stale
+    fresh = h.refresh()
+    assert fresh.generation > b.generation and not h._stale
+    assert fresh.consumed_bytes == b.consumed_bytes
+    assert fresh == fresh and fresh == ObservationRows(h) and fresh == _rows_of(path)
+    assert fresh == ObservationHistory(str(path)).load()
+    assert a == a and a == fresh               # a's bytes [0, a.end) are unchanged: still valid
+    with pytest.raises(StaleHistoryError):
+        b == b                                  # the old stale snapshot keeps raising
+    with pytest.raises(StaleHistoryError):
+        b == fresh
+    with pytest.raises(StaleHistoryError):
+        fresh == b
+    assert not h._stale                         # old generation does not re-flag the new one
+
+
+def test_eq_follow_6_distinct_comparison_memory_bounded_and_file_untouched(tmp_path):
+    x_path, y_path = tmp_path / "x.jsonl", tmp_path / "y.jsonl"
+    body = _rows_bytes(36000, pad=200)          # ~9.6 MB of valid rows
+    x_path.write_bytes(body)
+    y_path.write_bytes(body + _junk(2 * SEG))   # same rows, ~2 MiB more consumed bytes
+    states = [_file_state(p) for p in (x_path, y_path)]
+    x = ObservationHistory(str(x_path)).load()
+    y = ObservationHistory(str(y_path)).load()
+    assert x._pin.count >= 9 and y._pin.count >= x._pin.count + 2
+    peaks = []
+    for op in (lambda: x == y, lambda: y == x):
+        tracemalloc.start()
+        try:
+            assert op() is True
+            peaks.append(tracemalloc.get_traced_memory()[1])
+        finally:
+            tracemalloc.stop()
+    # two verified segment streams, one row at a time: independent of file size
+    assert max(peaks) < 6.5 * (1 << 20) < x_path.stat().st_size, peaks
+    assert ObservationRows.__slots__ == ("_history", "_path", "_generation", "_len", "_end", "_splits", "_pin")
+    assert [_file_state(p) for p in (x_path, y_path)] == states
+    print(f"x={x_path.stat().st_size} y={y_path.stat().st_size} peaks={peaks}")
