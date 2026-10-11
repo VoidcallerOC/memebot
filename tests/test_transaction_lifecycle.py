@@ -217,6 +217,7 @@ def test_live_failed_or_unconfirmed_result_does_not_open_position(status):
     bot.executor = types.SimpleNamespace(swap=lambda *args, **kwargs: SwapResult(ok=False, simulated=False, in_amount=1, out_amount=1, status=status))
     bot.notifier = types.SimpleNamespace(buy=lambda *args: None)
     bot._usd_to_lamports = lambda _usd: 1
+    bot._sell_route_ok = lambda _mint, _lamports: True  # gate tested in test_p1_sellability
     bot._reconciliation_required = False
     bot._seek_entry()
     assert bot.portfolio.positions == {}
