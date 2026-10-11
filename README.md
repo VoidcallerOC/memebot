@@ -66,8 +66,12 @@ CI installs the exact, hash-pinned dependency set from
 instead of resolving `requirements.txt` afresh. To reproduce CI locally:
 `pip install --require-hashes --no-deps --only-binary :all: -r requirements/ci-py3.13.lock`.
 After changing `requirements.txt`, regenerate both locks with the command in
-each file's header. The Docker image and systemd install still use
-`requirements.txt` directly.
+each file's header. `requirements/ci-py3.11.lock` is also the canonical
+**runtime** lock: the Docker image and the systemd install path in
+[`deploy/README.md`](deploy/README.md) install it with
+`--require-hashes --no-deps --only-binary :all:` followed by `pip check`
+(CPython 3.11, linux x86_64, glibc >= 2.28 only). `requirements.txt` stays the
+loose spec for development and for regenerating the locks.
 
 ## Backtesting
 

@@ -32,7 +32,23 @@ Open positions and the daily circuit-breaker state live in the `memebot-state`
 volume, so restarts and rebuilds don't orphan a live position or reset your
 daily loss limit.
 
+The image installs its Python dependencies from the hash-locked
+`requirements/ci-py3.11.lock` (the same file CI tests on Python 3.11), not
+from `requirements.txt`. The lock only contains linux **x86_64** wheels, so
+the build refuses (fails closed) on an arm64 host (e.g. Raspberry Pi, Apple
+Silicon) unless you build for `linux/amd64`.
+
 ## Option B — systemd (plain VM, no Docker)
+
+**Precondition:** Linux **x86_64**, glibc **>= 2.28**, **CPython 3.11**
+(`python3.11 -VV` and `ldd --version` to check). The runtime dependencies are
+installed from the hash-locked `requirements/ci-py3.11.lock`, which was
+resolved for exactly that target (manylinux_2_28 x86_64 wheels). The lock
+hashes every published file of each pinned version, so it does **not** by
+itself reject another platform: the guard command below does, and the install
+must stop if it fails. Do not fall back to resolving `requirements.txt` on the
+host. The target VM is not pinned by this repo and has not been validated;
+confirm it meets the precondition first.
 
 See the install steps in the header of [`memebot.service`](./memebot.service).
 Summary:
@@ -40,7 +56,12 @@ Summary:
 ```bash
 sudo git clone https://github.com/VoidcallerOC/memebot.git /opt/memebot
 cd /opt/memebot
-sudo python3 -m venv .venv && sudo .venv/bin/pip install -r requirements.txt
+sudo python3.11 -m venv .venv
+# Refuse anything but CPython 3.11 / x86_64 / glibc >= 2.28:
+sudo .venv/bin/python -c "import platform, sys; l = platform.libc_ver(); ok = sys.version_info[:2] == (3, 11) and platform.machine() == 'x86_64' and l[0] == 'glibc' and tuple(int(x) for x in l[1].split('.')[:2]) >= (2, 28); sys.exit(0 if ok else 'unsupported runtime target: %s %s %s' % (sys.version.split()[0], platform.machine(), l))"
+sudo .venv/bin/python -m pip install --require-hashes --no-deps --only-binary :all: \
+    -r requirements/ci-py3.11.lock
+sudo .venv/bin/python -m pip check
 sudo cp config.example.env .env && sudoedit .env
 sudo useradd --system --home /opt/memebot memebot
 sudo chown -R memebot:memebot /opt/memebot
