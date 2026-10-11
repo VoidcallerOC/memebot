@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Optional
 import requests
 
 from .config import Config
+from .jupiter import valid_token_decimals
 
 if TYPE_CHECKING:
     from .meta.model import TokenSnapshot
@@ -43,6 +44,9 @@ class TokenSafety:
     liquidity_usd: float = 0.0
     price_usd: float = 0.0
     symbol: str = ""
+    # SPL mint decimals read from the same verified getAccountInfo mint fetch
+    # as the authority checks; None when unverified (never guessed).
+    decimals: Optional[int] = None
 
     def reject(self, reason: str) -> None:
         self.passed = False
@@ -118,6 +122,7 @@ class SafetyScreener:
                 result.reject("could not verify mint/freeze authority")
             return
 
+        result.decimals = valid_token_decimals(info.get("decimals"))
         if self.cfg.require_mint_revoked and info.get("mint_authority") is not None:
             result.reject("mint authority NOT revoked (dev can print more supply)")
         if self.cfg.require_freeze_revoked and info.get("freeze_authority") is not None:
@@ -191,7 +196,10 @@ class SafetyScreener:
         }
 
     def _fetch_mint_account(self, mint: str) -> Optional[dict]:
-        """Read the SPL mint account via RPC and extract authorities."""
+        """Read the SPL mint account via RPC and extract authorities + decimals.
+
+        ``decimals`` is None unless the parsed mint reports a valid int.
+        """
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -208,6 +216,7 @@ class SafetyScreener:
             return {
                 "mint_authority": info.get("mintAuthority"),
                 "freeze_authority": info.get("freezeAuthority"),
+                "decimals": valid_token_decimals(info.get("decimals")),
             }
         except Exception as exc:
             log.debug("mint account fetch failed for %s: %s", mint[:6], exc)

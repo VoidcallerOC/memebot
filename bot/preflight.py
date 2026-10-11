@@ -2,13 +2,16 @@
 
 The preflight is deliberately separate from trading execution.  It may inspect
 configuration, instantiate existing safety/risk/execution components, derive a
-public key locally, and issue read-only RPC balance requests.  It never quotes,
-signs, submits, funds, or changes live-trading configuration.
+public key locally, issue read-only RPC balance requests, and request one
+read-only SOL->USDC price quote (to value the wallet against the experiment
+ceiling).  It never signs, submits, funds, or changes live-trading
+configuration.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -17,12 +20,19 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from .config import MAX_EXPERIMENT_USD, Config, load_config
-from .jupiter import JupiterClient, SwapExecutor
+from .jupiter import JupiterClient, SwapExecutor, sol_price_usd
 from .paths import with_resolved_data_paths
 from .process_lock import process_lock_available
 from .reconcile import fetch_sol_balance, get_wallet_pubkey
 from .risk import RiskManager
 from .safety import SafetyScreener
+
+# Explicit allowance above MAX_EXPERIMENT_USD for SOL kept for network fees and
+# rent (a few cents at realistic prices). The wallet's total native SOL, valued
+# at an independently fetched SOL/USD price, must not exceed
+# MAX_EXPERIMENT_USD + PREFLIGHT_FEE_BUFFER_USD. It does not raise the per-swap
+# ceiling, which SwapExecutor enforces at MAX_EXPERIMENT_USD.
+PREFLIGHT_FEE_BUFFER_USD = 1.0
 
 @dataclass(frozen=True)
 class Prerequisite:
@@ -91,6 +101,7 @@ def run_preflight(
     derive_pubkey: Callable[[Config], Optional[str]] = get_wallet_pubkey,
     read_sol_balance: Callable[..., Optional[float]] = fetch_sol_balance,
     jupiter_factory: Callable[..., Any] = JupiterClient,
+    read_sol_price_usd: Callable[[Any], Optional[float]] = sol_price_usd,
     swap_executor_factory: Callable[..., Any] = SwapExecutor,
     risk_factory: Callable[[Config], Any] = RiskManager,
     safety_factory: Callable[..., Any] = SafetyScreener,
@@ -233,6 +244,47 @@ def run_preflight(
         "jupiter_readiness", jupiter_ok,
         "Jupiter integration could not be initialized" if not jupiter_ok else "",
     ), "JUPITER_UNAVAILABLE")
+
+    # Wallet exposure: the whole native SOL balance, valued at an independently
+    # fetched SOL/USD price, must stay within the ceiling (+ fee buffer).
+    # Missing/unverifiable balance or price fails closed.
+    sol_price: Optional[float] = None
+    if jupiter_ok:
+        try:
+            sol_price = read_sol_price_usd(jupiter)
+        except Exception:
+            sol_price = None
+    price_ok = (
+        isinstance(sol_price, (int, float)) and not isinstance(sol_price, bool)
+        and math.isfinite(sol_price) and sol_price > 0
+    )
+    balance_limit_usd = MAX_EXPERIMENT_USD + PREFLIGHT_FEE_BUFFER_USD
+    balance_usd: Optional[float] = None
+    if balance_ok and price_ok and math.isfinite(observed_sol_balance):
+        balance_usd = observed_sol_balance * sol_price
+    exposure_ok = (
+        balance_usd is not None and math.isfinite(balance_usd)
+        and balance_usd <= balance_limit_usd
+    )
+    if not balance_ok:
+        exposure_reason, exposure_code = "wallet SOL balance unverified", "WALLET_BALANCE_UNVERIFIED"
+    elif not price_ok:
+        exposure_reason, exposure_code = "SOL/USD price unavailable or invalid", "SOL_PRICE_UNVERIFIED"
+    elif not exposure_ok:
+        exposure_reason, exposure_code = (
+            f"wallet SOL value exceeds ${balance_limit_usd:.2f} "
+            f"(ceiling ${MAX_EXPERIMENT_USD:.2f} + fee buffer ${PREFLIGHT_FEE_BUFFER_USD:.2f})",
+            "WALLET_BALANCE_EXCEEDS_CEILING",
+        )
+    else:
+        exposure_reason, exposure_code = "", None
+    add(_check(
+        "wallet_balance_ceiling", exposure_ok, exposure_reason,
+        observed_sol_balance=observed_sol_balance,
+        sol_price_usd=sol_price if price_ok else None,
+        wallet_value_usd=balance_usd,
+        limit_usd=balance_limit_usd,
+    ), exposure_code)
 
     try:
         executor = swap_executor_factory(cfg, jup=jupiter, session=session) if session is not None else swap_executor_factory(cfg, jup=jupiter)
