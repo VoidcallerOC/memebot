@@ -280,6 +280,8 @@ class ObservationRows(Sequence):
         ``index``/``count``, ``reversed`` and ``==`` against a list or another
         snapshot (element-wise, like list ==) follow from that iteration.
         Like list, it is never equal to a tuple.
+      * ``==``/``!=`` always verify the pinned bytes first, including
+        ``a == a``, and raise StaleHistoryError if they changed (see __eq__).
       * Mutation (append, extend, insert, pop, remove, clear, sort, reverse,
         item assignment/deletion, +=, *=) raises TypeError.
 
@@ -292,6 +294,21 @@ class ObservationRows(Sequence):
         not meant for repeated random access. ``list(rows)`` materialises it.
       * ``refresh()``/``load()`` return the same object while nothing new was
         consumed (so ``refresh() is load()`` still holds then).
+      * Python containers compare elements with an identity check before
+        ``__eq__``: ``snap in [snap]``, ``[snap] == [snap]``,
+        ``[snap].index(snap)``/``count(snap)`` and ``operator.contains`` never
+        call ``__eq__`` for the identical object, so they cannot detect a
+        stale snapshot. Iterate it or compare it directly instead.
+      * NaN values (json.loads accepts NaN): rows are re-parsed on every
+        comparison, so the snapshot never shares row objects with the other
+        operand and list's per-element identity shortcut never applies.
+        Parsed NaNs still compare equal because CPython's json returns one
+        shared NaN object (json.decoder.NaN) and dict/list == check identity
+        first; that is an implementation detail. A NaN that is not that
+        object (e.g. a list whose row was rebuilt with float("nan")) makes
+        the rows unequal, even though that list compares equal to itself.
+        Two snapshots with the same pin compare equal after verification
+        (identical bytes) without parsing.
     """
 
     __hash__ = None  # type: ignore[assignment]
@@ -355,16 +372,53 @@ class ObservationRows(Sequence):
             return row
         raise IndexError("ObservationRows index out of range")  # pragma: no cover
 
+    def _validate(self) -> None:
+        """Verify bytes [0, consumed length) against the pinned fingerprint
+        without parsing them: one segment (<= 1 MiB) in memory at a time,
+        nothing retained. StaleHistoryError on any mismatch."""
+        if not self._end:
+            return
+        self._history.disk_scans += 1
+        for _ in _verified_chunks(self._path, self._pin, self._stale):
+            pass
+
+    def _same_pin(self, other: "ObservationRows") -> bool:
+        # Same history, generation and consumed length => the very same pinned
+        # fingerprint (the segment list of a generation is append-only), so
+        # both describe the same bytes and one verification covers both.
+        return (other._history is self._history and other._generation == self._generation
+                and other._end == self._end and other._path == self._path)
+
     def __eq__(self, other: object) -> bool:
+        """Element-wise equality, like list ==, that never answers from stale
+        bytes: the pinned contents of every snapshot involved are verified on
+        every call (also for ``a == a``) and StaleHistoryError is raised on a
+        mismatch, before any result is returned.
+
+        * Same pin (``a == a`` or two snapshots of one history/cursor): one
+          hash-only verification pass, no parsing; True if it verifies.
+        * Otherwise the snapshot(s) are iterated to the end (no
+          short-circuit on the first differing row, so a mismatch anywhere in
+          the consumed bytes still raises) and compared row by row.
+        * A length mismatch still verifies before returning False.
+        * Not a list/snapshot: NotImplemented (nothing is read).
+        """
         if isinstance(other, ObservationRows):
-            if (other._path == self._path and other._generation == self._generation
-                    and other._end == self._end and other._history is self._history):
+            if self._same_pin(other):
+                self._validate()
                 return True
         elif not isinstance(other, list):
             return NotImplemented
         if len(other) != self._len:
+            self._validate()
+            if isinstance(other, ObservationRows):
+                other._validate()
             return False
-        return all(a == b for a, b in zip(self, other))
+        equal = True
+        for a, b in zip(self, other):  # consumes self (and other) fully: verified
+            if equal and not a == b:
+                equal = False
+        return equal
 
     def __repr__(self) -> str:
         return (f"ObservationRows(len={self._len}, consumed_bytes={self._end}, "
