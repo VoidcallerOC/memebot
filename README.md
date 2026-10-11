@@ -61,6 +61,14 @@ pip install -r requirements.txt
 pytest
 ```
 
+CI installs the exact, hash-pinned dependency set from
+`requirements/ci-py3.11.lock` / `requirements/ci-py3.13.lock` (Linux x86_64)
+instead of resolving `requirements.txt` afresh. To reproduce CI locally:
+`pip install --require-hashes --no-deps --only-binary :all: -r requirements/ci-py3.13.lock`.
+After changing `requirements.txt`, regenerate both locks with the command in
+each file's header. The Docker image and systemd install still use
+`requirements.txt` directly.
+
 ## Backtesting
 
 Validate the risk rules against historical price data *before* risking funds.
