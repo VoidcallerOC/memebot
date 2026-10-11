@@ -53,12 +53,44 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: requirements/ci-py${{ matrix.python-version }}.lock
 
-      - name: Install dependencies (requirements.txt)
+      # Locked install: requirements/ci-py<X.Y>.lock is the full direct +
+      # transitive set for requirements.txt on that Python, linux x86_64
+      # (manylinux), every file hash-pinned. Regenerate with the command in
+      # the lock header (uv pip compile ... --generate-hashes).
+      - name: Install dependencies (hash-locked, wheels only)
+        env:
+          LOCK: requirements/ci-py${{ matrix.python-version }}.lock
         run: |
-          python -m pip install -r requirements.txt
+          set -euo pipefail
           python -VV
+          python -m pip install --require-hashes --no-deps --only-binary :all: -r "$LOCK"
+          python -m pip check
+          # requirements.txt must be satisfied by the locked set alone (no index).
+          python -m pip install --no-index --dry-run -r requirements.txt
+          # Installed distributions must equal the lock exactly (no drift,
+          # nothing missing, nothing extra besides the installer itself).
+          python - "$LOCK" <<'PY'
+          import re, sys
+          from importlib.metadata import distributions
+          norm = lambda n: re.sub(r"[-_.]+", "-", n).lower()
+          locked = {}
+          for line in open(sys.argv[1]):
+              m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)", line)
+              if m:
+                  locked[norm(m.group(1))] = m.group(2)
+          installed = {norm(d.metadata["Name"]): d.version for d in distributions()}
+          for tool in ("pip", "setuptools", "wheel"):
+              installed.pop(tool, None)
+          drift = sorted(set(locked.items()) ^ set(installed.items()))
+          if drift:
+              for name, ver in drift:
+                  side = "lock" if locked.get(name) == ver else "installed"
+                  print(f"::error::dependency drift ({side} only): {name}=={ver}")
+              sys.exit(1)
+          print(f"installed set == lock ({len(locked)} packages)")
+          PY
           python -m pip freeze
 
       - name: Run test suite offline (network namespace, clean env)
