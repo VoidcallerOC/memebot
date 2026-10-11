@@ -73,6 +73,36 @@ def valid_token_decimals(value: object) -> Optional[int]:
     return value
 
 
+def swap_quote_error(
+    quote: object, input_mint: str, output_mint: str, amount: int,
+) -> Optional[str]:
+    """Why a quote must not be executed or booked, or None if it may.
+
+    A swap quote must be a dict that echoes the requested ``inputMint`` and
+    ``outputMint``, has ``inAmount`` exactly equal to the requested raw
+    ``amount``, a positive canonical integer ``outAmount`` (via
+    ``parse_raw_amount``), ``swapMode`` ExactIn when present, and, when
+    present, a positive canonical integer ``otherAmountThreshold`` that does
+    not exceed ``outAmount``. Never raises.
+    """
+    if not isinstance(quote, dict):
+        return "quote is not an object"
+    if quote.get("inputMint") != input_mint or quote.get("outputMint") != output_mint:
+        return "quote mints do not match request"
+    if "swapMode" in quote and quote["swapMode"] != "ExactIn":
+        return "quote is not ExactIn"
+    if parse_raw_amount(quote.get("inAmount")) != amount:
+        return "quote inAmount does not match request"
+    out_raw = parse_raw_amount(quote.get("outAmount"))
+    if out_raw is None or out_raw <= 0:
+        return "quote outAmount missing, malformed or not positive"
+    if "otherAmountThreshold" in quote:
+        min_out = parse_raw_amount(quote["otherAmountThreshold"])
+        if min_out is None or min_out <= 0 or min_out > out_raw:
+            return "quote otherAmountThreshold malformed or inconsistent"
+    return None
+
+
 def sol_usdc_raw_per_sol(jup: Any) -> Optional[int]:
     """USDC raw units (1e-6 USD) Jupiter returns for exactly 1 SOL, or None.
 
@@ -213,6 +243,12 @@ class SwapExecutor:
                     status=TransactionStatus.CONFIRMED_FAILURE,
                     error=exposure_error,
                 )
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            return SwapResult(
+                ok=False, simulated=not self.cfg.is_armed, in_amount=amount,
+                out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
+                error="swap amount is not a positive integer raw amount",
+            )
         quote = self.jup.quote(input_mint, output_mint, amount)
         if quote is None:
             return SwapResult(
@@ -220,7 +256,17 @@ class SwapExecutor:
                 out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
                 error="no route / quote unavailable",
             )
-        out_amount = int(quote["outAmount"])
+        # Validate before anything is booked, built, signed or sent. A bad
+        # quote is the same clean failure as "no route" (nothing submitted).
+        quote_error = swap_quote_error(quote, input_mint, output_mint, amount)
+        if quote_error is not None:
+            log.warning("swap refused before execution: %s", quote_error)
+            return SwapResult(
+                ok=False, simulated=not self.cfg.is_armed, in_amount=amount,
+                out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
+                error=f"invalid quote: {quote_error}",
+            )
+        out_amount = parse_raw_amount(quote["outAmount"])
         if not self.cfg.is_armed:
             log.info("[DRY-RUN] would swap %s of %s -> %s (out=%s)", amount, input_mint[:4], output_mint[:4], out_amount)
             return SwapResult(
