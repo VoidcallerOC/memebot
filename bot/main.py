@@ -16,13 +16,16 @@ import signal
 import sys
 import time
 from enum import Enum
+from fractions import Fraction
 
 import requests
 
 from .alerts import Notifier
 from .config import Config, load_config
 from .jupiter import (
-    JupiterClient, SOL_MINT, USDC_MINT, SwapExecutor, TransactionStatus,
+    JupiterClient, LAMPORTS_PER_SOL, SOL_MINT, USDC_MINT, USDC_RAW_PER_USD,
+    SwapExecutor, TransactionStatus, parse_raw_amount, sol_usdc_raw_per_sol,
+    valid_token_decimals,
 )
 from .preflight import run_preflight
 from .portfolio import Portfolio
@@ -127,15 +130,35 @@ def _classify_exit_quote(quote: object) -> tuple[ExitQuoteKind, float | None]:
     return ExitQuoteKind.PRICE, price
 
 
-def _price_usd(jup: JupiterClient, mint: str) -> float | None:
-    """USD mark for 1 token unit, or None when that mark must not be traded.
+def _price_usd(jup: JupiterClient, mint: str, decimals: int | None) -> float | None:
+    """USD mark for 1 WHOLE token, or None when that mark must not be traded.
 
-    None covers a missing quote and a malformed outAmount (not a canonical
-    raw integer in 0 .. 2**64-1). A parsed 0.0 from canonical ``"0"`` or
+    ``decimals`` must be the mint's verified SPL decimals (from the safety
+    screener's getAccountInfo mint fetch or the confirmed fill). Exactly
+    ``10**decimals`` raw units (one whole token) are quoted to USDC, so the
+    USDC ``outAmount / 10**6`` is the whole-token price for 6- and 9-decimal
+    mints alike. Unknown/invalid decimals return None (no mark) and are never
+    guessed.
+
+    None also covers a missing quote, a malformed outAmount (not a canonical
+    raw integer in 0 .. 2**64-1), and a quote whose ``inAmount`` or mints, when
+    present, disagree with the request. A parsed 0.0 from canonical ``"0"`` or
     int ``0`` is returned as 0.0 so a legitimate zero quote still follows
     the exit rules.
     """
-    quote = jup.quote(mint, USDC_MINT, 1_000_000)
+    decimals = valid_token_decimals(decimals)
+    if decimals is None:
+        log.warning("no verified decimals for %s — no mark", mint)
+        return None
+    raw_in = 10 ** decimals
+    quote = jup.quote(mint, USDC_MINT, raw_in)
+    if isinstance(quote, dict) and (
+        ("inAmount" in quote and parse_raw_amount(quote["inAmount"]) != raw_in)
+        or ("inputMint" in quote and quote["inputMint"] != mint)
+        or ("outputMint" in quote and quote["outputMint"] != USDC_MINT)
+    ):
+        log.warning("inconsistent exit quote for %s — not an executable price", mint)
+        return None
     kind, price = _classify_exit_quote(quote)
     if kind is ExitQuoteKind.MALFORMED:
         log.warning("malformed exit quote for %s — not an executable price", mint)
@@ -221,7 +244,14 @@ class TradingBot:
     def _manage_positions(self) -> None:
         for mint in list(self.portfolio.positions.keys()):
             pos = self.portfolio.positions[mint]
-            price = _price_usd(self.jup, mint)
+            decimals = self._verified_decimals(mint, pos)
+            if decimals is None:
+                log.warning(
+                    "%s: token decimals unverified — no mark; holding position and cost basis",
+                    pos.symbol,
+                )
+                continue
+            price = _price_usd(self.jup, mint, decimals)
             # Missing and malformed quotes are not marks. Numeric 0.0 is.
             # Refuse anything else before exit rules or portfolio accounting.
             if not _is_executable_mark(price):
@@ -279,8 +309,17 @@ class TradingBot:
 
             size_usd = self.risk.position_size_usd()
             tokens = size_usd / safety.price_usd
+            lamports = self._usd_to_lamports(size_usd)
+            if lamports is None:
+                # Fail closed: no verified SOL/USD price (or invalid size) means
+                # no trade this tick — never a fabricated default price.
+                log.warning(
+                    "entry skipped for %s: SOL/USD price unavailable or size invalid",
+                    safety.symbol,
+                )
+                return
             result = self.executor.swap(
-                SOL_MINT, candidate.mint, self._usd_to_lamports(size_usd),
+                SOL_MINT, candidate.mint, lamports,
                 allocation_usd=size_usd,
             )
             if not result.ok:
@@ -303,7 +342,15 @@ class TradingBot:
                 log.error("confirmed live entry lacks actual fill data; no position recorded")
                 return
             if self.cfg.is_armed:
-                decimals = result.out_decimals if result.out_decimals is not None else 6
+                # Decimals come from the confirmed fill, else the screener's
+                # verified mint fetch; they are never guessed.
+                decimals = valid_token_decimals(result.out_decimals)
+                if decimals is None:
+                    decimals = valid_token_decimals(getattr(safety, "decimals", None))
+                if decimals is None:
+                    self._reconciliation_required = True
+                    log.error("confirmed live entry has unverified token decimals; no position recorded")
+                    return
                 tokens = result.actual_out_amount / (10 ** decimals)
                 if tokens <= 0:
                     self._reconciliation_required = True
@@ -312,7 +359,7 @@ class TradingBot:
                 entry_price = size_usd / tokens
                 self.portfolio.open(
                     candidate.mint, safety.symbol, entry_price, size_usd, tokens,
-                    token_decimals=result.out_decimals,
+                    token_decimals=decimals,
                     entry_signature=result.tx_signature,
                     actual_in_amount=result.actual_in_amount,
                     actual_out_amount=result.actual_out_amount,
@@ -321,6 +368,7 @@ class TradingBot:
             else:
                 self.portfolio.open(
                     candidate.mint, safety.symbol, safety.price_usd, size_usd, tokens,
+                    token_decimals=valid_token_decimals(getattr(safety, "decimals", None)),
                 )
             opened = self.portfolio.positions[candidate.mint]
             self.notifier.buy(safety.symbol, size_usd, opened.entry_price, result.simulated)
@@ -430,10 +478,57 @@ class TradingBot:
     def _save(self) -> None:
         save_state(self.cfg.state_file, self.portfolio, self.risk)
 
-    def _usd_to_lamports(self, usd: float) -> int:
-        sol_price = _price_usd(self.jup, SOL_MINT) or 150.0
-        sol_amount = usd / sol_price
-        return int(sol_amount * 1_000_000_000)
+    def _usd_to_lamports(self, usd: float) -> int | None:
+        """Lamports worth at most ``usd`` at a verified SOL/USD price, or None.
+
+        Prices exactly 1 SOL (``10**9`` lamports) SOL->USDC; the USDC
+        ``outAmount`` is USD in 1e-6 units, so
+        ``lamports = floor(usd * 10**9 * 10**6 / outAmount)`` computed exactly
+        (rounding can never exceed the allocation). Returns None — and the
+        caller skips the trade — for invalid ``usd`` (None, bool, <=0, NaN,
+        inf), an unavailable/invalid quote, or a zero-lamport result. There is
+        no fallback SOL price (the old ``or 150.0`` default is removed).
+        """
+        if isinstance(usd, bool) or not isinstance(usd, (int, float)):
+            return None
+        if not math.isfinite(usd) or usd <= 0:
+            return None
+        out_raw = sol_usdc_raw_per_sol(self.jup)
+        if out_raw is None:
+            return None
+        lamports = (Fraction(usd) * LAMPORTS_PER_SOL * USDC_RAW_PER_USD) // out_raw
+        if lamports <= 0:
+            return None
+        return int(lamports)
+
+    def _verified_decimals(self, mint: str, pos=None) -> int | None:
+        """Verified SPL decimals for ``mint``, or None (never guessed).
+
+        Uses the position's recorded decimals (confirmed fill, or the
+        screener's mint fetch at entry), else the screener's verified
+        getAccountInfo mint fetch, cached only on success.
+        """
+        recorded = valid_token_decimals(getattr(pos, "token_decimals", None))
+        if recorded is not None:
+            return recorded
+        cache = getattr(self, "_decimals_cache", None)
+        if cache is None:
+            cache = {}
+            self._decimals_cache = cache
+        if mint in cache:
+            return cache[mint]
+        fetch = getattr(getattr(self, "screener", None), "_fetch_mint_account", None)
+        if not callable(fetch):
+            return None
+        try:
+            info = fetch(mint)
+        except Exception as exc:
+            log.debug("mint decimals fetch failed for %s: %s", mint[:6], exc)
+            return None
+        decimals = valid_token_decimals(info.get("decimals")) if isinstance(info, dict) else None
+        if decimals is not None:
+            cache[mint] = decimals
+        return decimals
 
     def _banner(self) -> None:
         mode = "LIVE — REAL MONEY" if self.cfg.is_armed else "DRY-RUN (no funds at risk)"

@@ -61,12 +61,13 @@ def _bot(cfg: Config | None = None):
 
 
 def _open(bot, *, entry_price=1.0, size_usd=100.0, tokens=100.0):
-    bot.portfolio.open(MINT, "PEPE", entry_price, size_usd, tokens)
+    # PR P0: marks need verified decimals; these fixtures model a 6-decimal mint.
+    bot.portfolio.open(MINT, "PEPE", entry_price, size_usd, tokens, token_decimals=6)
     return bot.portfolio.positions[MINT]
 
 
 def _stub_price(monkeypatch, value):
-    def _price(_jup, mint):
+    def _price(_jup, mint, _decimals):
         assert mint == MINT
         return value() if callable(value) else value
 
@@ -75,16 +76,16 @@ def _stub_price(monkeypatch, value):
 
 def test_price_usd_distinguishes_missing_quote_from_numeric_zero():
     missing = types.SimpleNamespace(quote=lambda *_a, **_k: None)
-    assert main_module._price_usd(missing, MINT) is None
+    assert main_module._price_usd(missing, MINT, 6) is None
 
     failed = types.SimpleNamespace(quote=lambda *_a, **_k: {"error": "no route"})
-    assert main_module._price_usd(failed, MINT) is None
+    assert main_module._price_usd(failed, MINT, 6) is None
 
     zero = types.SimpleNamespace(quote=lambda *_a, **_k: {"outAmount": "0"})
-    assert main_module._price_usd(zero, MINT) == 0.0
+    assert main_module._price_usd(zero, MINT, 6) == 0.0
 
     priced = types.SimpleNamespace(quote=lambda *_a, **_k: {"outAmount": "1500000"})
-    assert main_module._price_usd(priced, MINT) == 1.5
+    assert main_module._price_usd(priced, MINT, 6) == 1.5
 
 
 def test_missing_exit_quote_does_not_sell_at_zero(monkeypatch):
@@ -126,7 +127,7 @@ def test_partial_exit_then_missing_quote_keeps_remainder(monkeypatch):
     _open(bot)
     quotes = iter([1.6, None])
 
-    def _price(_jup, _mint):
+    def _price(_jup, _mint, _decimals):
         return next(quotes)
 
     monkeypatch.setattr(main_module, "_price_usd", _price)
@@ -388,7 +389,7 @@ def test_exit_quote_kinds_stay_distinct(quote, kind, price):
     else:
         assert got_price == price
     client = types.SimpleNamespace(quote=lambda *_a, **_k: quote)
-    assert main_module._price_usd(client, MINT) == price
+    assert main_module._price_usd(client, MINT, 6) == price
 
 
 def test_negative_quote_cannot_stop_out_or_book_loss():
@@ -398,7 +399,7 @@ def test_negative_quote_cannot_stop_out_or_book_loss():
     _open(bot)
     _bind_quotes(bot, [{"outAmount": "-1000000"}] * 3)
 
-    assert main_module._price_usd(bot.jup, MINT) is None
+    assert main_module._price_usd(bot.jup, MINT, 6) is None
     bot._manage_positions()
     bot._manage_positions()
 
@@ -570,7 +571,7 @@ def test_python_int_zero_quote_still_stop_losses_through_parser():
     _open(bot)
     _bind_quotes(bot, [{"outAmount": 0}, {"outAmount": 0}])
 
-    assert main_module._price_usd(bot.jup, MINT) == 0.0
+    assert main_module._price_usd(bot.jup, MINT, 6) == 0.0
     bot._manage_positions()
 
     assert MINT not in bot.portfolio.positions
@@ -588,7 +589,7 @@ def test_canonical_one_raw_unit_follows_stop_loss():
     _open(bot)
     _bind_quotes(bot, [{"outAmount": "1"}, {"outAmount": "1"}])
 
-    price = main_module._price_usd(bot.jup, MINT)
+    price = main_module._price_usd(bot.jup, MINT, 6)
     assert price == 1 / 1_000_000
     assert math.isfinite(price)
     bot._manage_positions()
@@ -610,7 +611,7 @@ def test_uint64_max_quote_is_finite_and_follows_exit_rules(raw):
     _open(bot)
     _bind_quotes(bot, [{"outAmount": raw}, {"outAmount": raw}])
 
-    price = main_module._price_usd(bot.jup, MINT)
+    price = main_module._price_usd(bot.jup, MINT, 6)
     assert price == (2**64 - 1) / 1_000_000
     assert math.isfinite(price)
     assert price >= 0
@@ -632,7 +633,7 @@ def test_legitimate_zero_quote_still_stop_losses_through_parser():
     _open(bot)
     _bind_quotes(bot, [{"outAmount": "0"}, {"outAmount": "0"}])
 
-    assert main_module._price_usd(bot.jup, MINT) == 0.0
+    assert main_module._price_usd(bot.jup, MINT, 6) == 0.0
     bot._manage_positions()
 
     assert MINT not in bot.portfolio.positions
@@ -715,20 +716,21 @@ def test_leaked_non_executable_mark_does_not_sell(monkeypatch, mark):
 
 
 def test_malformed_sol_quote_does_not_size_a_negative_entry():
+    # PR P0: the fabricated $150 fallback is removed; a malformed SOL quote
+    # now fails closed (no size, no trade) instead of sizing at a default.
     bot = _bot()
     bot.jup = types.SimpleNamespace(quote=lambda *_a, **_k: {"outAmount": "-1000000"})
     lamports = bot._usd_to_lamports(2.0)
-    assert lamports == int(2.0 / 150.0 * 1_000_000_000)
-    assert lamports > 0
+    assert lamports is None
 
 
 def test_quote_request_uses_usdc_not_a_zero_fill():
-    """``_price_usd`` asks Jupiter for USDC out of 1 token unit; it does not invent 0."""
+    """``_price_usd`` asks Jupiter for USDC out of 1 whole token; it does not invent 0."""
     seen = {}
 
     def quote(input_mint, output_mint, amount):
         seen["args"] = (input_mint, output_mint, amount)
         return None
 
-    assert main_module._price_usd(types.SimpleNamespace(quote=quote), MINT) is None
+    assert main_module._price_usd(types.SimpleNamespace(quote=quote), MINT, 6) is None
     assert seen["args"] == (MINT, USDC_MINT, 1_000_000)
