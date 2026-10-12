@@ -159,6 +159,32 @@ def exact_raw_sell_amount(pos, fraction: object) -> tuple[int | None, str]:
 # stop stop-loss / take-profit management of other positions.
 OPEN_SELL_INTENT_STATUSES = frozenset({"pending", "unresolved", "blocked", "confirmed_unbooked"})
 TERMINAL_SELL_INTENTS_KEPT = 50
+
+
+def _rung_value(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _take_profit_rung(reason: object) -> float | None:
+    """The ladder gain-target of a ``take_profit:<gain>`` reason, else None."""
+    if not isinstance(reason, str) or not reason.startswith("take_profit:"):
+        return None
+    try:
+        return _rung_value(float(reason.split(":", 1)[1]))
+    except ValueError:
+        return None
+
+
+def _intent_rung(intent: dict) -> float | None:
+    """The take-profit rung a sell intent is for. New intents carry
+    ``rung``; a legacy intent (created when rungs were consumed at the
+    threshold, so its rung is already marked) falls back to its reason, which
+    only re-adds the same rung (idempotent)."""
+    rung = _rung_value(intent.get("rung"))
+    return rung if rung is not None else _take_profit_rung(intent.get("reason"))
 # A Solana transaction's recent blockhash is valid for 150 slots (~60-90 s;
 # solana.com docs "Transactions" / "Confirmation & Expiration"). After this
 # conservative wall-clock window an unconfirmed transaction can no longer land,
@@ -328,6 +354,30 @@ class TradingBot:
                 "decision shadow ENABLED (dry-run journal/gate only; never authorizes live)"
             )
         load_state(cfg.state_file, self.portfolio, self.risk)
+        if cfg.is_armed:
+            self._flag_unverified_rungs()
+
+    def _flag_unverified_rungs(self) -> None:
+        """Legacy policy. State written before rungs were tied to bookings
+        could mark a rung filled at the threshold although its sale never
+        happened (crash, refusal, failure); it is indistinguishable from a
+        sold rung. Such a rung is KEPT filled (never re-sold automatically:
+        that could sell twice) and flagged for operator review. A rung is
+        verified when a settled intent for it is on record."""
+        settled = {
+            (i.get("mint"), _intent_rung(i))
+            for i in getattr(self.portfolio, "pending_intents", None) or []
+            if isinstance(i, dict) and i.get("status") == "settled"
+        }
+        for mint, pos in self.portfolio.positions.items():
+            for rung in sorted(getattr(pos, "ladder_filled", None) or ()):
+                if (mint, _rung_value(rung)) not in settled:
+                    log.warning(
+                        "%s: take-profit rung %g is marked filled without a settled sale on "
+                        "record (legacy state or pruned history); kept filled, NOT re-sold; "
+                        "operator review: compare with on-chain history",
+                        getattr(pos, "symbol", str(mint)[:8]), rung,
+                    )
 
     def stop(self, *_):
         log.info("Kill switch received — shutting down after this tick.")
@@ -431,10 +481,13 @@ class TradingBot:
                     )
                 continue
             for action in self.risk.evaluate_exit(pos.entry_price, price, pos.ladder_filled):
-                if action.reason.startswith("take_profit:"):
-                    target = float(action.reason.split(":")[1])
-                    pos.ladder_filled.add(target)
-                self._sell(mint, action.fraction, price, action.reason)
+                # A take-profit rung is NOT consumed here: it is marked filled
+                # only together with the sale's booking (paper: after the
+                # accounting; live: in the settlement's atomic save). Until
+                # then a failed / refused sell leaves it eligible, and an
+                # unresolved one freezes the mint (no second sell).
+                self._sell(mint, action.fraction, price, action.reason,
+                           rung=_take_profit_rung(action.reason))
 
     def _seek_entry(self) -> None:
         for candidate in self.strategy.find_candidates():
@@ -581,7 +634,8 @@ class TradingBot:
             log.debug("holder attach failed for %s: %s", mint[:6], exc)
         return snap
 
-    def _sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
+    def _sell(self, mint: str, fraction: float, price: float, reason: str,
+              *, rung: float | None = None) -> None:
         if mint not in self.portfolio.positions:
             return
         pos = self.portfolio.positions[mint]
@@ -597,16 +651,20 @@ class TradingBot:
                 log.error("%s: refusing %s; an earlier live sell is unresolved", symbol, reason)
                 return
             # Settles and books atomically (or leaves an open intent).
-            self._settle_live_sell(pos, fraction, price, reason)
+            self._settle_live_sell(pos, fraction, price, reason, rung=rung)
             return
-        self._book_sell(mint, fraction, price, reason)
+        self._book_sell(mint, fraction, price, reason, rung=rung)
 
-    def _book_sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
-        """Paper-sell accounting (live sells book via ``_book_confirmed_sell``)."""
+    def _book_sell(self, mint: str, fraction: float, price: float, reason: str,
+                   *, rung: float | None = None) -> None:
+        """Paper-sell accounting (live sells book via ``_book_confirmed_sell``).
+        A take-profit ``rung`` is marked filled only after the sell and its
+        accounting succeeded."""
         symbol = self.portfolio.positions[mint].symbol
         was_halted = self.risk.trading_halted()
         pnl = self.portfolio.sell_fraction(mint, fraction, price, reason)
         self.risk.record_realized_pnl(pnl)
+        self._mark_rung_filled(mint, rung)
         self.notifier.sell(symbol, fraction, price, reason, pnl)
         if self.risk.trading_halted() and not was_halted:
             self.notifier.halt(-self.risk.realized_pnl_today)
@@ -644,6 +702,13 @@ class TradingBot:
             self._restore_accounting(snapshot)
             raise
         return symbol, pnl, newly_halted
+
+    def _mark_rung_filled(self, mint, rung) -> None:
+        """Consume a take-profit rung (only once its sale is booked). A fully
+        closed position has no ladder left to mark."""
+        pos = self.portfolio.positions.get(mint)
+        if rung is not None and pos is not None:
+            pos.ladder_filled.add(rung)
 
     def _notify_sell(self, symbol, fraction, price, reason, pnl, newly_halted) -> None:
         self.notifier.sell(symbol, fraction, price, reason, pnl)
@@ -736,6 +801,10 @@ class TradingBot:
         symbol, pnl, newly_halted = self._apply_sell_accounting(
             mint, fraction, price, reason, raw_sold=raw_sold,
         )
+        # The take-profit rung is consumed in the SAME atomic save as the
+        # booking (the snapshot above covers it, so a failed save rolls the
+        # rung back too).
+        self._mark_rung_filled(mint, _intent_rung(intent))
         intent["status"] = "settled"
         intent["booked_at"] = time.time()
         intent["booked_pnl"] = pnl
@@ -752,7 +821,8 @@ class TradingBot:
         self._notify_sell(symbol, fraction, price, reason, pnl, newly_halted)
         return True
 
-    def _settle_live_sell(self, pos, fraction: float, price: float, reason: str) -> bool:
+    def _settle_live_sell(self, pos, fraction: float, price: float, reason: str,
+                          *, rung: float | None = None) -> bool:
         """Submit an armed sell of exactly ``exact_raw_sell_amount`` raw units.
 
         The intent, carrying that exact ``raw_amount``, must be durably saved
@@ -774,6 +844,8 @@ class TradingBot:
             "created_at": time.time(),
             "raw_amount": raw_amount,
         }
+        if rung is not None:
+            intent["rung"] = rung  # consumed only when this intent is booked
         self.portfolio.pending_intents.append(intent)
         durable = self._save()
         if decimals is None or tokens_to_sell <= 0:

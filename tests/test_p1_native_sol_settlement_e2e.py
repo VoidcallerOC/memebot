@@ -628,14 +628,11 @@ def test_crash_after_every_save_never_loses_or_double_books(world, monkeypatch, 
         run(boot(world), 4)
         assert_never_terminal_unbooked(world)
         if path == "on_time" and k == 1 and kind == "take_profit_partial":
-            # Died before anything was sent. Pre-existing exit-management
-            # behaviour (unchanged here): the TP rung is marked filled before
-            # the sell, so it is not retried. Nothing sold, nothing booked.
-            state = persisted(world)
-            assert [i["status"] for i in intents_of(state)] == ["failed"]
-            assert position(state)["raw_tokens"] == RAW_DOUBLE
+            # Died before anything was sent: the unsent intent resolves as
+            # failed and the TP rung, never consumed, is retried and sold once.
+            state = assert_booked_once(world, **expect)
+            assert [i["status"] for i in intents_of(state)] == ["failed", "settled"]
             assert position(state)["ladder_filled"] == [50.0]
-            assert state["portfolio"]["realized_pnl"] == 0.0 and world.sends == []
         else:
             assert_booked_once(world, **expect)
         k += 1
