@@ -275,10 +275,25 @@ def test_wrap_inside_sell_fails_closed():
     assert fill(tx).actual_out_amount is None
 
 
-def test_wsol_out_of_owner_account_is_netted():
-    tx = real()  # a later hop moves 1,000 lamports of wSOL out of the temp account
+def test_wsol_out_of_owner_account_outside_route_fails_closed():
+    # Re-review P1: a top-level (non-route) wSOL transfer out of the temp
+    # account reconciles the balance equation but is not provably part of the
+    # swap. It used to be netted (OUT - 1,000); now the fill is not proven.
+    tx = real()
     add_top(tx, "spl-token", "transfer", {"source": TEMP, "destination": "Pool1111",
                                           "authority": OWNER, "amount": "1000"})
+    bump_post(tx, OWNER_IDX, -1_000)
+    assert fill(tx).actual_out_amount is None
+
+
+def test_wsol_out_of_owner_account_inside_route_is_netted():
+    tx = real()  # a later route hop (CPI of the Jupiter instruction) moves 1,000 out
+    route = next(g for g in tx["meta"]["innerInstructions"] if g["index"] == 3)
+    route["instructions"].append({"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                                  "parsed": {"type": "transfer", "info": {
+                                      "source": TEMP, "destination": "Pool1111",
+                                      "authority": OWNER, "amount": "1000"}},
+                                  "stackHeight": 2})
     bump_post(tx, OWNER_IDX, -1_000)
     assert fill(tx).actual_out_amount == OUT_LAMPORTS - 1_000
 

@@ -37,6 +37,53 @@ def _real_number(value: object) -> bool:
             and math.isfinite(value))
 
 
+# Every sell-intent status any writer has persisted (git history of
+# bot/main.py: c733c9e pending/blocked/unresolved/settled; 1975efd +failed;
+# 4587d65 +confirmed_unbooked). da613e4 introduced the field but never
+# appended to it.
+SELL_INTENT_STATUSES = frozenset({
+    "pending", "blocked", "unresolved", "confirmed_unbooked", "failed", "settled",
+})
+
+
+def sell_intent_problem(entry: object) -> str | None:
+    """Why a persisted live SELL intent cannot be classified, else None.
+
+    Accepts every historical shape explicitly: c733c9e (mint, fraction,
+    reason, requested_price, status, tx_signature), 1975efd (+created_at,
+    raw_amount possibly None, resolution fields) and 4587d65+ (+raw_amount at
+    creation, optional rung, booking fields). Required to classify: a
+    non-empty ``mint`` (what the open intent freezes) and a known string
+    ``status``; ``tx_signature`` is None or a non-empty string. A
+    ``confirmed_unbooked`` intent is booked from its stored evidence, so it
+    also needs its signature, ``fraction``, ``requested_price`` and
+    ``reason`` and must not already be booked.
+    """
+    if not isinstance(entry, dict):
+        return "entry is not an object"
+    mint = entry.get("mint")
+    if not isinstance(mint, str) or not mint:
+        return "missing or invalid mint"
+    status = entry.get("status")
+    if not isinstance(status, str):
+        return "missing or non-string status"
+    if status not in SELL_INTENT_STATUSES:
+        return f"unknown status {status!r}"
+    sig = entry.get("tx_signature")
+    if sig is not None and (not isinstance(sig, str) or not sig):
+        return "invalid tx_signature"
+    if status == "confirmed_unbooked":
+        if sig is None:
+            return "confirmed_unbooked without tx_signature"
+        if not _real_number(entry.get("fraction")) or not _real_number(entry.get("requested_price")):
+            return "confirmed_unbooked without numeric fraction/requested_price"
+        if not isinstance(entry.get("reason"), str):
+            return "confirmed_unbooked without reason"
+        if entry.get("booked_at") is not None:
+            return "confirmed_unbooked already carries booked_at"
+    return None
+
+
 def buy_intent_problem(entry: object) -> str | None:
     """Why a persisted buy intent is malformed, or None. Mirrors what
     ``TradingBot._live_entry`` writes; anything else is corruption, never
@@ -263,14 +310,22 @@ class Portfolio:
         # sell-freeze checks, so it is corruption (raw kept, trading refused).
         # Field-level validation of sell entries is a follow-up (legacy sell
         # intents have several historical shapes).
-        raw_sells = d.get("pending_intents")
-        if raw_sells is None:
-            self.pending_intents = []
-        elif not isinstance(raw_sells, list):
+        if "pending_intents" not in d:  # legacy state: field never written
+            raw_sells: object = []
+        else:
+            raw_sells = d["pending_intents"]
+        sell_problems = (
+            [] if not isinstance(raw_sells, list)
+            else [(n, sell_intent_problem(i)) for n, i in enumerate(raw_sells)]
+        )
+        sell_problems = [(n, why) for n, why in sell_problems if why is not None]
+        if not isinstance(raw_sells, list):
+            # Present but null / non-list is corrupt, never silently [].
             self._mark_corrupt("pending_intents", raw_sells, "field is not a list")
             self.pending_intents = []
-        elif any(not isinstance(i, dict) for i in raw_sells):
-            self._mark_corrupt("pending_intents", raw_sells, "an entry is not an object")
+        elif sell_problems:
+            n, why = sell_problems[0]
+            self._mark_corrupt("pending_intents", raw_sells, f"entry {n}: {why}")
             self.pending_intents = []
         else:
             self.pending_intents = list(raw_sells)

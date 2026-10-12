@@ -195,6 +195,35 @@ def _parsed_instructions(tx: dict) -> Optional[list[dict]]:
     return out
 
 
+# Jupiter v6 aggregator program: the swap route instruction of every swap the
+# bot builds (Jupiter /swap, wrapAndUnwrapSol).
+JUPITER_V6_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+
+
+def _swap_route_inner_ids(tx: dict) -> Optional[set[int]]:
+    """``id()`` of every inner instruction executed under THE swap route.
+
+    The route is the single top-level instruction invoking the Jupiter v6
+    program; its CPIs are the inner group whose ``index`` is that
+    instruction's position. Zero or several top-level route instructions,
+    or a missing / duplicated inner group, return None (not provable). Only
+    wSOL transfers inside this set are attributable to the swap.
+    """
+    message = ((tx.get("transaction") or {}).get("message") or {})
+    tops = message.get("instructions")
+    inner = (tx.get("meta") or {}).get("innerInstructions")
+    if not isinstance(tops, list) or not isinstance(inner, list):
+        return None
+    routes = [i for i, ix in enumerate(tops)
+              if isinstance(ix, dict) and ix.get("programId") == JUPITER_V6_PROGRAM]
+    if len(routes) != 1:
+        return None
+    groups = [g for g in inner if isinstance(g, dict) and g.get("index") == routes[0]]
+    if len(groups) != 1 or not isinstance(groups[0].get("instructions"), list):
+        return None
+    return {id(ix) for ix in groups[0]["instructions"] if isinstance(ix, dict)}
+
+
 def _ix_int(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return None
@@ -212,7 +241,9 @@ def _native_sol_proceeds(tx: dict, owner: str) -> Optional[int]:
     account (often a temporary ATA created and closed in the same
     transaction, so absent from pre/postTokenBalances) and closes it to the
     owner. Proceeds are the parsed wSOL ``transfer``/``transferChecked``
-    amounts into the owner's wSOL accounts minus amounts out of them.
+    amounts into the owner's wSOL accounts minus amounts out of them, counted
+    ONLY when executed as CPIs of the single Jupiter route instruction; any
+    wSOL transfer touching the owner's wSOL accounts outside it returns None.
 
     They are accepted only if the authoritative lamport balances agree
     EXACTLY. With S = the owner + the owner's wSOL accounts:
@@ -245,6 +276,9 @@ def _native_sol_proceeds(tx: dict, owner: str) -> Optional[int]:
             return None
         ixs = _parsed_instructions(tx)
         if ixs is None:
+            return None
+        route_ids = _swap_route_inner_ids(tx)
+        if route_ids is None:
             return None
 
         # The owner's wSOL token accounts: persistent ones from token balances
@@ -289,6 +323,12 @@ def _native_sol_proceeds(tx: dict, owner: str) -> Optional[int]:
                 src, dst = info.get("source"), info.get("destination")
                 if src not in wsol and dst not in wsol:
                     continue
+                if id(ix) not in route_ids:
+                    # A wSOL transfer touching our accounts that is not a CPI
+                    # of the swap route is not provably part of the swap
+                    # (it would still reconcile the balance equation and skew
+                    # the amount): fail closed.
+                    return None
                 if kind == "transferChecked":
                     if info.get("mint") != SOL_MINT:
                         return None
@@ -345,7 +385,9 @@ def _native_sol_spent(tx: dict, owner: str) -> Optional[int]:
     owner -> wSOL + ``syncNative``; often a temporary account created and
     closed in the same transaction) and the route takes wSOL out of it. The
     swap principal is the parsed wSOL ``transfer``/``transferChecked`` amount
-    out of the owner's wSOL accounts minus amounts into them. It excludes the
+    out of the owner's wSOL accounts minus amounts into them, counted ONLY as
+    CPIs of the single Jupiter route instruction (any other wSOL transfer
+    touching the owner's wSOL accounts returns None). It excludes the
     transaction fee and rent for new non-wSOL accounts (e.g. the output
     token's ATA), which the plain lamport delta (``_native_delta``) includes.
 
@@ -380,6 +422,9 @@ def _native_sol_spent(tx: dict, owner: str) -> Optional[int]:
             return None
         ixs = _parsed_instructions(tx)
         if ixs is None:
+            return None
+        route_ids = _swap_route_inner_ids(tx)
+        if route_ids is None:
             return None
 
         wsol: set[str] = set()
@@ -422,6 +467,12 @@ def _native_sol_spent(tx: dict, owner: str) -> Optional[int]:
                 src, dst = info.get("source"), info.get("destination")
                 if src not in wsol and dst not in wsol:
                     continue
+                if id(ix) not in route_ids:
+                    # A wSOL transfer touching our accounts that is not a CPI
+                    # of the swap route is not provably part of the swap
+                    # (it would still reconcile the balance equation and skew
+                    # the amount): fail closed.
+                    return None
                 if kind == "transferChecked":
                     if info.get("mint") != SOL_MINT:
                         return None

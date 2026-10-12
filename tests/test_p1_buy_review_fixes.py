@@ -173,10 +173,19 @@ def test_corrupt_sell_intents_also_fail_closed_and_are_preserved(bw, raw):
     assert bot._save() is True and raw_field(bw, "pending_intents") == raw
 
 
-def test_null_or_empty_sell_intents_stay_legacy_ok(bw):
-    for value in (None, []):
-        write_state(bw, pending_intents=value)
-        assert boot(bw).portfolio.corrupt == {}
+def test_empty_or_absent_sell_intents_are_ok_but_null_is_corrupt(bw):
+    # Re-review P1-2: a PRESENT null is corrupt (never silently []); only an
+    # absent key is legacy. See tests/test_p1_rereview_fixes.py.
+    write_state(bw, pending_intents=[])
+    assert boot(bw).portfolio.corrupt == {}
+    write_state(bw)
+    state = persisted(bw)
+    del state["portfolio"]["pending_intents"]
+    with open(bw.state, "w") as f:
+        json.dump(state, f)
+    assert boot(bw).portfolio.corrupt == {}
+    write_state(bw, pending_intents=None)
+    assert "pending_intents" in boot(bw).portfolio.corrupt
 
 
 # -- 2. SOL-input fill: exact principal only ------------------------------------------
