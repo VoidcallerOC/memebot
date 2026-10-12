@@ -34,6 +34,9 @@ from tests.test_p1_prebroadcast_signature import (  # noqa: F401  (rw is a fixtu
 from tests.test_p1_state_durability import install as install_faulty_os
 
 
+SELL_QUOTE = {"inputMint": MINT, "outputMint": SOL_MINT, "outAmount": "1"}
+
+
 def executor(w):
     ex = boot(w).executor
     ex.jup = Jup()
@@ -61,7 +64,7 @@ def test_armed_sell_without_callable_callback_refused_before_quote(rw, cb):
 
 def test_execute_live_direct_without_callback_refused_before_build(rw):
     ex = executor(rw)
-    result = ex._execute_live({"outAmount": "1"}, IN_RAW, 1, input_mint=MINT, output_mint=SOL_MINT)
+    result = ex._execute_live(SELL_QUOTE, IN_RAW, 1, input_mint=MINT, output_mint=SOL_MINT)
     assert result.status == TransactionStatus.CONFIRMED_FAILURE and result.tx_signature is None
     assert rw.builds == 0 and rw.sends == []          # nothing built, so nothing signed
 
@@ -69,7 +72,7 @@ def test_execute_live_direct_without_callback_refused_before_build(rw):
 def test_unknown_input_fails_closed_as_a_sell(rw):
     ex = executor(rw)
     assert ex.requires_pre_broadcast_callback(None) is True
-    result = ex._execute_live({"outAmount": "1"}, IN_RAW, 1)
+    result = ex._execute_live({"outAmount": "1"}, IN_RAW, 1)      # no direction at all
     assert result.status == TransactionStatus.CONFIRMED_FAILURE and rw.builds == 0 and rw.sends == []
 
 
@@ -176,3 +179,101 @@ def test_armed_buy_without_callback_still_broadcasts_pr_b_scope(rw):
     (sig,) = rw.sends
     assert result.tx_signature == sig and rw.builds == 1
     assert result.status == TransactionStatus.TIMEOUT       # not visible within timeout 0
+
+
+# -- the executed direction is the quote's, validated against the request ------------
+# (review of #39: a direct caller must not be able to pass a token->SOL quote
+# while claiming input_mint=SOL and so skip the mandatory sell callback)
+
+OTHER = "Other11111111111111111111111111111111111111"
+BUY_QUOTE = {"inputMint": SOL_MINT, "outputMint": MINT, "outAmount": "1"}
+
+
+def counting(ex):
+    loads = []
+    real = ex._load_keypair
+    ex._load_keypair = lambda K: loads.append(1) or real(K)
+    return loads
+
+
+def assert_refused_before_anything(w, result, loads):
+    assert result.ok is False and result.status == TransactionStatus.CONFIRMED_FAILURE
+    assert result.tx_signature is None and "refused before signing" in result.error
+    assert loads == [] and w.builds == 0 and w.sends == []      # no key, build, sign, send
+
+
+@pytest.mark.parametrize("quote, args", [
+    pytest.param({"inputMint": MINT, "outputMint": SOL_MINT, "outAmount": "1"}, (SOL_MINT, MINT),
+                 id="reviewer-sell-quote-claimed-as-buy"),
+    pytest.param({"inputMint": MINT, "outputMint": SOL_MINT, "outAmount": "1"}, (SOL_MINT, SOL_MINT),
+                 id="sell-quote-claimed-sol-to-sol"),
+    pytest.param({"inputMint": SOL_MINT, "outputMint": OTHER, "outAmount": "1"}, (SOL_MINT, MINT),
+                 id="output-mismatch"),
+    pytest.param({"inputMint": OTHER, "outputMint": MINT, "outAmount": "1"}, (SOL_MINT, MINT),
+                 id="input-mismatch"),
+    pytest.param({"outputMint": MINT, "outAmount": "1"}, (SOL_MINT, MINT), id="missing-inputMint"),
+    pytest.param({"inputMint": SOL_MINT, "outAmount": "1"}, (SOL_MINT, MINT), id="missing-outputMint"),
+    pytest.param({"inputMint": 1, "outputMint": MINT, "outAmount": "1"}, (SOL_MINT, MINT),
+                 id="non-string-inputMint"),
+    pytest.param({"inputMint": SOL_MINT, "outputMint": b"m", "outAmount": "1"}, (SOL_MINT, MINT),
+                 id="non-string-outputMint"),
+    pytest.param({"inputMint": "", "outputMint": MINT, "outAmount": "1"}, ("", MINT), id="empty"),
+    pytest.param(BUY_QUOTE, (None, None), id="request-mints-missing"),
+    pytest.param({"inputMint": SOL_MINT, "outputMint": SOL_MINT, "outAmount": "1"}, (SOL_MINT, SOL_MINT),
+                 id="same-mint"),
+    pytest.param("not-a-dict", (SOL_MINT, MINT), id="quote-not-object"),
+])
+def test_direction_mismatch_refused_before_key_build_sign_broadcast(rw, quote, args):
+    ex = executor(rw)
+    loads = counting(ex)
+    result = ex._execute_live(quote, IN_RAW, 1, input_mint=args[0], output_mint=args[1])
+    assert_refused_before_anything(rw, result, loads)
+
+
+def test_swapped_mints_refused_even_with_a_true_callback(rw):
+    ex = executor(rw)
+    loads = counting(ex)
+    calls = []
+    result = ex._execute_live(BUY_QUOTE, IN_RAW, 1, input_mint=MINT, output_mint=SOL_MINT,
+                              before_broadcast=lambda sig: calls.append(sig) or True)
+    assert_refused_before_anything(rw, result, loads)
+    assert calls == []
+
+
+def test_consistent_sell_quote_with_true_callback_broadcasts_once(rw):
+    ex = executor(rw)
+    rw.wallet[MINT] = IN_RAW / 10**8
+    seen = []
+    result = ex._execute_live(SELL_QUOTE, IN_RAW, 1, input_mint=MINT, output_mint=SOL_MINT,
+                              before_broadcast=lambda sig: seen.append(sig) or True)
+    assert rw.sends == seen and len(seen) == 1 and result.tx_signature == seen[0]
+
+
+def test_consistent_sell_quote_without_callback_refused_before_build(rw):
+    ex = executor(rw)
+    result = ex._execute_live(SELL_QUOTE, IN_RAW, 1, input_mint=MINT, output_mint=SOL_MINT)
+    assert result.status == TransactionStatus.CONFIRMED_FAILURE and result.tx_signature is None
+    assert rw.builds == 0 and rw.sends == [] and "pre-broadcast" in result.error
+
+
+def test_consistent_buy_quote_without_callback_still_broadcasts_pr_b_scope(rw):
+    ex = executor(rw)
+    rw.plan = ["drop"]
+    result = ex._execute_live(BUY_QUOTE, 1_000_000, 1, input_mint=SOL_MINT, output_mint=MINT)
+    (sig,) = rw.sends
+    assert result.tx_signature == sig and rw.builds == 1
+
+
+def test_swap_path_never_executes_a_quote_with_another_direction(rw):
+    """swap() validates the fetched quote (swap_quote_error, which now uses the
+    same direction check) before execution: a quote for the other direction
+    is a clean pre-execution failure."""
+    ex = executor(rw)
+
+    class FlippedJup(Jup):
+        def quote(self, i, o, amount):
+            return super().quote(o, i, amount)       # answers for the other direction
+    ex.jup = FlippedJup()
+    result = sell(ex, before_broadcast=lambda sig: True)
+    assert result.status == TransactionStatus.CONFIRMED_FAILURE and "invalid quote" in result.error
+    assert rw.builds == 0 and rw.sends == []

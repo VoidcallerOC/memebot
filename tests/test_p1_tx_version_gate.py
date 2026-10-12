@@ -179,7 +179,8 @@ def boundary(monkeypatch):
 
 def run(ex):
     # an armed sell must carry a pre-broadcast persistence callback (True: durable)
-    return ex._execute_live({"outAmount": "10"}, 5, 10, input_mint=MINT, output_mint=SOL_MINT,
+    quote = {"inputMint": MINT, "outputMint": SOL_MINT, "outAmount": "10"}
+    return ex._execute_live(quote, 5, 10, input_mint=MINT, output_mint=SOL_MINT,
                             before_broadcast=lambda sig: True)
 
 

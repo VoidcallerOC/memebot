@@ -5,13 +5,17 @@ import sys
 import types
 
 from bot.config import Config
-from bot.jupiter import JupiterClient, SwapExecutor
+from bot.jupiter import SOL_MINT as _SOL, JupiterClient, SwapExecutor
 from bot.paths import resolve_data_path
 import bot.main as main_module
 
 
 SENTINEL = "test-only-sentinel"
 
+
+_TOKEN = "Mint111111111111111111111111111111111111111"
+# _execute_live refuses a quote whose direction does not match the request.
+_BUY_QUOTE = {"inputMint": _SOL, "outputMint": _TOKEN, "outAmount": "123"}
 
 def armed_cfg(**overrides):
     values = dict(
@@ -104,7 +108,7 @@ def test_live_signer_mismatch_blocks_before_swap_construction(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
 
     monkeypatch.setattr(executor, "_load_keypair", lambda _keypair: FakeKeypair())
-    result = executor._execute_live({"outAmount": "123"}, 1, 123)
+    result = executor._execute_live(_BUY_QUOTE, 1, 123, input_mint=_SOL, output_mint=_TOKEN)
     assert not result.ok
     assert result.error == "signer does not match BURNER_WALLET_PUBKEY"
 
@@ -136,7 +140,7 @@ def test_missing_burner_address_blocks_signer(monkeypatch):
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    result = executor._execute_live({"outAmount": "123"}, 1, 123)
+    result = executor._execute_live(_BUY_QUOTE, 1, 123, input_mint=_SOL, output_mint=_TOKEN)
     assert not result.ok
     assert result.error == "signer does not match BURNER_WALLET_PUBKEY"
 

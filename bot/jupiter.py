@@ -73,6 +73,27 @@ def valid_token_decimals(value: object) -> Optional[int]:
     return value
 
 
+def quote_direction_error(quote: object, input_mint: object, output_mint: object) -> Optional[str]:
+    """Why a quote's direction does not match the requested swap, or None.
+
+    The requested ``input_mint`` / ``output_mint`` and the quote's
+    ``inputMint`` / ``outputMint`` must all be non-empty strings, equal
+    pairwise (exact string equality) and the input must differ from the
+    output. Missing, non-string or inconsistent -> refused. Never raises.
+    """
+    if not isinstance(quote, dict):
+        return "quote is not an object"
+    q_in, q_out = quote.get("inputMint"), quote.get("outputMint")
+    for value in (input_mint, output_mint, q_in, q_out):
+        if not isinstance(value, str) or not value:
+            return "quote mints do not match request (missing or not a string)"
+    if q_in != input_mint or q_out != output_mint:
+        return "quote mints do not match request"
+    if q_in == q_out:
+        return "quote input and output mint are the same"
+    return None
+
+
 def swap_quote_error(
     quote: object, input_mint: str, output_mint: str, amount: int,
 ) -> Optional[str]:
@@ -85,10 +106,9 @@ def swap_quote_error(
     present, a positive canonical integer ``otherAmountThreshold`` that does
     not exceed ``outAmount``. Never raises.
     """
-    if not isinstance(quote, dict):
-        return "quote is not an object"
-    if quote.get("inputMint") != input_mint or quote.get("outputMint") != output_mint:
-        return "quote mints do not match request"
+    direction_error = quote_direction_error(quote, input_mint, output_mint)
+    if direction_error is not None:
+        return direction_error
     if "swapMode" in quote and quote["swapMode"] != "ExactIn":
         return "quote is not ExactIn"
     if parse_raw_amount(quote.get("inAmount")) != amount:
@@ -398,6 +418,17 @@ class SwapExecutor:
         output_mint: Optional[str] = None,
         before_broadcast: Optional[Callable[[str], bool]] = None,
     ) -> SwapResult:
+        # The direction actually executed is the QUOTE's. It must match the
+        # requested mints before anything is loaded, built, signed or sent,
+        # so the caller cannot misclassify a sell as a buy (or vice versa).
+        direction_error = quote_direction_error(quote, input_mint, output_mint)
+        if direction_error is not None:
+            log.error("live swap refused before signing: %s", direction_error)
+            return SwapResult(
+                ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                status=TransactionStatus.CONFIRMED_FAILURE,
+                error=f"refused before signing: {direction_error}",
+            )
         try:
             from solders.keypair import Keypair
             from solders.transaction import VersionedTransaction
@@ -419,7 +450,7 @@ class SwapExecutor:
                 )
             # Defence in depth for direct callers: the same mandatory-callback
             # rule as ``swap``, before the transaction is built or signed.
-            missing = self._missing_pre_broadcast_callback(input_mint, before_broadcast)
+            missing = self._missing_pre_broadcast_callback(quote["inputMint"], before_broadcast)
             if missing is not None:
                 return missing
             swap_resp = self.session.post(
