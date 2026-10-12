@@ -67,13 +67,17 @@ from bot.chain import SPL_TOKEN_PROGRAM, _native_delta, _native_sol_spent, extra
 from bot.config import Config
 from bot.jupiter import SOL_MINT, USDC_MINT, SwapExecutor, TransactionStatus
 from bot.state import save_state as REAL_SAVE
+from tests.swap_tx_factory import conformant_instructions, direct_route, unsigned_tx_bytes
 from tests.test_p1_state_durability import install as install_faulty_os
+
+# Runs the REAL direct-route quote gate and pre-sign validator (see conftest).
+pytestmark = pytest.mark.real_swap_policy
 
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "synthetic_native_sol_buy.json"
 FIXTURE_SHA256 = "8d857dfaa4d0c86ab5019806dda03fbf7b1948b5bf72c1f69b4c85bbf3ca7bd6"
 OWNER_PLACEHOLDER = "SynthOwner111111111111111111111111111111111"
 MINT = "SynthBuyMint1111111111111111111111111111111"
-MINT2 = "SynthOtherMint11111111111111111111111111111"
+MINT2 = "Synth2therMint11111111111111111111111111111"  # valid base58 (ATA derivation)
 HELD = "SynthHeldMint111111111111111111111111111111"
 RPC = "https://rpc.test"
 SWAP_URL = "https://jupiter.test/swap"
@@ -110,9 +114,9 @@ class BJup:
             out = self.sol_usd * 10**6 * amount // 10**9
             return {"inputMint": i, "outputMint": o, "inAmount": str(amount), "outAmount": str(out)}
         out = amount * 315 if i == SOL_MINT else amount // 315
-        return {"inputMint": i, "outputMint": o, "inAmount": str(amount), "outAmount": str(out),
-                "otherAmountThreshold": str(out * 99 // 100), "swapMode": "ExactIn",
-                "slippageBps": 100}
+        return direct_route({"inputMint": i, "outputMint": o, "inAmount": str(amount),
+                             "outAmount": str(out), "otherAmountThreshold": str(out * 99 // 100),
+                             "swapMode": "ExactIn"})
 
     def _headers(self):
         return {}
@@ -163,6 +167,7 @@ class BWorld:
         self.txs, self.status, self.wallet = {}, {}, {}
         self.sends, self.durable_at_send, self.plan = [], [], []
         self.builds = 0
+        self.extra_ixs = []          # appended to the conformant build (pre-sign policy tests)
         self.crash_build = False
         self.rpc = []
         self.marks, self.mark_calls = {}, []
@@ -193,11 +198,12 @@ class BWorld:
                 raise SystemExit("crash: died while building, before signing")
             self.builds += 1
             assert json["quoteResponse"]["inputMint"] == SOL_MINT
-            msg = MessageV0.try_compile(self.kp.pubkey(), [Instruction(
-                Pubkey.from_string("Stake11111111111111111111111111111111111111"), b"\x02",
-                [AccountMeta(self.kp.pubkey(), True, True)])], [], Hash.new_unique())
-            unsigned = VersionedTransaction.populate(msg, [Signature.default()])
-            return Resp({"swapTransaction": base64.b64encode(bytes(unsigned)).decode()})
+            q = json["quoteResponse"]
+            # Policy-conformant SYNTHETIC build: the real pre-sign validator runs.
+            unsigned = unsigned_tx_bytes(self.kp.pubkey(), conformant_instructions(
+                self.kp.pubkey(), q["inputMint"], q["outputMint"],
+                int(q["inAmount"]), int(q["outAmount"])) + list(self.extra_ixs))
+            return Resp({"swapTransaction": base64.b64encode(unsigned).decode()})
         assert url == RPC, url
         method, params = json["method"], json["params"]
         self.rpc.append(method)
@@ -836,3 +842,40 @@ def test_open_buy_intent_halts_an_unarmed_session(bw):
     paper = boot(bw, armed=False)
     assert run(paper, 3) == 1 and paper._running is False   # needs an armed session
     assert bw.sends == [bw.sends[0]] and paper.portfolio.positions == {}
+
+
+# -- direct-route policy rejections (real policy): definitive, nothing sent ---------
+
+def test_quote_route_policy_rejection_never_builds_signs_or_sends(bw):
+    """A multi-hop quote is refused before /swap: no build, no signature, no
+    broadcast; the intent is definitively failed (never unresolved)."""
+    class MultiHop(BJup):
+        def quote(self, i, o, amount):
+            q = super().quote(i, o, amount)
+            if (i, o) == (SOL_MINT, MINT):
+                q["routePlan"] = q["routePlan"] * 2
+            return q
+    bot = start(bw, jup=MultiHop())
+    bot._tick()
+    assert bw.builds == 0 and bw.sends == [] and "sendTransaction" not in bw.rpc
+    (intent,) = buys_of(persisted(bw))
+    assert intent["status"] == "failed" and intent["tx_signature"] is None
+    assert intent["resolution"] == "refused before send (no transaction)"
+    assert "route policy" in intent["error"]
+    assert bot.portfolio.positions == {} and not bot._open_buy_intents()
+
+
+def test_presign_policy_rejection_never_signs_or_sends(bw):
+    """An extra SOL transfer in the built transaction is refused before
+    signing: no signature persisted, nothing broadcast, intent failed."""
+    from solders.system_program import TransferParams, transfer
+    bw.extra_ixs = [transfer(TransferParams(
+        from_pubkey=bw.kp.pubkey(), to_pubkey=Keypair().pubkey(), lamports=1_000))]
+    bot = start(bw)
+    bot._tick()
+    assert bw.builds == 1 and bw.sends == [] and "sendTransaction" not in bw.rpc
+    (intent,) = buys_of(persisted(bw))
+    assert intent["status"] == "failed" and intent["tx_signature"] is None
+    assert "signed_at" not in intent
+    assert "transaction policy" in intent["error"]
+    assert bot.portfolio.positions == {} and not bot._open_buy_intents()

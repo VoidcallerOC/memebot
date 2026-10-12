@@ -44,7 +44,19 @@ from tests.test_p1_native_sol_settlement_e2e import (
     ENTRY, FEE, FIXTURE, FULL, IN_RAW, MINT, OUT_LAMPORTS, OWNER, RAW_DOUBLE, RPC, SENTINEL,
     SL_MARK, SL_PNL, SWAP_URL, TP_MARK, Jup, Notes, Resp, intents_of, persisted, position,
 )
+from tests.swap_tx_factory import conformant_unsigned_tx, direct_route
 from tests.test_p1_state_durability import install as install_faulty_os
+
+# Runs the REAL direct-route quote gate and pre-sign validator (see conftest).
+pytestmark = pytest.mark.real_swap_policy
+
+
+class DirectJup(Jup):
+    """The shared fake's quotes as single-step 100% direct routes."""
+
+    def quote(self, i, o, amount):
+        q = super().quote(i, o, amount)
+        return direct_route(q) if isinstance(q, dict) and "outAmount" in q else q
 
 EXPIRY = main_module.SELL_INTENT_EXPIRY_SECONDS
 TP50_PNL = FULL * (TP_MARK - ENTRY)
@@ -92,11 +104,13 @@ class RWorld:
             if self.crash_build:
                 raise SystemExit("crash: died while building, before signing")
             self.builds += 1
-            msg = MessageV0.try_compile(self.kp.pubkey(), [Instruction(
-                Pubkey.from_string("Stake11111111111111111111111111111111111111"), b"\x01",
-                [AccountMeta(self.kp.pubkey(), True, True)])], [], Hash.new_unique())
-            unsigned = VersionedTransaction.populate(msg, [Signature.default()])
-            return Resp({"swapTransaction": base64.b64encode(bytes(unsigned)).decode()})
+            q = json["quoteResponse"]
+            # Policy-conformant SYNTHETIC build: the real pre-sign validator runs.
+            unsigned = conformant_unsigned_tx(
+                self.kp.pubkey(), q["inputMint"], q["outputMint"],
+                # (legacy-fixture callers may pass quotes without amounts)
+                int(q.get("inAmount") or 1), int(q.get("outAmount") or 1))
+            return Resp({"swapTransaction": base64.b64encode(unsigned).decode()})
         assert url == RPC, url
         method, params = json["method"], json["params"]
         self.rpc.append(method)
@@ -167,7 +181,7 @@ def boot(w):
                  poll_interval_seconds=0, state_file=w.state, process_lock_file=w.lock)
     bot = main_module.TradingBot(cfg)
     bot.session = w
-    bot.jup = Jup()
+    bot.jup = DirectJup()
     bot.executor = SwapExecutor(cfg, jup=bot.jup, session=w)
     bot.executor._load_keypair = lambda _Keypair: w.kp
     bot.notifier = Notes()

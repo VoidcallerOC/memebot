@@ -25,6 +25,9 @@ log = logging.getLogger(__name__)
 # intentionally independent of BANKROLL_USD and strategy configuration.
 MAX_EXPERIMENT_USD = 20.0
 
+# Hard upper bound for PRIORITY_FEE_MAX_LAMPORTS (0.0002 SOL per swap).
+PRIORITY_FEE_HARD_CEILING_LAMPORTS = 200_000
+
 
 def _get_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -115,6 +118,10 @@ class Config:
         default_factory=lambda: [(50.0, 0.5), (100.0, 0.25), (300.0, 0.25)]
     )
     max_slippage_bps: int = 150
+    # Cap on the Jupiter-estimated priority fee per swap (lamports), sent as
+    # prioritizationFeeLamports.priorityLevelWithMaxLamports.maxLamports and
+    # re-checked on the unsigned transaction (limit x price) before signing.
+    priority_fee_max_lamports: int = 50_000
 
     # Token safety screen
     min_liquidity_usd: float = 20000.0
@@ -182,6 +189,7 @@ def load_config() -> Config:
         daily_loss_limit_pct=_get_float("DAILY_LOSS_LIMIT_PCT", 10.0),
         take_profit_ladder=_parse_ladder(ladder_raw),
         max_slippage_bps=_get_int("MAX_SLIPPAGE_BPS", 150),
+        priority_fee_max_lamports=_get_int("PRIORITY_FEE_MAX_LAMPORTS", 50_000),
         min_liquidity_usd=_get_float("MIN_LIQUIDITY_USD", 20000.0),
         require_liquidity_locked=_get_bool("REQUIRE_LIQUIDITY_LOCKED", True),
         require_mint_revoked=_get_bool("REQUIRE_MINT_REVOKED", True),
@@ -219,6 +227,11 @@ def _validate(cfg: Config) -> None:
         problems.append("STOP_LOSS_PCT must be in (0, 100)")
     if cfg.bankroll_usd <= 0:
         problems.append("BANKROLL_USD must be > 0")
+    if not 1 <= cfg.priority_fee_max_lamports <= PRIORITY_FEE_HARD_CEILING_LAMPORTS:
+        problems.append(
+            "PRIORITY_FEE_MAX_LAMPORTS must be in "
+            f"[1, {PRIORITY_FEE_HARD_CEILING_LAMPORTS}]"
+        )
     ladder_total = sum(frac for _, frac in cfg.take_profit_ladder)
     if ladder_total > 1.0 + 1e-9:
         problems.append(

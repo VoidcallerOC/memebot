@@ -170,11 +170,19 @@ See `config.example.env` for every knob, but the important ones:
 | `TAKE_PROFIT_LADDER` | Profit targets / sell fractions | `50:0.5,100:0.25,300:0.25` |
 | `MAX_OPEN_POSITIONS` | Concurrent positions allowed | `3` |
 | `JUPITER_BASE_URL` | Jupiter swap API base | `https://lite-api.jup.ag/swap/v1` |
+| `PRIORITY_FEE_MAX_LAMPORTS` | Cap on the per-swap priority fee (1..200000) | `50000` |
 
 > **Jupiter endpoint:** the bot quotes and swaps through Jupiter. The legacy
 > `quote-api.jup.ag/v6` host was deprecated on 2025-10-01, so the default is now
 > the keyless free tier `lite-api.jup.ag/swap/v1`. With a Jupiter API key, set
 > `JUPITER_API_KEY` and point `JUPITER_BASE_URL` at `https://api.jup.ag/swap/v1`.
+>
+> **Direct-route policy** (`bot/swap_policy.py`): quotes are requested with
+> `onlyDirectRoutes=true` and refused unless they are a single 100% SOL<->token
+> step with no platform fee; the unsigned `/swap` transaction is then checked
+> against an instruction allowlist (ComputeBudget limit/price, idempotent ATA
+> creation for the owner, owner -> own wSOL funding + syncNative, exactly one
+> Jupiter `route`, wSOL close back to the owner) before it is signed.
 
 ## Architecture
 
