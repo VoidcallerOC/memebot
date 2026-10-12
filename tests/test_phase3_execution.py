@@ -134,7 +134,8 @@ def test_live_swap_attaches_getTransaction_fill(monkeypatch):
     session = Phase3Session(parsed_swap_tx())
     executor = SwapExecutor(cfg(), jup=JupiterClient(cfg()), session=session)
     executor._load_keypair = lambda _keypair: types.SimpleNamespace(pubkey=lambda: WALLET)
-    result = executor._execute_live({"outAmount": "1"}, 5, 1, input_mint=SOL_MINT, output_mint=MINT)
+    quote = {"inputMint": SOL_MINT, "outputMint": MINT, "outAmount": "1"}
+    result = executor._execute_live(quote, 5, 1, input_mint=SOL_MINT, output_mint=MINT)
     assert result.ok
     assert result.status == TransactionStatus.CONFIRMED_SUCCESS
     assert result.tx_signature == "sig-fill"
