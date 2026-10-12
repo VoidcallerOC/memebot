@@ -173,8 +173,8 @@ def test_valid_quote_armed_still_reaches_execution(direction, threshold_present)
     executor._execute_live = lambda quote, amt, out, **kw: seen.append((quote, amt, out, kw)) or SwapResult(
         ok=True, simulated=False, in_amount=amt, out_amount=out,
         status=TransactionStatus.CONFIRMED_SUCCESS)
-    # armed sells must carry a pre-broadcast persistence callback; buys do not (yet)
-    cb = (lambda sig: True) if direction == "sell" else None
+    # every armed swap (buy and sell) must carry a pre-broadcast persistence callback
+    cb = lambda sig: True  # noqa: E731
     assert executor.swap(i, o, amount, allocation_usd=2.0, before_broadcast=cb).ok
     (quote, amt, out, kw), = seen
     assert amt == amount and out == amount * 1000 and isinstance(out, int)

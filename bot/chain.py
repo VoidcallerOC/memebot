@@ -337,6 +337,139 @@ def _native_sol_proceeds(tx: dict, owner: str) -> Optional[int]:
         return None
 
 
+def _native_sol_spent(tx: dict, owner: str) -> Optional[int]:
+    """Lamports of SOL a native SOL -> token swap took from ``owner``.
+
+    The buy-side mirror of ``_native_sol_proceeds``. With ``wrapAndUnwrapSol``
+    Jupiter wraps SOL into an owner wSOL token account (system ``transfer``
+    owner -> wSOL + ``syncNative``; often a temporary account created and
+    closed in the same transaction) and the route takes wSOL out of it. The
+    swap principal is the parsed wSOL ``transfer``/``transferChecked`` amount
+    out of the owner's wSOL accounts minus amounts into them. It excludes the
+    transaction fee and rent for new non-wSOL accounts (e.g. the output
+    token's ATA), which the plain lamport delta (``_native_delta``) includes.
+
+    Accepted only if the authoritative lamport balances agree EXACTLY. With
+    S = the owner + the owner's wSOL accounts:
+
+        -delta_lamports(S) == fee(if owner pays) + rent(owner -> new non-wSOL
+        accounts via createAccount) + (wSOL out - wSOL in)
+
+    Wrapping (owner -> own wSOL ``transfer``/``createAccount``), ``syncNative``
+    and closing an owner wSOL account back to the owner are internal to S.
+    Any other lamport movement into or out of S breaks the equality or is
+    rejected and returns None, as do missing meta / innerInstructions, a
+    failed transaction, an unknown owner or no positive principal. Never
+    raises.
+    """
+    try:
+        meta = tx.get("meta")
+        if not isinstance(meta, dict) or meta.get("err") is not None:
+            return None
+        keys = _account_keys(tx)
+        pre = meta.get("preBalances")
+        post = meta.get("postBalances")
+        if (
+            not isinstance(pre, list) or not isinstance(post, list)
+            or len(keys) != len(pre) or len(keys) != len(post)
+            or owner not in keys or keys.count(owner) != 1
+        ):
+            return None
+        fee = _ix_int(meta.get("fee"))
+        if fee is None:
+            return None
+        ixs = _parsed_instructions(tx)
+        if ixs is None:
+            return None
+
+        wsol: set[str] = set()
+        for entry in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
+            if not isinstance(entry, dict) or entry.get("mint") != SOL_MINT:
+                continue
+            idx = entry.get("accountIndex")
+            if not isinstance(idx, int) or not 0 <= idx < len(keys):
+                return None
+            if entry.get("owner") == owner:
+                wsol.add(keys[idx])
+        for ix in ixs:
+            parsed = ix.get("parsed")
+            if not isinstance(parsed, dict):
+                continue
+            info = parsed.get("info") or {}
+            kind = parsed.get("type")
+            if ix.get("program") == "spl-token" and kind in _WSOL_INIT_TYPES:
+                if info.get("mint") == SOL_MINT and info.get("owner") == owner:
+                    wsol.add(info.get("account"))
+            elif ix.get("program") == "spl-associated-token-account" and kind in _ATA_CREATE_TYPES:
+                if info.get("mint") == SOL_MINT and info.get("wallet") == owner:
+                    wsol.add(info.get("account"))
+        wsol.discard(None)
+        if not wsol or owner in wsol:
+            return None
+        group = wsol | {owner}
+
+        wsol_in = wsol_out = rent_out = 0
+        for ix in ixs:
+            parsed = ix.get("parsed")
+            if not isinstance(parsed, dict):
+                continue
+            info = parsed.get("info") or {}
+            if not isinstance(info, dict):
+                return None
+            kind = parsed.get("type")
+            program = ix.get("program")
+            if program == "spl-token" and kind in _TOKEN_TRANSFER_TYPES:
+                src, dst = info.get("source"), info.get("destination")
+                if src not in wsol and dst not in wsol:
+                    continue
+                if kind == "transferChecked":
+                    if info.get("mint") != SOL_MINT:
+                        return None
+                    amount = _ix_int((info.get("tokenAmount") or {}).get("amount"))
+                else:
+                    amount = _ix_int(info.get("amount"))
+                if amount is None:
+                    return None
+                if src in wsol and dst not in wsol:
+                    wsol_out += amount
+                elif dst in wsol and src not in wsol:
+                    wsol_in += amount
+            elif program == "spl-token" and kind == "closeAccount":
+                acct, dst = info.get("account"), info.get("destination")
+                if acct in wsol and dst != owner:
+                    return None  # our SOL sent elsewhere
+                if acct not in wsol and dst in group:
+                    return None  # unexplained refund into the owner
+            elif program == "system":
+                if kind == "createAccount":
+                    src, new = info.get("source"), info.get("newAccount")
+                    lamports = _ix_int(info.get("lamports"))
+                    if lamports is None:
+                        return None
+                    if src == owner and new in wsol:
+                        continue  # rent into our own wSOL account: internal
+                    if src == owner:
+                        rent_out += lamports  # rent for another new account (token ATA)
+                    elif new in group:
+                        return None
+                elif kind == "transfer" and info.get("source") == owner \
+                        and info.get("destination") in wsol:
+                    continue  # wrapping into our own wSOL account: internal
+                elif info.get("source") in group or info.get("destination") in group or \
+                        info.get("newAccount") in group or info.get("account") in group:
+                    return None  # any other system lamport move touching S
+        spent = wsol_out - wsol_in
+        if spent <= 0:
+            return None
+        delta = sum(int(post[i]) - int(pre[i]) for i, k in enumerate(keys) if k in group)
+        fee_paid = fee if keys[0] == owner else 0
+        if -delta != fee_paid + rent_out + spent:
+            return None
+        return spent
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def extract_fill(
     tx: dict,
     owner: str,
@@ -350,6 +483,9 @@ def extract_fill(
     owner's persistent wSOL token-balance delta is used when positive;
     otherwise native SOL proceeds are derived by ``_native_sol_proceeds``
     (temporary wSOL account closed in the same transaction) or left None.
+    For SOL input the same order applies on the input side: the persistent
+    wSOL delta, else the exact principal from ``_native_sol_spent``, else
+    the fee-adjusted lamport drop (``_native_delta``, may include rent).
     """
     meta = tx.get("meta")
     if not isinstance(meta, dict):
@@ -401,6 +537,15 @@ def extract_fill(
                 record.actual_in_amount = delta
                 record.in_decimals = 9
         if record.actual_in_amount is None:
+            # Exact swap principal (excludes fee and new-account rent) when
+            # the parsed instructions and lamport balances prove it.
+            spent = _native_sol_spent(tx, owner)
+            if spent is not None:
+                record.actual_in_amount = spent
+                record.in_decimals = 9
+        if record.actual_in_amount is None:
+            # Fallback: owner lamport drop minus fee. It can over-state the
+            # principal by new-account rent, never under-state it.
             native = _native_delta(tx, owner, fee_lamports or 0)
             if native:
                 record.actual_in_amount = native

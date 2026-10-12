@@ -102,7 +102,11 @@ class Portfolio:
     def __init__(self):
         self.positions: dict[str, Position] = {}
         self.realized_pnl: float = 0.0
-        self.pending_intents: list[dict] = []
+        self.pending_intents: list[dict] = []   # live SELL intents
+        # Live BUY intents (armed entries), kept apart from sell intents so no
+        # sell path (freeze, resolver, pruning) ever sees them. Same atomic
+        # state file; absent in legacy state (loads as an empty list).
+        self.buy_intents: list[dict] = []
 
     def open(self, mint: str, symbol: str, entry_price: float,
              size_usd: float, tokens: float, **fill) -> Position:
@@ -190,6 +194,7 @@ class Portfolio:
             "realized_pnl": self.realized_pnl,
             "positions": [p.to_dict() for p in self.positions.values()],
             "pending_intents": list(self.pending_intents),
+            "buy_intents": list(self.buy_intents),
         }
 
     def load_dict(self, d: dict) -> None:
@@ -199,6 +204,8 @@ class Portfolio:
             pos = Position.from_dict(pd)
             self.positions[pos.mint] = pos
         self.pending_intents = list(d.get("pending_intents") or [])
+        raw_buys = d.get("buy_intents")
+        self.buy_intents = list(raw_buys) if isinstance(raw_buys, list) else []
 
     def unrealized_pnl(self, prices: dict[str, float]) -> float:
         total = 0.0
