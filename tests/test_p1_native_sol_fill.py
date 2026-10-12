@@ -111,7 +111,11 @@ def test_real_fixture_temp_account_absent_from_token_balances():
 
 # -- persistent wSOL and token -> token keep existing behaviour ----------------
 
-def test_persistent_wsol_output_uses_token_balance_delta():
+def test_persistent_wsol_delta_accepted_only_when_equal_to_strict_result():
+    # Persistent wSOL fix (Nick @ b9690ee): this used to settle from the
+    # token-balance delta ALONE. Now the strict parser must prove it (the close
+    # removed but balances untouched still reconciles the owner + wSOL group:
+    # 8,656,067) and the non-zero token delta must equal that exactly.
     tx = real()
     remove(tx, find(tx, "closeAccount", account=TEMP))
     bal = lambda amt: {"accountIndex": TEMP_IDX, "mint": SOL, "owner": OWNER,
@@ -121,6 +125,8 @@ def test_persistent_wsol_output_uses_token_balance_delta():
     tx["meta"]["postTokenBalances"].append(bal(OUT_LAMPORTS))
     f = fill(tx)
     assert f.actual_out_amount == OUT_LAMPORTS and f.out_decimals == 9
+    tx["meta"]["postTokenBalances"][-1] = bal(OUT_LAMPORTS + 1)   # delta != strict result
+    assert fill(tx).actual_out_amount is None
 
 
 def test_token_to_token_output_unchanged():
@@ -275,13 +281,31 @@ def test_wrap_inside_sell_fails_closed():
     assert fill(tx).actual_out_amount is None
 
 
-def test_wsol_out_of_owner_account_is_netted():
-    tx = real()  # a later hop moves 1,000 lamports of wSOL out of the temp account
+def test_wsol_out_of_owner_account_outside_route_fails_closed():
+    # Re-review P1: a top-level (non-route) wSOL transfer out of the temp
+    # account reconciles the balance equation but is not provably part of the
+    # swap. It used to be netted (OUT - 1,000); now the fill is not proven.
+    tx = real()
     add_top(tx, "spl-token", "transfer", {"source": TEMP, "destination": "Pool1111",
                                           "authority": OWNER, "amount": "1000"})
     bump_post(tx, OWNER_IDX, -1_000)
-    assert fill(tx).actual_out_amount == OUT_LAMPORTS - 1_000
+    assert fill(tx).actual_out_amount is None
 
+
+def test_wsol_out_of_owner_account_inside_route_fails_closed():
+    # Route-attribution fix (Nick @ 7cc26cb): route membership is not proof.
+    # A sell has exactly one owner wSOL transfer (pool -> owner) and no owner
+    # wSOL outflow; an extra outflow, even as a route CPI, used to be netted
+    # (OUT - 1,000) and is now not provable.
+    tx = real()
+    route = next(g for g in tx["meta"]["innerInstructions"] if g["index"] == 3)
+    route["instructions"].append({"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                                  "parsed": {"type": "transfer", "info": {
+                                      "source": TEMP, "destination": "Pool1111",
+                                      "authority": OWNER, "amount": "1000"}},
+                                  "stackHeight": 2})
+    bump_post(tx, OWNER_IDX, -1_000)
+    assert fill(tx).actual_out_amount is None
 
 def test_unparseable_amount_fails_closed():
     tx = real()

@@ -8,7 +8,7 @@ import time
 from fractions import Fraction
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -73,6 +73,27 @@ def valid_token_decimals(value: object) -> Optional[int]:
     return value
 
 
+def quote_direction_error(quote: object, input_mint: object, output_mint: object) -> Optional[str]:
+    """Why a quote's direction does not match the requested swap, or None.
+
+    The requested ``input_mint`` / ``output_mint`` and the quote's
+    ``inputMint`` / ``outputMint`` must all be non-empty strings, equal
+    pairwise (exact string equality) and the input must differ from the
+    output. Missing, non-string or inconsistent -> refused. Never raises.
+    """
+    if not isinstance(quote, dict):
+        return "quote is not an object"
+    q_in, q_out = quote.get("inputMint"), quote.get("outputMint")
+    for value in (input_mint, output_mint, q_in, q_out):
+        if not isinstance(value, str) or not value:
+            return "quote mints do not match request (missing or not a string)"
+    if q_in != input_mint or q_out != output_mint:
+        return "quote mints do not match request"
+    if q_in == q_out:
+        return "quote input and output mint are the same"
+    return None
+
+
 def swap_quote_error(
     quote: object, input_mint: str, output_mint: str, amount: int,
 ) -> Optional[str]:
@@ -85,10 +106,9 @@ def swap_quote_error(
     present, a positive canonical integer ``otherAmountThreshold`` that does
     not exceed ``outAmount``. Never raises.
     """
-    if not isinstance(quote, dict):
-        return "quote is not an object"
-    if quote.get("inputMint") != input_mint or quote.get("outputMint") != output_mint:
-        return "quote mints do not match request"
+    direction_error = quote_direction_error(quote, input_mint, output_mint)
+    if direction_error is not None:
+        return direction_error
     if "swapMode" in quote and quote["swapMode"] != "ExactIn":
         return "quote is not ExactIn"
     if parse_raw_amount(quote.get("inAmount")) != amount:
@@ -191,6 +211,22 @@ class SwapResult:
     fill_source: Optional[str] = None
 
 
+_DEFAULT_SIGNATURE = "1" * 64   # base58 of 64 zero bytes: an unsigned slot
+
+
+def signed_tx_signature(signed: Any) -> Optional[str]:
+    """The first signature (base58) of a signed transaction: the id the
+    network will know it by. None if missing or the all-zero placeholder."""
+    try:
+        sigs = signed.signatures
+        value = str(sigs[0]) if sigs else ""
+    except Exception:
+        return None
+    if not value or value == _DEFAULT_SIGNATURE:
+        return None
+    return value
+
+
 def _status_from_rpc(value: Any, commitment: str) -> Optional[TransactionStatus]:
     if value is None:
         return None
@@ -249,7 +285,22 @@ class SwapExecutor:
         self.jup = jup or JupiterClient(cfg, self.session)
 
     def swap(self, input_mint: str, output_mint: str, amount: int,
-             *, allocation_usd: Optional[float] = None) -> SwapResult:
+             *, allocation_usd: Optional[float] = None,
+             before_broadcast: Optional[Callable[[str], bool]] = None) -> SwapResult:
+        """Quote, validate and (armed) execute a swap.
+
+        ``before_broadcast`` (every armed swap): called with the exact signature of
+        the signed transaction (its first signature, base58) after signing and
+        before anything is broadcast. Only a return value of ``True`` (the
+        signature is durably saved) allows the broadcast; anything else, or
+        an exception, aborts with nothing sent (the signed bytes are
+        discarded, never re-signed, re-quoted or resent).
+
+        Mandatory for every armed swap (``requires_pre_broadcast_callback``,
+        buys and sells alike): without a callable ``before_broadcast`` it is refused
+        before any quote, signing or broadcast (after the allocation ceiling
+        and SOL-exposure gates, which refuse first).
+        """
         if self.cfg.is_armed and (
             not isinstance(allocation_usd, (int, float))
             or isinstance(allocation_usd, bool)
@@ -270,6 +321,9 @@ class SwapExecutor:
                     status=TransactionStatus.CONFIRMED_FAILURE,
                     error=exposure_error,
                 )
+        missing = self._missing_pre_broadcast_callback(input_mint, before_broadcast)
+        if missing is not None:
+            return missing
         if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
             return SwapResult(
                 ok=False, simulated=not self.cfg.is_armed, in_amount=amount,
@@ -303,6 +357,26 @@ class SwapExecutor:
         return self._execute_live(
             quote, amount, out_amount,
             input_mint=input_mint, output_mint=output_mint,
+            before_broadcast=before_broadcast,
+        )
+
+    def requires_pre_broadcast_callback(self, input_mint: Optional[str]) -> bool:
+        """Armed submissions that must durably save their signature before
+        broadcast: every armed swap, buy (SOL input) and sell alike. The
+        argument is kept for the call sites (it is the validated quote input
+        in ``_execute_live``) but no direction is exempt."""
+        return self.cfg.is_armed
+
+    def _missing_pre_broadcast_callback(self, input_mint, before_broadcast) -> Optional[SwapResult]:
+        if not self.requires_pre_broadcast_callback(input_mint) or callable(before_broadcast):
+            return None
+        side = "buy" if input_mint == SOL_MINT else "sell"
+        log.error("live swap refused before quote/sign: no pre-broadcast signature "
+                  "persistence callback for an armed %s", side)
+        return SwapResult(
+            ok=False, simulated=False, in_amount=0, out_amount=0,
+            status=TransactionStatus.CONFIRMED_FAILURE,
+            error=f"refused: armed {side} without a pre-broadcast persistence callback; nothing sent",
         )
 
     def _armed_sol_exposure_error(self, amount: object, allocation_usd: float) -> Optional[str]:
@@ -342,7 +416,19 @@ class SwapExecutor:
         out_amount: int,
         input_mint: Optional[str] = None,
         output_mint: Optional[str] = None,
+        before_broadcast: Optional[Callable[[str], bool]] = None,
     ) -> SwapResult:
+        # The direction actually executed is the QUOTE's. It must match the
+        # requested mints before anything is loaded, built, signed or sent,
+        # so the caller cannot misclassify a sell as a buy (or vice versa).
+        direction_error = quote_direction_error(quote, input_mint, output_mint)
+        if direction_error is not None:
+            log.error("live swap refused before signing: %s", direction_error)
+            return SwapResult(
+                ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                status=TransactionStatus.CONFIRMED_FAILURE,
+                error=f"refused before signing: {direction_error}",
+            )
         try:
             from solders.keypair import Keypair
             from solders.transaction import VersionedTransaction
@@ -352,6 +438,7 @@ class SwapExecutor:
                 status=TransactionStatus.CONFIRMED_FAILURE,
                 error="solana/solders not installed; cannot trade live",
             )
+        signature: Optional[str] = None   # set once a broadcast may have happened
         try:
             keypair = self._load_keypair(Keypair)
             user_pubkey = str(keypair.pubkey())
@@ -361,6 +448,11 @@ class SwapExecutor:
                     status=TransactionStatus.CONFIRMED_FAILURE,
                     error="signer does not match BURNER_WALLET_PUBKEY",
                 )
+            # Defence in depth for direct callers: the same mandatory-callback
+            # rule as ``swap``, before the transaction is built or signed.
+            missing = self._missing_pre_broadcast_callback(quote["inputMint"], before_broadcast)
+            if missing is not None:
+                return missing
             swap_resp = self.session.post(
                 self.jup.swap_url,
                 json={
@@ -392,7 +484,50 @@ class SwapExecutor:
                     status=TransactionStatus.CONFIRMED_FAILURE, error=version_error,
                 )
             signed = VersionedTransaction(tx.message, [keypair])
-            signature = send_raw_transaction(self.session, self.cfg.rpc_url, bytes(signed))
+            # The transaction's identity on chain is its first signature,
+            # known before broadcast; it never depends on the send response.
+            derived = signed_tx_signature(signed)
+            if derived is None:
+                log.error("live swap refused before broadcast: signed transaction has no "
+                          "usable first signature")
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    status=TransactionStatus.CONFIRMED_FAILURE,
+                    error="refused before broadcast: signed transaction has no signature",
+                )
+            if before_broadcast is not None:
+                try:
+                    durable = before_broadcast(derived) is True
+                except Exception as exc:
+                    log.error("pre-broadcast signature persistence raised: %s", exc)
+                    durable = False
+                if not durable:
+                    log.error("live swap NOT broadcast: signature %s was not durably saved",
+                              derived)
+                    return SwapResult(
+                        ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                        tx_signature=derived, status=TransactionStatus.CONFIRMED_FAILURE,
+                        error="signature not durably saved before broadcast; nothing sent",
+                    )
+            signature = derived
+            try:
+                reported = send_raw_transaction(self.session, self.cfg.rpc_url, bytes(signed))
+            except Exception as exc:
+                # The broadcast may or may not have reached the network: never
+                # resend; resolve by the (already saved) signature.
+                log.error("LIVE swap broadcast outcome unknown for %s: %s", signature, exc)
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    tx_signature=signature, status=TransactionStatus.UNKNOWN,
+                    error=f"broadcast outcome unknown: {exc}",
+                )
+            if reported != signature:
+                log.error("LIVE swap: RPC reported signature %s, signed %s", reported, signature)
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    tx_signature=signature, status=TransactionStatus.UNKNOWN,
+                    error=f"RPC reported a different signature ({reported})",
+                )
             log.info("LIVE swap submitted: %s", signature)
             status = self._confirm_transaction(self.session, signature)
             if status != TransactionStatus.CONFIRMED_SUCCESS:
@@ -417,7 +552,7 @@ class SwapExecutor:
             log.error("LIVE swap failed: %s", exc)
             return SwapResult(
                 ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
-                status=TransactionStatus.UNKNOWN, error=str(exc),
+                tx_signature=signature, status=TransactionStatus.UNKNOWN, error=str(exc),
             )
 
     def _extract_confirmed_fill(

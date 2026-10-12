@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 import types
 
-from bot.chain import extract_fill
+from bot.chain import extract_fill, JUPITER_V6_PROGRAM
 from bot.config import Config
 from bot.jupiter import JupiterClient, SwapExecutor, SwapResult, TransactionStatus
 import bot.main as main_module
@@ -32,32 +32,48 @@ def cfg(**overrides):
 
 def parsed_swap_tx(*, owner=WALLET, out_mint=MINT, out_pre=0, out_post=25_000_000,
                    sol_pre=2_000_000_000, sol_post=1_499_995_000, fee=5_000):
+    # Buy output attribution fix (Nick @ b8a2a95): the bought token must be
+    # provable, so the output arrives as the single pool -> owner
+    # transferChecked CPI of one top-level Jupiter route (SOL in stays
+    # unproven: no wSOL movement is modelled).
+    ata, pool = "OwnerTokenAta11111111111111111111111111111", "PoolTokenAcc11111111111111111111111111111"
+    transfer = {"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "parsed": {"type": "transferChecked", "info": {
+                    "source": pool, "destination": ata, "authority": "PoolAuth", "mint": out_mint,
+                    "tokenAmount": {"amount": str(out_post - out_pre), "decimals": 6}}}}
     return {
-        "transaction": {"message": {"accountKeys": [owner, "Other"]}},
+        "transaction": {"message": {
+            "accountKeys": [owner, ata, pool, JUPITER_V6_PROGRAM],
+            "instructions": [{"programId": JUPITER_V6_PROGRAM, "accounts": [], "data": ""}]}},
         "meta": {
+            "err": None,
             "fee": fee,
-            "preBalances": [sol_pre, 0],
-            "postBalances": [sol_post, 0],
+            "innerInstructions": [{"index": 0, "instructions": [transfer]}],
+            "preBalances": [sol_pre, 2_039_280, 2_039_280, 1],
+            "postBalances": [sol_post, 2_039_280, 2_039_280, 1],
             "preTokenBalances": [{
-                "owner": owner, "mint": out_mint,
+                "accountIndex": 1, "owner": owner, "mint": out_mint,
                 "uiTokenAmount": {"amount": str(out_pre), "decimals": 6, "uiAmount": out_pre / 1e6},
             }],
             "postTokenBalances": [{
-                "owner": owner, "mint": out_mint,
+                "accountIndex": 1, "owner": owner, "mint": out_mint,
                 "uiTokenAmount": {"amount": str(out_post), "decimals": 6, "uiAmount": out_post / 1e6},
             }],
         },
     }
 
-
 def test_extract_fill_uses_token_delta_and_native_sol_principal():
     fill = extract_fill(parsed_swap_tx(), WALLET, SOL_MINT, MINT)
-    assert fill.complete
     assert fill.actual_out_amount == 25_000_000
     assert fill.out_decimals == 6
-    assert fill.actual_in_amount == 500_000_000
-    assert fill.in_decimals == 9
     assert fill.fee_lamports == 5_000
+    # SOL in is accepted only when _native_sol_spent proves the exact
+    # principal; this tx has no parsed instructions, so the old owner
+    # lamport-delta fallback (500_000_000 here) is no longer used and the
+    # fill is incomplete (a live buy stays unresolved). See
+    # tests/test_p1_buy_review_fixes.py.
+    assert fill.actual_in_amount is None and fill.in_decimals is None
+    assert not fill.complete
 
 
 class FakeResponse:
@@ -111,7 +127,8 @@ def install_solders(monkeypatch):
             pass
         def __bytes__(self):
             return b"signed"
-    Versioned = type("VersionedTransaction", (), {"from_bytes": RawTx.from_bytes, "__init__": SignedTx.__init__, "__bytes__": SignedTx.__bytes__})
+    Versioned = type("VersionedTransaction", (), {"from_bytes": RawTx.from_bytes, "__init__": SignedTx.__init__, "__bytes__": SignedTx.__bytes__,
+                                               "signatures": ["sig-fill"]})
     modules = {
         "solders": types.ModuleType("solders"),
         "solders.keypair": types.ModuleType("solders.keypair"),
@@ -133,14 +150,19 @@ def test_live_swap_attaches_getTransaction_fill(monkeypatch):
     session = Phase3Session(parsed_swap_tx())
     executor = SwapExecutor(cfg(), jup=JupiterClient(cfg()), session=session)
     executor._load_keypair = lambda _keypair: types.SimpleNamespace(pubkey=lambda: WALLET)
-    result = executor._execute_live({"outAmount": "1"}, 5, 1, input_mint=SOL_MINT, output_mint=MINT)
+    quote = {"inputMint": SOL_MINT, "outputMint": MINT, "outAmount": "1"}
+    # armed buys carry the pre-broadcast persistence callback (True: durable)
+    result = executor._execute_live(quote, 5, 1, input_mint=SOL_MINT, output_mint=MINT,
+                                    before_broadcast=lambda sig: True)
     assert result.ok
     assert result.status == TransactionStatus.CONFIRMED_SUCCESS
     assert result.tx_signature == "sig-fill"
     assert result.actual_out_amount == 25_000_000
-    assert result.actual_in_amount == 500_000_000
+    # unproven SOL principal (no parsed instructions): no actual_in, fill
+    # incomplete -> the entry path records nothing (stays unresolved)
+    assert result.actual_in_amount is None
     assert result.fee_lamports == 5_000
-    assert result.fill_source == "getTransaction"
+    assert result.fill_source is None
 
 
 def test_live_entry_opens_from_confirmed_raw_fill_and_persists_full_record(monkeypatch):
@@ -159,11 +181,11 @@ def test_live_entry_opens_from_confirmed_raw_fill_and_persists_full_record(monke
         fill_source="getTransaction",
     ))
     bot.notifier = types.SimpleNamespace(buy=lambda *args: None)
-    bot._usd_to_lamports = lambda _usd: 1
+    bot._usd_to_lamports = lambda _usd: 500_000_000   # the fill's SOL in may not exceed this
     bot._sell_route_ok = lambda _mint, _lamports: True  # gate tested in test_p1_sellability
     bot._reconciliation_required = False
     saved = []
-    bot._save = lambda: saved.append(True)
+    bot._save = lambda: saved.append(True) or True
     bot._seek_entry()
     pos = bot.portfolio.positions[MINT]
     assert pos.tokens == 25.0
@@ -174,7 +196,11 @@ def test_live_entry_opens_from_confirmed_raw_fill_and_persists_full_record(monke
     assert pos.actual_in_amount == 500_000_000
     assert pos.fee_lamports == 5000
     assert pos.token_decimals == 6
-    assert saved == [True]
+    assert pos.raw_tokens == pos.raw_tokens_initial == 25_000_000
+    # intent (before quote/sign), fill evidence, then position + settled (one write)
+    assert len(saved) == 3
+    (intent,) = bot.portfolio.buy_intents
+    assert intent["status"] == "settled" and intent["tx_signature"] == "sig-fill"
 
 
 def test_live_sell_without_settlement_does_not_reduce_position():

@@ -143,7 +143,8 @@ def install_fake_live_modules(monkeypatch, status):
     Versioned = type(
         "VersionedTransaction",
         (),
-        {"from_bytes": RawTx.from_bytes, "__init__": SignedTx.__init__, "__bytes__": SignedTx.__bytes__},
+        {"from_bytes": RawTx.from_bytes, "__init__": SignedTx.__init__, "__bytes__": SignedTx.__bytes__,
+         "signatures": ["sig"]},
     )
     modules = {
         "solders": types.ModuleType("solders"),
@@ -171,7 +172,11 @@ def run_live_execution(monkeypatch, status, tx=None):
     session = FakeSession(status=status_value, tx=tx, status_error=status_error)
     executor = SwapExecutor(cfg(), jup=JupiterClient(cfg()), session=session)
     executor._load_keypair = lambda _keypair: types.SimpleNamespace(pubkey=lambda: "PUBKEY")
-    return executor._execute_live({"outAmount": "10"}, 5, 10)
+    # an armed sell with a direction-consistent quote and a durable pre-broadcast callback
+    token, sol = "Mint111111111111111111111111111111111111111", "So11111111111111111111111111111111111111112"
+    quote = {"inputMint": token, "outputMint": sol, "outAmount": "10"}
+    return executor._execute_live(quote, 5, 10, input_mint=token, output_mint=sol,
+                                  before_broadcast=lambda sig: True)
 
 
 def test_submission_signature_but_confirmation_failure_is_not_success(monkeypatch):

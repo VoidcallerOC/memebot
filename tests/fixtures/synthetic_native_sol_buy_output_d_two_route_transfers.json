@@ -1,0 +1,453 @@
+{
+ "_source": {
+  "derived_from": "synthetic_native_sol_buy.json",
+  "derived_from_sha256": "8d857dfaa4d0c86ab5019806dda03fbf7b1948b5bf72c1f69b4c85bbf3ca7bd6",
+  "kind": "SYNTHETIC",
+  "note": "SYNTHETIC derivation, NOT a real on-chain transaction. Base synthetic buy with the single pool -> owner SynthBuyMint transferChecked split into two route CPIs of 2,100,000,000 each (same total, balances unchanged).",
+  "variant": "d_two_route_transfers"
+ },
+ "result": {
+  "blockTime": 1800000000,
+  "meta": {
+   "computeUnitsConsumed": 120000,
+   "err": null,
+   "fee": 15000,
+   "innerInstructions": [
+    {
+     "index": 1,
+     "instructions": [
+      {
+       "parsed": {
+        "info": {
+         "lamports": 2039280,
+         "newAccount": "SynthTokenAta111111111111111111111111111111",
+         "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+         "source": "SynthOwner111111111111111111111111111111111",
+         "space": 165
+        },
+        "type": "createAccount"
+       },
+       "program": "system",
+       "programId": "11111111111111111111111111111111",
+       "stackHeight": null
+      },
+      {
+       "parsed": {
+        "info": {
+         "account": "SynthTokenAta111111111111111111111111111111"
+        },
+        "type": "initializeImmutableOwner"
+       },
+       "program": "spl-token",
+       "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+       "stackHeight": null
+      },
+      {
+       "parsed": {
+        "info": {
+         "account": "SynthTokenAta111111111111111111111111111111",
+         "mint": "SynthBuyMint1111111111111111111111111111111",
+         "owner": "SynthOwner111111111111111111111111111111111"
+        },
+        "type": "initializeAccount3"
+       },
+       "program": "spl-token",
+       "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+       "stackHeight": null
+      }
+     ]
+    },
+    {
+     "index": 2,
+     "instructions": [
+      {
+       "parsed": {
+        "info": {
+         "lamports": 2039280,
+         "newAccount": "SynthWsolAta1111111111111111111111111111111",
+         "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+         "source": "SynthOwner111111111111111111111111111111111",
+         "space": 165
+        },
+        "type": "createAccount"
+       },
+       "program": "system",
+       "programId": "11111111111111111111111111111111",
+       "stackHeight": null
+      },
+      {
+       "parsed": {
+        "info": {
+         "account": "SynthWsolAta1111111111111111111111111111111"
+        },
+        "type": "initializeImmutableOwner"
+       },
+       "program": "spl-token",
+       "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+       "stackHeight": null
+      },
+      {
+       "parsed": {
+        "info": {
+         "account": "SynthWsolAta1111111111111111111111111111111",
+         "mint": "So11111111111111111111111111111111111111112",
+         "owner": "SynthOwner111111111111111111111111111111111"
+        },
+        "type": "initializeAccount3"
+       },
+       "program": "spl-token",
+       "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+       "stackHeight": null
+      }
+     ]
+    },
+    {
+     "index": 5,
+     "instructions": [
+      {
+       "parsed": {
+        "info": {
+         "authority": "SynthOwner111111111111111111111111111111111",
+         "destination": "SynthPoolWso1111111111111111111111111111111",
+         "mint": "So11111111111111111111111111111111111111112",
+         "source": "SynthWsolAta1111111111111111111111111111111",
+         "tokenAmount": {
+          "amount": "13333333",
+          "decimals": 9
+         }
+        },
+        "type": "transferChecked"
+       },
+       "program": "spl-token",
+       "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+       "stackHeight": null
+      },
+      {
+       "parsed": {
+        "info": {
+         "authority": "SynthPoolAuth111111111111111111111111111111",
+         "destination": "SynthTokenAta111111111111111111111111111111",
+         "mint": "SynthBuyMint1111111111111111111111111111111",
+         "source": "SynthPoolTok1111111111111111111111111111111",
+         "tokenAmount": {
+          "amount": "2100000000",
+          "decimals": 6,
+          "uiAmount": 2100.0,
+          "uiAmountString": "2100.0"
+         }
+        },
+        "type": "transferChecked"
+       },
+       "program": "spl-token",
+       "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+       "stackHeight": null
+      },
+      {
+       "parsed": {
+        "info": {
+         "authority": "SynthPoolAuth111111111111111111111111111111",
+         "destination": "SynthTokenAta111111111111111111111111111111",
+         "mint": "SynthBuyMint1111111111111111111111111111111",
+         "source": "SynthPoolTok1111111111111111111111111111111",
+         "tokenAmount": {
+          "amount": "2100000000",
+          "decimals": 6,
+          "uiAmount": 2100.0,
+          "uiAmountString": "2100.0"
+         }
+        },
+        "type": "transferChecked"
+       },
+       "program": "spl-token",
+       "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+       "stackHeight": null
+      }
+     ]
+    }
+   ],
+   "loadedAddresses": {
+    "readonly": [],
+    "writable": []
+   },
+   "logMessages": [],
+   "postBalances": [
+    984612387,
+    0,
+    2039280,
+    5015372613,
+    2039280,
+    0,
+    1461600,
+    1169280,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "postTokenBalances": [
+    {
+     "accountIndex": 2,
+     "mint": "SynthBuyMint1111111111111111111111111111111",
+     "owner": "SynthOwner111111111111111111111111111111111",
+     "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+     "uiTokenAmount": {
+      "amount": "4200000000",
+      "decimals": 6,
+      "uiAmount": 4200.0,
+      "uiAmountString": "4200.0"
+     }
+    },
+    {
+     "accountIndex": 3,
+     "mint": "So11111111111111111111111111111111111111112",
+     "owner": "SynthPoolAuth111111111111111111111111111111",
+     "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+     "uiTokenAmount": {
+      "amount": "5013333333",
+      "decimals": 9,
+      "uiAmount": 5.013333333,
+      "uiAmountString": "5.013333333"
+     }
+    },
+    {
+     "accountIndex": 4,
+     "mint": "SynthBuyMint1111111111111111111111111111111",
+     "owner": "SynthPoolAuth111111111111111111111111111111",
+     "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+     "uiTokenAmount": {
+      "amount": "999995800000000",
+      "decimals": 6,
+      "uiAmount": 999995800.0,
+      "uiAmountString": "999995800.0"
+     }
+    }
+   ],
+   "preBalances": [
+    1000000000,
+    0,
+    0,
+    5002039280,
+    2039280,
+    0,
+    1461600,
+    1169280,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "preTokenBalances": [
+    {
+     "accountIndex": 3,
+     "mint": "So11111111111111111111111111111111111111112",
+     "owner": "SynthPoolAuth111111111111111111111111111111",
+     "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+     "uiTokenAmount": {
+      "amount": "5000000000",
+      "decimals": 9,
+      "uiAmount": 5.0,
+      "uiAmountString": "5.0"
+     }
+    },
+    {
+     "accountIndex": 4,
+     "mint": "SynthBuyMint1111111111111111111111111111111",
+     "owner": "SynthPoolAuth111111111111111111111111111111",
+     "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+     "uiTokenAmount": {
+      "amount": "1000000000000000",
+      "decimals": 6,
+      "uiAmount": 1000000000.0,
+      "uiAmountString": "1000000000.0"
+     }
+    }
+   ],
+   "status": {
+    "Ok": null
+   }
+  },
+  "slot": 300000000,
+  "transaction": {
+   "message": {
+    "accountKeys": [
+     {
+      "pubkey": "SynthOwner111111111111111111111111111111111",
+      "signer": true,
+      "source": "transaction",
+      "writable": true
+     },
+     {
+      "pubkey": "SynthWsolAta1111111111111111111111111111111",
+      "signer": false,
+      "source": "transaction",
+      "writable": true
+     },
+     {
+      "pubkey": "SynthTokenAta111111111111111111111111111111",
+      "signer": false,
+      "source": "transaction",
+      "writable": true
+     },
+     {
+      "pubkey": "SynthPoolWso1111111111111111111111111111111",
+      "signer": false,
+      "source": "transaction",
+      "writable": true
+     },
+     {
+      "pubkey": "SynthPoolTok1111111111111111111111111111111",
+      "signer": false,
+      "source": "transaction",
+      "writable": true
+     },
+     {
+      "pubkey": "SynthPoolAuth111111111111111111111111111111",
+      "signer": false,
+      "source": "transaction",
+      "writable": false
+     },
+     {
+      "pubkey": "SynthBuyMint1111111111111111111111111111111",
+      "signer": false,
+      "source": "transaction",
+      "writable": false
+     },
+     {
+      "pubkey": "So11111111111111111111111111111111111111112",
+      "signer": false,
+      "source": "transaction",
+      "writable": false
+     },
+     {
+      "pubkey": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "signer": false,
+      "source": "transaction",
+      "writable": false
+     },
+     {
+      "pubkey": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+      "signer": false,
+      "source": "transaction",
+      "writable": false
+     },
+     {
+      "pubkey": "11111111111111111111111111111111",
+      "signer": false,
+      "source": "transaction",
+      "writable": false
+     },
+     {
+      "pubkey": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+      "signer": false,
+      "source": "transaction",
+      "writable": false
+     },
+     {
+      "pubkey": "ComputeBudget111111111111111111111111111111",
+      "signer": false,
+      "source": "transaction",
+      "writable": false
+     }
+    ],
+    "addressTableLookups": [],
+    "instructions": [
+     {
+      "accounts": [],
+      "data": "3DdGGhkhJbjm",
+      "programId": "ComputeBudget111111111111111111111111111111",
+      "stackHeight": null
+     },
+     {
+      "parsed": {
+       "info": {
+        "account": "SynthTokenAta111111111111111111111111111111",
+        "mint": "SynthBuyMint1111111111111111111111111111111",
+        "source": "SynthOwner111111111111111111111111111111111",
+        "systemProgram": "11111111111111111111111111111111",
+        "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "wallet": "SynthOwner111111111111111111111111111111111"
+       },
+       "type": "createIdempotent"
+      },
+      "program": "spl-associated-token-account",
+      "programId": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+      "stackHeight": null
+     },
+     {
+      "parsed": {
+       "info": {
+        "account": "SynthWsolAta1111111111111111111111111111111",
+        "mint": "So11111111111111111111111111111111111111112",
+        "source": "SynthOwner111111111111111111111111111111111",
+        "systemProgram": "11111111111111111111111111111111",
+        "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "wallet": "SynthOwner111111111111111111111111111111111"
+       },
+       "type": "createIdempotent"
+      },
+      "program": "spl-associated-token-account",
+      "programId": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+      "stackHeight": null
+     },
+     {
+      "parsed": {
+       "info": {
+        "destination": "SynthWsolAta1111111111111111111111111111111",
+        "lamports": 13333333,
+        "source": "SynthOwner111111111111111111111111111111111"
+       },
+       "type": "transfer"
+      },
+      "program": "system",
+      "programId": "11111111111111111111111111111111",
+      "stackHeight": null
+     },
+     {
+      "parsed": {
+       "info": {
+        "account": "SynthWsolAta1111111111111111111111111111111"
+       },
+       "type": "syncNative"
+      },
+      "program": "spl-token",
+      "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "stackHeight": null
+     },
+     {
+      "accounts": [
+       "SynthOwner111111111111111111111111111111111",
+       "SynthWsolAta1111111111111111111111111111111",
+       "SynthPoolWso1111111111111111111111111111111",
+       "SynthPoolTok1111111111111111111111111111111",
+       "SynthTokenAta111111111111111111111111111111",
+       "SynthPoolAuth111111111111111111111111111111"
+      ],
+      "data": "SynthRouteData",
+      "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+      "stackHeight": null
+     },
+     {
+      "parsed": {
+       "info": {
+        "account": "SynthWsolAta1111111111111111111111111111111",
+        "destination": "SynthOwner111111111111111111111111111111111",
+        "owner": "SynthOwner111111111111111111111111111111111"
+       },
+       "type": "closeAccount"
+      },
+      "program": "spl-token",
+      "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "stackHeight": null
+     }
+    ],
+    "recentBlockhash": "SynthBlockhash11111111111111111111111111111"
+   },
+   "signatures": [
+    "SYNTHETIC_SIGNATURE_PLACEHOLDER"
+   ]
+  },
+  "version": 0
+ }
+}

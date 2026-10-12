@@ -147,6 +147,8 @@ def boundary(monkeypatch):
     events = []
 
     class SpySigned:
+        signatures = ["sig-test"]   # what the signed tx is known by on chain
+
         def __bytes__(self):
             return b"spy-signed"
 
@@ -176,7 +178,10 @@ def boundary(monkeypatch):
 
 
 def run(ex):
-    return ex._execute_live({"outAmount": "10"}, 5, 10, input_mint=MINT, output_mint=SOL_MINT)
+    # an armed sell must carry a pre-broadcast persistence callback (True: durable)
+    quote = {"inputMint": MINT, "outputMint": SOL_MINT, "outAmount": "10"}
+    return ex._execute_live(quote, 5, 10, input_mint=MINT, output_mint=SOL_MINT,
+                            before_broadcast=lambda sig: True)
 
 
 @pytest.mark.parametrize("build, kind", [(legacy_tx, "Message"), (v0_tx, "MessageV0")])

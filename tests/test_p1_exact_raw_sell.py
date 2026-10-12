@@ -20,6 +20,8 @@ from fractions import Fraction
 
 import pytest
 
+from tests.test_p1_stuck_sell_intents import sell_tx
+
 import bot.main as main_module
 from bot.jupiter import SOL_MINT, SwapResult, TransactionStatus
 from bot.portfolio import Portfolio, Position
@@ -79,10 +81,10 @@ def test_entry_seeds_raw_holding_from_verified_fill():
         status=TransactionStatus.CONFIRMED_SUCCESS, actual_in_amount=10**8,
         actual_out_amount=123_456_789, fee_lamports=5000, in_decimals=9, out_decimals=8))
     bot.notifier = types.SimpleNamespace(buy=lambda *a: None)
-    bot._usd_to_lamports = lambda _usd: 1
+    bot._usd_to_lamports = lambda _usd: 10**8   # the fill's SOL in may not exceed this
     bot._sell_route_ok = lambda _m, _l: True
     bot._reconciliation_required = False
-    bot._save = lambda: None
+    bot._save = lambda: True                     # armed entries need durable saves
     bot._seek_entry()
     pos = bot.portfolio.positions[MINT]
     assert getattr(pos, "raw_tokens", None) == 123_456_789
@@ -204,16 +206,9 @@ def test_delayed_settlement_decrements_exactly_once(env):
     bot._tick()
     assert pos.raw_tokens == 123_456_789          # unknown: no decrement
     env.chain.status["sig-1"] = {"err": None, "confirmationStatus": "confirmed"}
-    env.chain.txs["sig-1"] = {
-        "transaction": {"message": {"accountKeys": ["WalletPubkey1111111111111111111111111111111"]}},
-        "meta": {"err": None, "fee": 5000, "innerInstructions": [],
-                 "preTokenBalances": [{"owner": "WalletPubkey1111111111111111111111111111111", "mint": MINT,
-                                       "uiTokenAmount": {"amount": "123456789", "decimals": 8}}],
-                 "postTokenBalances": [{"owner": "WalletPubkey1111111111111111111111111111111", "mint": MINT,
-                                        "uiTokenAmount": {"amount": "61728395", "decimals": 8}},
-                                       {"owner": "WalletPubkey1111111111111111111111111111111", "mint": SOL_MINT,
-                                        "uiTokenAmount": {"amount": "5000000", "decimals": 9}}],
-                 "preBalances": [10**9], "postBalances": [10**9]}}
+    # strictly provable persistent-wSOL sell (see test_p1_stuck_sell_intents.sell_tx)
+    env.chain.txs["sig-1"] = sell_tx(mint=MINT, token_pre=123_456_789, token_post=61_728_395,
+                                     wsol_out=5_000_000, owner="WalletPubkey1111111111111111111111111111111")
     for _ in range(3):
         bot._tick()
     assert intents(bot) == [(MINT, "settled")]

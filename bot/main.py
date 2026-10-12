@@ -28,7 +28,7 @@ from .chain import (
 )
 from .config import Config, load_config
 from .jupiter import (
-    JupiterClient, LAMPORTS_PER_SOL, SOL_MINT, USDC_MINT, USDC_RAW_PER_USD,
+    MAX_EXPERIMENT_USD, JupiterClient, LAMPORTS_PER_SOL, SOL_MINT, USDC_MINT, USDC_RAW_PER_USD,
     SwapExecutor, TransactionStatus, parse_raw_amount, sol_usdc_raw_per_sol,
     valid_token_decimals,
 )
@@ -159,11 +159,61 @@ def exact_raw_sell_amount(pos, fraction: object) -> tuple[int | None, str]:
 # stop stop-loss / take-profit management of other positions.
 OPEN_SELL_INTENT_STATUSES = frozenset({"pending", "unresolved", "blocked", "confirmed_unbooked"})
 TERMINAL_SELL_INTENTS_KEPT = 50
+
+
+def _rung_value(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _take_profit_rung(reason: object) -> float | None:
+    """The ladder gain-target of a ``take_profit:<gain>`` reason, else None."""
+    if not isinstance(reason, str) or not reason.startswith("take_profit:"):
+        return None
+    try:
+        return _rung_value(float(reason.split(":", 1)[1]))
+    except ValueError:
+        return None
+
+
+def _intent_rung(intent: dict) -> float | None:
+    """The take-profit rung a sell intent is for. New intents carry
+    ``rung``; a legacy intent (created when rungs were consumed at the
+    threshold, so its rung is already marked) falls back to its reason, which
+    only re-adds the same rung (idempotent)."""
+    rung = _rung_value(intent.get("rung"))
+    return rung if rung is not None else _take_profit_rung(intent.get("reason"))
 # A Solana transaction's recent blockhash is valid for 150 slots (~60-90 s;
 # solana.com docs "Transactions" / "Confirmation & Expiration"). After this
 # conservative wall-clock window an unconfirmed transaction can no longer land,
 # so an unchanged on-chain balance is evidence the sell did not execute.
 SELL_INTENT_EXPIRY_SECONDS = 300
+
+# Live buy intents (armed entries only; ``portfolio.buy_intents``). A buy
+# intent is durably saved BEFORE the entry is quoted or signed, and its exact
+# signature is durably saved before the broadcast. Statuses (see
+# ``TradingBot._live_entry`` / ``_resolve_buy_intents``):
+#   pending     saved before quote/sign; still pending only after a crash
+#   unresolved  sent or possibly sent, outcome not proven (timeout, lost
+#               response, unknown, confirmed without a verifiable fill)
+#   confirmed_unrecorded
+#               the buy is proven on chain and its verified fill evidence is
+#               persisted, but the position is not yet; recorded exactly once
+#               from that stored evidence (also at startup) with no chain lookup
+#   failed      terminal: evidence shows the buy did NOT execute (refused
+#               before broadcast, failed on chain, or expired unconfirmed with
+#               none of the token in the wallet); a later entry is a new intent
+#   settled     terminal: the position (raw holding from the verified fill)
+#               and this status were persisted in the same atomic write
+# Policy: while ANY buy intent is open, ALL new entries are blocked (its SOL
+# exposure and position count are uncertain, so the exposure cap cannot be
+# trusted) and its mint is frozen for entries. Exit management of existing
+# positions continues. A missing signature never proves non-execution.
+OPEN_BUY_INTENT_STATUSES = frozenset({"pending", "unresolved", "confirmed_unrecorded"})
+TERMINAL_BUY_INTENTS_KEPT = 50
+BUY_INTENT_EXPIRY_SECONDS = SELL_INTENT_EXPIRY_SECONDS
 
 
 # Pre-buy sellability gate: the slippage-adjusted SOL -> token -> SOL round
@@ -328,6 +378,30 @@ class TradingBot:
                 "decision shadow ENABLED (dry-run journal/gate only; never authorizes live)"
             )
         load_state(cfg.state_file, self.portfolio, self.risk)
+        if cfg.is_armed:
+            self._flag_unverified_rungs()
+
+    def _flag_unverified_rungs(self) -> None:
+        """Legacy policy. State written before rungs were tied to bookings
+        could mark a rung filled at the threshold although its sale never
+        happened (crash, refusal, failure); it is indistinguishable from a
+        sold rung. Such a rung is KEPT filled (never re-sold automatically:
+        that could sell twice) and flagged for operator review. A rung is
+        verified when a settled intent for it is on record."""
+        settled = {
+            (i.get("mint"), _intent_rung(i))
+            for i in getattr(self.portfolio, "pending_intents", None) or []
+            if isinstance(i, dict) and i.get("status") == "settled"
+        }
+        for mint, pos in self.portfolio.positions.items():
+            for rung in sorted(getattr(pos, "ladder_filled", None) or ()):
+                if (mint, _rung_value(rung)) not in settled:
+                    log.warning(
+                        "%s: take-profit rung %g is marked filled without a settled sale on "
+                        "record (legacy state or pruned history); kept filled, NOT re-sold; "
+                        "operator review: compare with on-chain history",
+                        getattr(pos, "symbol", str(mint)[:8]), rung,
+                    )
 
     def stop(self, *_):
         log.info("Kill switch received — shutting down after this tick.")
@@ -341,6 +415,10 @@ class TradingBot:
             log.error("live startup blocked: durable state saves (directory fsync) are "
                       "not supported on this platform")
             return
+        corrupt = self._corrupt_state_reason()
+        if corrupt and self.cfg.is_armed:
+            log.error("live startup blocked: %s", corrupt)
+            return
         mode = "LIVE — REAL MONEY" if self.cfg.is_armed else "DRY-RUN"
         if self.notifier.enabled:
             self.notifier.startup(mode)
@@ -349,6 +427,11 @@ class TradingBot:
                 # Settle/clear persisted intents on evidence first, so a sell
                 # that landed before a restart is booked, not left as drift.
                 self._resolve_sell_intents()
+            if self._open_buy_intents():
+                # Likewise for entries: a buy that landed before a restart is
+                # recorded as a position (exactly once) before reconciliation
+                # judges the wallet, so it is not reported as untracked drift.
+                self._resolve_buy_intents()
             reconciliation = reconcile_wallet(
                 self.cfg, self.portfolio, self.session, self.notifier
             )
@@ -367,7 +450,22 @@ class TradingBot:
         self._save()
         self._summary()
 
+    def _corrupt_state_reason(self) -> str | None:
+        """Operator-facing reason when persisted intents failed validation
+        (``Portfolio.corrupt``), else None. Their raw data is preserved."""
+        corrupt = getattr(self.portfolio, "corrupt", None) or {}
+        if not corrupt:
+            return None
+        return "; ".join(f"{name} corrupt ({why}): state recovery required"
+                         for name, why in sorted(corrupt.items()))
+
     def _tick(self) -> None:
+        corrupt = self._corrupt_state_reason()
+        if corrupt and self.cfg.is_armed:
+            # Never trade armed on state whose intents cannot be trusted.
+            log.error("trading halted: %s", corrupt)
+            self._running = False
+            return
         if self._open_sell_intents():
             if not self.cfg.is_armed:
                 log.error(
@@ -378,6 +476,16 @@ class TradingBot:
                 self._running = False
                 return
             self._resolve_sell_intents()
+        if self._open_buy_intents():
+            if not self.cfg.is_armed:
+                log.error(
+                    "trading halted: %d persisted live buy intent(s) need an armed "
+                    "session to resolve against the chain; operator action required",
+                    len(self._open_buy_intents()),
+                )
+                self._running = False
+                return
+            self._resolve_buy_intents()
         if self._reconciliation_required:
             reconciliation = reconcile_wallet(
                 self.cfg, self.portfolio, self.session, self.notifier
@@ -394,6 +502,18 @@ class TradingBot:
             log.error(
                 "new entries blocked: %d unresolved live sell intent(s) (%s)",
                 len(still_open), ", ".join(sorted({str(i.get("mint"))[:8] for i in still_open})),
+            )
+            return
+        if corrupt:
+            # Paper: exits still simulated above; no new entries (conservative).
+            log.error("new entries blocked: %s", corrupt)
+            return
+        open_buys = self._open_buy_intents()
+        if open_buys:
+            log.error(
+                "new entries blocked: %d unresolved live buy intent(s) (%s); SOL exposure "
+                "uncertain until resolved on evidence",
+                len(open_buys), ", ".join(sorted({str(i.get("mint"))[:8] for i in open_buys})),
             )
             return
         if self.risk.can_open_new_position(self.portfolio.open_count):
@@ -431,14 +551,27 @@ class TradingBot:
                     )
                 continue
             for action in self.risk.evaluate_exit(pos.entry_price, price, pos.ladder_filled):
-                if action.reason.startswith("take_profit:"):
-                    target = float(action.reason.split(":")[1])
-                    pos.ladder_filled.add(target)
-                self._sell(mint, action.fraction, price, action.reason)
+                # A take-profit rung is NOT consumed here: it is marked filled
+                # only together with the sale's booking (paper: after the
+                # accounting; live: in the settlement's atomic save). Until
+                # then a failed / refused sell leaves it eligible, and an
+                # unresolved one freezes the mint (no second sell).
+                self._sell(mint, action.fraction, price, action.reason,
+                           rung=_take_profit_rung(action.reason))
 
     def _seek_entry(self) -> None:
+        corrupt = self._corrupt_state_reason()
+        if corrupt:  # paper and armed alike: no new entry on untrusted state
+            log.error("entry search refused: %s", corrupt)
+            return
         for candidate in self.strategy.find_candidates():
             if self.portfolio.has(candidate.mint):
+                continue
+            if self._buy_frozen(candidate.mint):
+                # Defence in depth (all entries are blocked while a buy intent
+                # is open): never a second buy of a mint whose buy is unresolved.
+                log.error("entry skipped for %s: an unresolved live buy of this mint exists",
+                          str(candidate.mint)[:8])
                 continue
             # One DexScreener TokenSnapshot per candidate for safety + decision parity.
             market_snap = self._candidate_market_snapshot(candidate.mint)
@@ -490,65 +623,23 @@ class TradingBot:
                     safety.symbol,
                 )
                 continue
+            if self.cfg.is_armed:
+                # Durable buy intent + pre-broadcast signature; the position is
+                # recorded only from a verified fill, atomically with the intent.
+                if self._live_entry(candidate.mint, safety, size_usd, lamports) == "next":
+                    continue
+                return
             result = self.executor.swap(
                 SOL_MINT, candidate.mint, lamports,
                 allocation_usd=size_usd,
             )
             if not result.ok:
                 log.info("entry aborted for %s: %s", safety.symbol, result.error)
-                if self.cfg.is_armed and result.status in {
-                    TransactionStatus.SUBMITTED,
-                    TransactionStatus.TIMEOUT,
-                    TransactionStatus.UNKNOWN,
-                }:
-                    self._reconciliation_required = True
-                    log.error("live entry unresolved; new entries require reconciliation")
                 continue
-            if self.cfg.is_armed and result.status != TransactionStatus.CONFIRMED_SUCCESS:
-                log.error("live entry was not confirmed; no position recorded")
-                return
-            if self.cfg.is_armed and (
-                result.actual_in_amount is None or result.actual_out_amount is None
-            ):
-                self._reconciliation_required = True
-                log.error("confirmed live entry lacks actual fill data; no position recorded")
-                return
-            if self.cfg.is_armed:
-                # Decimals come from the confirmed fill, else the screener's
-                # verified mint fetch; they are never guessed.
-                decimals = valid_token_decimals(result.out_decimals)
-                if decimals is None:
-                    decimals = valid_token_decimals(getattr(safety, "decimals", None))
-                if decimals is None:
-                    self._reconciliation_required = True
-                    log.error("confirmed live entry has unverified token decimals; no position recorded")
-                    return
-                if not is_raw_units(result.actual_out_amount):
-                    self._reconciliation_required = True
-                    log.error("confirmed live entry fill raw output is not an integer in "
-                              "1..2**64-1; no position recorded")
-                    return
-                tokens = result.actual_out_amount / (10 ** decimals)
-                if tokens <= 0:
-                    self._reconciliation_required = True
-                    log.error("confirmed live entry produced a zero fill")
-                    return
-                entry_price = size_usd / tokens
-                self.portfolio.open(
-                    candidate.mint, safety.symbol, entry_price, size_usd, tokens,
-                    token_decimals=decimals,
-                    entry_signature=result.tx_signature,
-                    actual_in_amount=result.actual_in_amount,
-                    actual_out_amount=result.actual_out_amount,
-                    fee_lamports=result.fee_lamports,
-                    raw_tokens=result.actual_out_amount,
-                    raw_tokens_initial=result.actual_out_amount,
-                )
-            else:
-                self.portfolio.open(
-                    candidate.mint, safety.symbol, safety.price_usd, size_usd, tokens,
-                    token_decimals=valid_token_decimals(getattr(safety, "decimals", None)),
-                )
+            self.portfolio.open(
+                candidate.mint, safety.symbol, safety.price_usd, size_usd, tokens,
+                token_decimals=valid_token_decimals(getattr(safety, "decimals", None)),
+            )
             opened = self.portfolio.positions[candidate.mint]
             self.notifier.buy(safety.symbol, size_usd, opened.entry_price, result.simulated)
             self._save()
@@ -581,7 +672,8 @@ class TradingBot:
             log.debug("holder attach failed for %s: %s", mint[:6], exc)
         return snap
 
-    def _sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
+    def _sell(self, mint: str, fraction: float, price: float, reason: str,
+              *, rung: float | None = None) -> None:
         if mint not in self.portfolio.positions:
             return
         pos = self.portfolio.positions[mint]
@@ -597,16 +689,20 @@ class TradingBot:
                 log.error("%s: refusing %s; an earlier live sell is unresolved", symbol, reason)
                 return
             # Settles and books atomically (or leaves an open intent).
-            self._settle_live_sell(pos, fraction, price, reason)
+            self._settle_live_sell(pos, fraction, price, reason, rung=rung)
             return
-        self._book_sell(mint, fraction, price, reason)
+        self._book_sell(mint, fraction, price, reason, rung=rung)
 
-    def _book_sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
-        """Paper-sell accounting (live sells book via ``_book_confirmed_sell``)."""
+    def _book_sell(self, mint: str, fraction: float, price: float, reason: str,
+                   *, rung: float | None = None) -> None:
+        """Paper-sell accounting (live sells book via ``_book_confirmed_sell``).
+        A take-profit ``rung`` is marked filled only after the sell and its
+        accounting succeeded."""
         symbol = self.portfolio.positions[mint].symbol
         was_halted = self.risk.trading_halted()
         pnl = self.portfolio.sell_fraction(mint, fraction, price, reason)
         self.risk.record_realized_pnl(pnl)
+        self._mark_rung_filled(mint, rung)
         self.notifier.sell(symbol, fraction, price, reason, pnl)
         if self.risk.trading_halted() and not was_halted:
             self.notifier.halt(-self.risk.realized_pnl_today)
@@ -644,6 +740,13 @@ class TradingBot:
             self._restore_accounting(snapshot)
             raise
         return symbol, pnl, newly_halted
+
+    def _mark_rung_filled(self, mint, rung) -> None:
+        """Consume a take-profit rung (only once its sale is booked). A fully
+        closed position has no ladder left to mark."""
+        pos = self.portfolio.positions.get(mint)
+        if rung is not None and pos is not None:
+            pos.ladder_filled.add(rung)
 
     def _notify_sell(self, symbol, fraction, price, reason, pnl, newly_halted) -> None:
         self.notifier.sell(symbol, fraction, price, reason, pnl)
@@ -736,6 +839,10 @@ class TradingBot:
         symbol, pnl, newly_halted = self._apply_sell_accounting(
             mint, fraction, price, reason, raw_sold=raw_sold,
         )
+        # The take-profit rung is consumed in the SAME atomic save as the
+        # booking (the snapshot above covers it, so a failed save rolls the
+        # rung back too).
+        self._mark_rung_filled(mint, _intent_rung(intent))
         intent["status"] = "settled"
         intent["booked_at"] = time.time()
         intent["booked_pnl"] = pnl
@@ -752,7 +859,8 @@ class TradingBot:
         self._notify_sell(symbol, fraction, price, reason, pnl, newly_halted)
         return True
 
-    def _settle_live_sell(self, pos, fraction: float, price: float, reason: str) -> bool:
+    def _settle_live_sell(self, pos, fraction: float, price: float, reason: str,
+                          *, rung: float | None = None) -> bool:
         """Submit an armed sell of exactly ``exact_raw_sell_amount`` raw units.
 
         The intent, carrying that exact ``raw_amount``, must be durably saved
@@ -774,6 +882,8 @@ class TradingBot:
             "created_at": time.time(),
             "raw_amount": raw_amount,
         }
+        if rung is not None:
+            intent["rung"] = rung  # consumed only when this intent is booked
         self.portfolio.pending_intents.append(intent)
         durable = self._save()
         if decimals is None or tokens_to_sell <= 0:
@@ -800,13 +910,51 @@ class TradingBot:
             self._save()
             return False
         tokens_to_sell = raw_amount / (10 ** valid_token_decimals(decimals))
+        pre_broadcast = {"refused": False}
+
+        def persist_signature(signature: str) -> bool:
+            """Durably save the signed transaction's exact signature on this
+            intent BEFORE it is broadcast. Only an explicit True from the
+            save allows the broadcast (no placeholders; no key or tx bytes
+            are stored)."""
+            intent["tx_signature"] = signature
+            intent["signed_at"] = time.time()
+            if self._save() is True:
+                return True
+            pre_broadcast["refused"] = True
+            return False
+
         result = self.executor.swap(
             pos.mint, SOL_MINT, raw_amount,
             allocation_usd=min(tokens_to_sell * price, self.cfg.max_position_usd()),
+            before_broadcast=persist_signature,
         )
-        intent["tx_signature"] = result.tx_signature
         intent["outcome"] = getattr(result.status, "value", str(result.status))
         intent["error"] = result.error
+        if pre_broadcast["refused"]:
+            # Signed but NOT broadcast (the bytes were discarded and can never
+            # land). Disk may hold the intent with or without this signature;
+            # either way a restart resolves it on evidence (signature status /
+            # blockhash expiry + unchanged wallet). In memory we know nothing
+            # was sent: the resolver clears it and the exit is re-evaluated
+            # with a NEW intent; this one is kept (with its signature) as audit.
+            intent["status"] = "blocked"
+            intent["error"] = "signature not durably saved before broadcast; nothing sent"
+            log.error("live sell for %s not broadcast: signature not durable", pos.symbol)
+            self._save()
+            return False
+        persisted = intent.get("tx_signature")
+        if persisted and result.tx_signature and result.tx_signature != persisted:
+            # Never replace the saved signature: resolve by it, fail closed.
+            intent["status"] = "unresolved"
+            intent["reported_signature"] = result.tx_signature
+            intent["resolution"] = "executor reported a different signature than was saved"
+            self._reconciliation_required = True
+            log.error("live sell for %s: signature mismatch; frozen", pos.symbol)
+            self._save()
+            return False
+        if not persisted:
+            intent["tx_signature"] = result.tx_signature
         if not result.ok or result.status != TransactionStatus.CONFIRMED_SUCCESS:
             intent["status"] = "unresolved"
             if result.status in {
@@ -840,6 +988,381 @@ class TradingBot:
         self._record_confirmed_fill(intent, result, "confirmed at submit with on-chain fill")
         return self._book_confirmed_sell(intent)
 
+
+    # -- live buy intents ----------------------------------------------------
+
+    def _open_buy_intents(self) -> list:
+        return [
+            intent for intent in getattr(self.portfolio, "buy_intents", None) or []
+            if isinstance(intent, dict) and intent.get("status") in OPEN_BUY_INTENT_STATUSES
+        ]
+
+    def _buy_frozen(self, mint: str) -> bool:
+        return any(intent.get("mint") == mint for intent in self._open_buy_intents())
+
+    def _live_entry(self, mint: str, safety, size_usd: float, lamports: int) -> str:
+        """Submit an armed buy of exactly ``lamports`` behind a durable intent.
+
+        1. The intent (mint, intended lamports, allocation, ``pending``) is
+           durably saved BEFORE the entry is quoted or signed; if that save
+           is not durable nothing is quoted, signed or sent.
+        2. ``before_broadcast`` saves the signed transaction's exact
+           signature on the intent; only ``save_state() is True`` allows the
+           broadcast. Otherwise nothing is sent, nothing is re-quoted,
+           re-signed or resent, and the intent is ``failed`` (audit kept).
+        3. A confirmed, verified fill is persisted as evidence
+           (``confirmed_unrecorded``), then the position (raw holding from
+           the fill) and ``settled`` are written in ONE atomic save.
+        4. A non-definitive outcome (timeout, lost response, unknown,
+           confirmed without a verifiable fill) leaves the intent
+           ``unresolved``: never resent; resolved on evidence by its saved
+           signature; entries stay blocked meanwhile.
+
+        Returns "opened", "next" (definitively not executed; the next
+        candidate may be tried) or "stop" (end this tick's entry search).
+        """
+        corrupt = self._corrupt_state_reason()
+        if corrupt:
+            log.error("live entry refused before quote/sign: %s", corrupt)
+            return "stop"
+        intent = {
+            "side": "buy",
+            "mint": mint,
+            "symbol": safety.symbol,
+            "lamports": lamports,
+            "allocation_usd": size_usd,
+            "screened_decimals": valid_token_decimals(getattr(safety, "decimals", None)),
+            "status": "pending",
+            "tx_signature": None,
+            "created_at": time.time(),
+        }
+        self.portfolio.buy_intents.append(intent)
+        if self._save() is not True:
+            intent["status"] = "failed"
+            intent["error"] = "state save failed before quote/sign; nothing sent"
+            intent["resolved_at"] = time.time()
+            log.error("live entry refused before quote/sign for %s: state not durable",
+                      safety.symbol)
+            self._save()
+            return "stop"
+        pre_broadcast = {"refused": False}
+
+        def persist_signature(signature: str) -> bool:
+            """Durably save the exact signature on this buy intent BEFORE the
+            broadcast; only an explicit True from the save allows it."""
+            intent["tx_signature"] = signature
+            intent["signed_at"] = time.time()
+            if self._save() is True:
+                return True
+            pre_broadcast["refused"] = True
+            return False
+
+        result = self.executor.swap(
+            SOL_MINT, mint, lamports,
+            allocation_usd=size_usd,
+            before_broadcast=persist_signature,
+        )
+        intent["outcome"] = getattr(result.status, "value", str(result.status))
+        intent["error"] = result.error
+        if pre_broadcast["refused"]:
+            # Signed but NOT broadcast: the bytes were discarded and can never
+            # land. If the disk still shows this intent open (with or without
+            # the signature), a restart resolves it on evidence.
+            intent["status"] = "failed"
+            intent["error"] = "signature not durably saved before broadcast; nothing sent"
+            intent["resolved_at"] = time.time()
+            log.error("live entry for %s not broadcast: signature not durable", safety.symbol)
+            self._save()
+            return "stop"
+        persisted = intent.get("tx_signature")
+        if persisted and result.tx_signature and result.tx_signature != persisted:
+            intent["status"] = "unresolved"
+            intent["reported_signature"] = result.tx_signature
+            intent["resolution"] = "executor reported a different signature than was saved"
+            log.error("live entry for %s: signature mismatch; entries blocked", safety.symbol)
+            self._save()
+            return "stop"
+        if not persisted and result.tx_signature:
+            intent["tx_signature"] = result.tx_signature
+        if result.status == TransactionStatus.CONFIRMED_FAILURE and not result.ok:
+            # Definitive: refused before broadcast (no signature) or the
+            # transaction failed on chain. No position; next candidate.
+            intent["status"] = "failed"
+            intent["resolution"] = (
+                "transaction failed on chain" if intent.get("tx_signature")
+                else "refused before send (no transaction)"
+            )
+            intent["resolved_at"] = time.time()
+            log.info("entry aborted for %s: %s", safety.symbol, result.error)
+            self._save()
+            return "next"
+        if not result.ok or result.status != TransactionStatus.CONFIRMED_SUCCESS:
+            intent["status"] = "unresolved"
+            intent["resolution"] = f"outcome not proven ({intent['outcome']}): {result.error}"
+            log.error("live entry for %s unresolved (%s); never resent; entries blocked "
+                      "until resolved on evidence", safety.symbol, result.error or result.status)
+            self._save()
+            return "stop"
+        evidence = self._buy_evidence(
+            result.actual_in_amount, result.actual_out_amount, result.fee_lamports,
+            result.out_decimals, SOL_MINT, mint,
+        )
+        problem = self._buy_fill_problem(dict(intent, **evidence))
+        if problem is not None:
+            intent["status"] = "unresolved"
+            intent["resolution"] = f"confirmed fill does not prove the intended buy: {problem}"
+            log.error("live entry for %s not recorded: %s", safety.symbol, problem)
+            self._save()
+            return "stop"
+        self._record_buy_evidence(intent, evidence, "confirmed at submit with on-chain fill")
+        return "opened" if self._record_confirmed_buy(intent) else "stop"
+
+    @staticmethod
+    def _buy_evidence(actual_in, actual_out, fee, out_decimals, input_mint, output_mint) -> dict:
+        return {
+            "actual_in_amount": actual_in,
+            "actual_out_amount": actual_out,
+            "fee_lamports": fee,
+            "out_decimals": out_decimals,
+            "fill_input_mint": input_mint,
+            "fill_output_mint": output_mint,
+        }
+
+    def _buy_fill_problem(self, intent: dict) -> str | None:
+        """Why stored fill evidence cannot record ``intent`` as a position.
+
+        The fill must be for SOL -> the intent's mint; SOL in an int in
+        ``1 .. lamports`` (never more than the intended, exposure-checked
+        amount; the hard $ ceiling was enforced on it before signing); raw
+        token out an int in ``1 .. 2**64-1``; verified decimals (fill, else
+        the screener's mint fetch); the allocation within the hard ceiling;
+        and no position for the mint already tracked (never a double entry).
+        Nothing is clamped or repaired.
+        """
+        mint = intent.get("mint")
+        lamports = intent.get("lamports")
+        if not isinstance(mint, str) or not mint or mint == SOL_MINT:
+            return "intent mint invalid"
+        if not is_raw_units(lamports):
+            return "intent lamports is not an integer in 1..2**64-1"
+        if not intent.get("tx_signature"):
+            return "confirmed buy has no transaction signature"
+        if intent.get("fill_input_mint") != SOL_MINT or intent.get("fill_output_mint") != mint:
+            return "fill mints do not match the intent (SOL -> mint)"
+        actual_in = intent.get("actual_in_amount")
+        if not is_raw_units(actual_in) or actual_in > lamports:
+            return f"on-chain SOL in {actual_in!r} missing or exceeds the intended {lamports}"
+        if not is_raw_units(intent.get("actual_out_amount")):
+            return "on-chain token output missing, not positive or out of range"
+        if self._buy_decimals(intent) is None:
+            return "token decimals unverified"
+        alloc = intent.get("allocation_usd")
+        if (
+            isinstance(alloc, bool) or not isinstance(alloc, (int, float))
+            or not math.isfinite(alloc) or not 0 < alloc <= MAX_EXPERIMENT_USD
+        ):
+            return "intent allocation missing or outside the hard ceiling"
+        if mint in self.portfolio.positions:
+            return "a position for this mint is already tracked"
+        return None
+
+    @staticmethod
+    def _buy_decimals(intent: dict) -> int | None:
+        decimals = valid_token_decimals(intent.get("out_decimals"))
+        if decimals is None:
+            decimals = valid_token_decimals(intent.get("screened_decimals"))
+        return decimals
+
+    def _record_buy_evidence(self, intent: dict, evidence: dict, detail: str) -> None:
+        """Persist verified fill evidence before the position. Best effort:
+        the commit point is the recording save (which carries it too)."""
+        intent.update(evidence)
+        intent["status"] = "confirmed_unrecorded"
+        intent["resolution"] = detail
+        intent["confirmed_at"] = time.time()
+        self._save()
+
+    def _record_confirmed_buy(self, intent: dict) -> bool:
+        """Record a ``confirmed_unrecorded`` buy exactly once from its stored
+        evidence: the position (``raw_tokens`` = ``raw_tokens_initial`` = the
+        verified raw fill) and the intent's ``settled`` status are persisted
+        in ONE atomic write. If it is not durable the position is removed
+        from memory and the intent stays ``confirmed_unrecorded`` (entries
+        blocked, retried next tick). Returns True if recorded."""
+        if intent.get("status") != "confirmed_unrecorded" or intent.get("recorded_at") is not None:
+            return False
+        mint = intent.get("mint")
+        problem = self._buy_fill_problem(intent)
+        if problem is not None:
+            reason = f"confirmed buy cannot be recorded: {problem}; operator action required"
+            if intent.get("resolution") != reason:
+                intent["resolution"] = reason
+                self._save()
+            log.error("live entry for %s %s", str(mint)[:8], reason)
+            return False
+        decimals = self._buy_decimals(intent)
+        raw_out = intent["actual_out_amount"]
+        tokens = raw_out / (10 ** decimals)
+        size_usd = intent["allocation_usd"]
+        symbol = intent.get("symbol") or str(mint)[:8]
+        self.portfolio.open(
+            mint, symbol, size_usd / tokens, size_usd, tokens,
+            token_decimals=decimals,
+            entry_signature=intent["tx_signature"],
+            actual_in_amount=intent["actual_in_amount"],
+            actual_out_amount=raw_out,
+            fee_lamports=intent.get("fee_lamports"),
+            raw_tokens=raw_out,
+            raw_tokens_initial=raw_out,
+        )
+        intent["status"] = "settled"
+        intent["recorded_at"] = time.time()
+        if self._save() is not True:  # one atomic write: position + settled intent
+            self.portfolio.positions.pop(mint, None)
+            intent["status"] = "confirmed_unrecorded"
+            intent.pop("recorded_at", None)
+            intent["resolution"] = "position recording not durable (state save failed); retried next tick"
+            log.error("live entry for %s confirmed but its position could not be saved; "
+                      "rolled back in memory, retried next tick", str(mint)[:8])
+            return False
+        opened = self.portfolio.positions[mint]
+        self.notifier.buy(symbol, size_usd, opened.entry_price, False)
+        return True
+
+    def _resolve_buy_intents(self) -> None:
+        """Resolve open live buy intents on evidence only (never a resend).
+
+        * ``confirmed_unrecorded``: recorded from stored evidence, no lookup.
+        * NOT EXECUTED (-> ``failed``, no position): refused before send
+          (``confirmed_failure`` outcome with no signature); the signature is
+          confirmed with an error; or the blockhash window has passed
+          (``BUY_INTENT_EXPIRY_SECONDS``), the signature is not confirmed and
+          the wallet holds none of the token. With no saved signature only
+          the expiry + wallet rule applies (absence of a signature is never
+          proof of non-execution).
+        * EXECUTED: the signature is confirmed without error and
+          ``getTransaction`` + ``extract_fill`` give a fill that verifies
+          (``_buy_fill_problem``); evidence persisted, then position +
+          ``settled`` in one atomic save.
+        * Anything else stays open (entries blocked) with a reason.
+        """
+        now = time.time()
+        balances: dict = {}
+        changed = False
+        for intent in self._open_buy_intents():
+            mint = str(intent.get("mint"))
+            if intent.get("status") == "confirmed_unrecorded":
+                if self._record_confirmed_buy(intent):
+                    log.warning("live buy intent for %s recorded from stored fill evidence", mint[:8])
+                continue
+            verdict, detail, evidence = self._buy_intent_evidence(intent, now, balances)
+            if verdict == "not_executed":
+                intent["status"] = "failed"
+                intent["resolution"] = detail
+                intent["resolved_at"] = now
+                changed = True
+                log.warning("live buy intent for %s resolved as NOT executed (%s); no position",
+                            mint[:8], detail)
+                continue
+            if verdict == "executed" and evidence is not None:
+                intent["resolved_at"] = now
+                self._record_buy_evidence(intent, evidence, detail)
+                if self._record_confirmed_buy(intent):
+                    log.warning("live buy intent for %s recorded from on-chain fill", mint[:8])
+                continue
+            if intent.get("resolution") != detail:
+                intent["resolution"] = detail
+                changed = True
+            log.error("live buy intent for %s UNRESOLVED: %s — new entries blocked; "
+                      "positions still managed", mint[:8], detail)
+            notifier = getattr(self, "notifier", None)
+            if not intent.get("alerted") and getattr(notifier, "enabled", False):
+                notifier.send(f"⚠️ unresolved live buy for {mint[:8]}: {detail}")
+                intent["alerted"] = True
+                changed = True
+        terminal = [
+            i for i in self.portfolio.buy_intents
+            if not (isinstance(i, dict) and i.get("status") in OPEN_BUY_INTENT_STATUSES)
+        ]
+        if len(terminal) > TERMINAL_BUY_INTENTS_KEPT:
+            drop = {id(i) for i in terminal[:-TERMINAL_BUY_INTENTS_KEPT]}
+            self.portfolio.buy_intents = [i for i in self.portfolio.buy_intents if id(i) not in drop]
+            changed = True
+        if changed:
+            self._save()
+
+    def _buy_intent_evidence(self, intent: dict, now: float, balances: dict):
+        """(verdict, detail, evidence) with verdict executed / not_executed / unknown."""
+        sig = intent.get("tx_signature")
+        mint = intent.get("mint")
+        if not isinstance(mint, str) or not mint:
+            return "unknown", "malformed buy intent (no mint); operator action required", None
+        if not sig and intent.get("outcome") == TransactionStatus.CONFIRMED_FAILURE.value:
+            return "not_executed", "rejected before send (no transaction)", None
+        if mint in self.portfolio.positions:
+            return ("unknown", "a position for this mint is already tracked; operator "
+                    "action required", None)
+        if sig:
+            try:
+                raw = get_signature_status(self.session, self.cfg.rpc_url, sig)
+            except Exception as exc:
+                return "unknown", f"signature status lookup failed: {exc}", None
+            required = (
+                {"finalized"} if self.cfg.confirmation_commitment == "finalized"
+                else {"confirmed", "finalized"}
+            )
+            if isinstance(raw, dict) and raw.get("confirmationStatus") in required:
+                if raw.get("err") is not None:
+                    return "not_executed", "transaction failed on chain", None
+                fill = self._confirmed_buy_fill(sig, mint)
+                evidence = None if fill is None else self._buy_evidence(
+                    fill.actual_in_amount, fill.actual_out_amount, fill.fee_lamports,
+                    fill.out_decimals, fill.input_mint, fill.output_mint,
+                )
+                problem = (
+                    "no fill data" if evidence is None
+                    else self._buy_fill_problem(dict(intent, **evidence))
+                )
+                if problem is not None:
+                    return ("unknown", f"buy confirmed on chain but its fill does not verify "
+                            f"({problem}); operator action required", None)
+                return "executed", "confirmed on chain with verified fill", evidence
+        started = intent.get("created_at", intent.get("first_seen_at"))
+        if (
+            isinstance(started, bool) or not isinstance(started, (int, float))
+            or now - started < BUY_INTENT_EXPIRY_SECONDS
+        ):
+            return "unknown", "outcome not yet known; waiting for blockhash expiry", None
+        # Proof of absence comes ONLY from exact raw amounts of a fully
+        # readable snapshot; unknown is never zero.
+        if "raw" not in balances:
+            balances["raw"] = self._wallet_token_raw()
+        raw = balances["raw"]
+        if raw is None:
+            return "unknown", "wallet balance unavailable", None
+        held = raw.get(mint, 0)
+        if isinstance(held, bool) or not isinstance(held, int) or held < 0:
+            return "unknown", "wallet balance unreadable", None
+        if held == 0:
+            return "not_executed", "expired unconfirmed; wallet holds none of the token", None
+        return ("unknown", "wallet holds the token but no confirmed, verified buy; operator "
+                "action required", None)
+
+    def _confirmed_buy_fill(self, signature: str, mint: str):
+        owner = self.cfg.burner_wallet_pubkey
+        if not owner:
+            return None
+        try:
+            tx = get_confirmed_transaction(
+                self.session, self.cfg.rpc_url, signature, self.cfg.confirmation_commitment,
+            )
+        except Exception as exc:
+            log.warning("getTransaction failed for %s: %s", signature, exc)
+            return None
+        if not tx:
+            return None
+        fill = extract_fill(tx, owner, SOL_MINT, mint)
+        return fill if fill.complete else None
 
     # -- live sell intent resolution -----------------------------------------
 
@@ -1030,6 +1553,21 @@ class TradingBot:
             log.warning("wallet balance fetch failed: %s", exc)
             return None
         return snapshot.amounts if snapshot is not None else None
+
+    def _wallet_token_raw(self) -> dict | None:
+        """Exact raw units per mint from a fully readable wallet snapshot, or
+        None when the balance is unknown (no wallet, RPC error, partial or
+        malformed response). A mint absent from a returned dict is proven 0."""
+        owner = self.cfg.burner_wallet_pubkey
+        if not owner:
+            return None
+        try:
+            snapshot = fetch_wallet_token_balances(self.cfg, owner, self.session)
+        except Exception as exc:
+            log.warning("wallet balance fetch failed: %s", exc)
+            return None
+        raw = getattr(snapshot, "raw_amounts", None) if snapshot is not None else None
+        return raw if isinstance(raw, dict) else None
 
     def _save(self) -> bool:
         """Persist state. False means the write is NOT known durable (it may

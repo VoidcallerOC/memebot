@@ -96,13 +96,14 @@ def test_entry_with_out_of_range_fill_raw_records_no_position(out_raw):
         status=TransactionStatus.CONFIRMED_SUCCESS, actual_in_amount=10**8,
         actual_out_amount=out_raw, fee_lamports=5000, in_decimals=9, out_decimals=8))
     bot.notifier = types.SimpleNamespace(buy=lambda *a: (_ for _ in ()).throw(AssertionError("no buy")))
-    bot._usd_to_lamports = lambda _usd: 1
+    bot._usd_to_lamports = lambda _usd: 10**8   # SOL in is valid; only the raw out is bad
     bot._sell_route_ok = lambda _m, _l: True
     bot._reconciliation_required = False
-    bot._save = lambda: None
+    bot._save = lambda: True                     # armed entries need durable saves
     bot._seek_entry()
     assert bot.portfolio.positions == {}
-    assert bot._reconciliation_required is True
+    (intent,) = bot.portfolio.buy_intents        # unresolved: entries blocked, nothing recorded
+    assert intent["status"] == "unresolved" and "token output" in intent["resolution"]
 
 
 # -- corrupted persisted holdings fail closed before quote / sign / send ----------
@@ -270,8 +271,8 @@ def test_booking_save_failure_rolls_back_and_books_once_later(world, monkeypatch
     if path == "delayed":
         bot._tick()
         show(world)
-    # saves in the settling tick: [pending,] confirmed_unbooked, booking -> fail the booking
-    _fail_saves(monkeypatch, {3} if path == "on_time" else {2})
+    # saves in the settling tick: [pending, signature,] confirmed_unbooked, booking
+    _fail_saves(monkeypatch, {4} if path == "on_time" else {2})
     bot._tick()
     (intent,) = bot.portfolio.pending_intents
     assert intent["status"] == "confirmed_unbooked" and "not durable" in intent["resolution"]
@@ -299,20 +300,19 @@ def test_evidence_and_booking_saves_both_fail_then_crash_never_double(world, mon
     world.sig_queue = [SIG, SIG]
     world.on_send[SIG] = lands(MINT, FULL)
     world.marks[MINT] = SL_MARK
-    real_save = _fail_saves(monkeypatch, {2, 3})
+    # saves: pending, signature (pre-broadcast), evidence, booking
+    real_save = _fail_saves(monkeypatch, {3, 4})
     bot._tick()
-    del bot                                             # process dies; disk has the pre-send intent
+    del bot                     # process dies; disk has the intent with its pre-broadcast signature
     (intent,) = intents_of(persisted(world))
-    assert (intent["status"], intent["raw_amount"], intent["tx_signature"]) == ("pending", IN_RAW, None)
+    assert (intent["status"], intent["raw_amount"], intent["tx_signature"]) == ("pending", IN_RAW, SIG)
     monkeypatch.setattr(main_module, "save_state", real_save)   # saves work again
     world.now += main_module.SELL_INTENT_EXPIRY_SECONDS + 1
     bot2 = boot(world)                                  # production restart from disk
-    run(bot2, 3)                                        # wallet dropped: startup blocked
-    state = persisted(world)
+    run(bot2, 3)                                        # resolves by the saved signature
     assert world.sends == [SIG]                         # never sent twice
-    assert state["portfolio"]["realized_pnl"] == 0.0     # never booked without evidence
-    assert position(state)["raw_tokens"] == IN_RAW
     assert_never_terminal_unbooked(world)
+    assert_booked_once(world)                           # booked once, from on-chain evidence
 
 
 @pytest.mark.parametrize("out", [None, 0, U64 + 1, True])
@@ -324,7 +324,7 @@ def test_on_time_confirmed_without_valid_proceeds_never_books(world, out):
     open_position(bot, world)
     calls = []
 
-    def swap(i, o, amount, *, allocation_usd=None):
+    def swap(i, o, amount, *, allocation_usd=None, before_broadcast=None):
         calls.append((i, o, amount))
         return SwapResult(ok=True, simulated=False, in_amount=amount, out_amount=1,
                           tx_signature=SIG, status=TransactionStatus.CONFIRMED_SUCCESS,

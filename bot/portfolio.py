@@ -6,7 +6,9 @@ this to disk/db, but the accounting logic is what matters and it lives here.
 
 from __future__ import annotations
 
+import copy
 import logging
+import math
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
@@ -23,6 +25,93 @@ def is_raw_units(value: object) -> bool:
         isinstance(value, int) and not isinstance(value, bool)
         and 0 < value <= MAX_RAW_UNITS
     )
+
+
+# Buy-intent statuses the live entry lifecycle writes (bot.main
+# OPEN_BUY_INTENT_STATUSES plus the terminal ``failed`` / ``settled``).
+BUY_INTENT_STATUSES = frozenset({"pending", "unresolved", "confirmed_unrecorded", "failed", "settled"})
+
+
+def _real_number(value: object) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+# Every sell-intent status any writer has persisted (git history of
+# bot/main.py: c733c9e pending/blocked/unresolved/settled; 1975efd +failed;
+# 4587d65 +confirmed_unbooked). da613e4 introduced the field but never
+# appended to it.
+SELL_INTENT_STATUSES = frozenset({
+    "pending", "blocked", "unresolved", "confirmed_unbooked", "failed", "settled",
+})
+
+
+def sell_intent_problem(entry: object) -> str | None:
+    """Why a persisted live SELL intent cannot be classified, else None.
+
+    Accepts every historical shape explicitly: c733c9e (mint, fraction,
+    reason, requested_price, status, tx_signature), 1975efd (+created_at,
+    raw_amount possibly None, resolution fields) and 4587d65+ (+raw_amount at
+    creation, optional rung, booking fields). Required to classify: a
+    non-empty ``mint`` (what the open intent freezes) and a known string
+    ``status``; ``tx_signature`` is None or a non-empty string. A
+    ``confirmed_unbooked`` intent is booked from its stored evidence, so it
+    also needs its signature, ``fraction``, ``requested_price`` and
+    ``reason`` and must not already be booked.
+    """
+    if not isinstance(entry, dict):
+        return "entry is not an object"
+    mint = entry.get("mint")
+    if not isinstance(mint, str) or not mint:
+        return "missing or invalid mint"
+    status = entry.get("status")
+    if not isinstance(status, str):
+        return "missing or non-string status"
+    if status not in SELL_INTENT_STATUSES:
+        return f"unknown status {status!r}"
+    sig = entry.get("tx_signature")
+    if sig is not None and (not isinstance(sig, str) or not sig):
+        return "invalid tx_signature"
+    if status == "confirmed_unbooked":
+        if sig is None:
+            return "confirmed_unbooked without tx_signature"
+        if not _real_number(entry.get("fraction")) or not _real_number(entry.get("requested_price")):
+            return "confirmed_unbooked without numeric fraction/requested_price"
+        if not isinstance(entry.get("reason"), str):
+            return "confirmed_unbooked without reason"
+        if entry.get("booked_at") is not None:
+            return "confirmed_unbooked already carries booked_at"
+    return None
+
+
+def buy_intent_problem(entry: object) -> str | None:
+    """Why a persisted buy intent is malformed, or None. Mirrors what
+    ``TradingBot._live_entry`` writes; anything else is corruption, never
+    guessed or repaired."""
+    if not isinstance(entry, dict):
+        return "entry is not an object"
+    if entry.get("side") != "buy":
+        return "side is not 'buy'"
+    mint = entry.get("mint")
+    if not isinstance(mint, str) or not mint:
+        return "mint missing or not a string"
+    status = entry.get("status")
+    if status not in BUY_INTENT_STATUSES:
+        return f"unknown status {status!r}"
+    if not is_raw_units(entry.get("lamports")):
+        return "intended lamports missing or not an integer in 1..2**64-1"
+    if not _real_number(entry.get("created_at")):
+        return "created_at missing or not a finite number"
+    if not _real_number(entry.get("allocation_usd")):
+        return "allocation_usd missing or not a finite number"
+    if "tx_signature" not in entry:
+        return "tx_signature field missing"
+    sig = entry["tx_signature"]
+    if sig is not None and (not isinstance(sig, str) or not sig):
+        return "tx_signature is not null or a non-empty string"
+    if status in {"confirmed_unrecorded", "settled"} and sig is None:
+        return f"{status} intent has no tx_signature"
+    return None
 
 
 @dataclass
@@ -102,7 +191,17 @@ class Portfolio:
     def __init__(self):
         self.positions: dict[str, Position] = {}
         self.realized_pnl: float = 0.0
-        self.pending_intents: list[dict] = []
+        self.pending_intents: list[dict] = []   # live SELL intents
+        # Live BUY intents (armed entries), kept apart from sell intents so no
+        # sell path (freeze, resolver, pruning) ever sees them. Same atomic
+        # state file; absent in legacy state (loads as an empty list).
+        self.buy_intents: list[dict] = []
+        # Persisted intent fields that failed validation: field -> reason.
+        # Their raw data is kept verbatim in ``_raw_corrupt`` and written back
+        # unchanged by ``to_dict`` (never dropped or rewritten); the bot
+        # refuses armed trading and all new entries while any is set.
+        self.corrupt: dict[str, str] = {}
+        self._raw_corrupt: dict[str, object] = {}
 
     def open(self, mint: str, symbol: str, entry_price: float,
              size_usd: float, tokens: float, **fill) -> Position:
@@ -189,7 +288,14 @@ class Portfolio:
         return {
             "realized_pnl": self.realized_pnl,
             "positions": [p.to_dict() for p in self.positions.values()],
-            "pending_intents": list(self.pending_intents),
+            "pending_intents": (
+                copy.deepcopy(self._raw_corrupt["pending_intents"])
+                if "pending_intents" in self.corrupt else list(self.pending_intents)
+            ),
+            "buy_intents": (
+                copy.deepcopy(self._raw_corrupt["buy_intents"])
+                if "buy_intents" in self.corrupt else list(self.buy_intents)
+            ),
         }
 
     def load_dict(self, d: dict) -> None:
@@ -198,7 +304,55 @@ class Portfolio:
         for pd in d.get("positions", []):
             pos = Position.from_dict(pd)
             self.positions[pos.mint] = pos
-        self.pending_intents = list(d.get("pending_intents") or [])
+        self.corrupt, self._raw_corrupt = {}, {}
+        # Sell intents: absent / null / [] (legacy) -> []. A present non-list
+        # value or a non-object entry would be silently ignored by the
+        # sell-freeze checks, so it is corruption (raw kept, trading refused).
+        # Field-level validation of sell entries is a follow-up (legacy sell
+        # intents have several historical shapes).
+        if "pending_intents" not in d:  # legacy state: field never written
+            raw_sells: object = []
+        else:
+            raw_sells = d["pending_intents"]
+        sell_problems = (
+            [] if not isinstance(raw_sells, list)
+            else [(n, sell_intent_problem(i)) for n, i in enumerate(raw_sells)]
+        )
+        sell_problems = [(n, why) for n, why in sell_problems if why is not None]
+        if not isinstance(raw_sells, list):
+            # Present but null / non-list is corrupt, never silently [].
+            self._mark_corrupt("pending_intents", raw_sells, "field is not a list")
+            self.pending_intents = []
+        elif sell_problems:
+            n, why = sell_problems[0]
+            self._mark_corrupt("pending_intents", raw_sells, f"entry {n}: {why}")
+            self.pending_intents = []
+        else:
+            self.pending_intents = list(raw_sells)
+        # Buy intents: key ABSENT (legacy state) -> []. Present but not a list,
+        # or any malformed entry -> corrupt: raw kept verbatim, not loaded.
+        if "buy_intents" not in d:
+            self.buy_intents = []
+        else:
+            raw_buys = d["buy_intents"]
+            if not isinstance(raw_buys, list):
+                problem = "field is not a list"
+            else:
+                problem = next((
+                    f"entry {n}: {why}" for n, why in
+                    ((n, buy_intent_problem(e)) for n, e in enumerate(raw_buys)) if why
+                ), None)
+            if problem is None:
+                self.buy_intents = list(raw_buys)
+            else:
+                self._mark_corrupt("buy_intents", raw_buys, problem)
+                self.buy_intents = []
+
+    def _mark_corrupt(self, name: str, raw: object, reason: str) -> None:
+        self.corrupt[name] = reason
+        self._raw_corrupt[name] = copy.deepcopy(raw)
+        log.error("state %s corrupt (%s): raw data preserved; state recovery required",
+                  name, reason)
 
     def unrealized_pnl(self, prices: dict[str, float]) -> float:
         total = 0.0

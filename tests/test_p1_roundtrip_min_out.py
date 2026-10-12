@@ -50,6 +50,7 @@ def test_realistic_slippage_and_two_percent_loss_still_passes(mode, monkeypatch)
         from tests.test_p1_sellability import armed_cfg
         cfg = armed_cfg()
         bot = make_bot(jup, cfg)
+        bot._save = lambda: True               # armed entries need a durable buy intent
         executor = SwapExecutor(cfg, jup=jup, session=object())
         reached = []
         executor._execute_live = lambda q, amount, out, **kw: reached.append(amount) or SwapResult(

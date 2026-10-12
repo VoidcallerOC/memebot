@@ -20,6 +20,7 @@ import pytest
 
 import bot.main as main_module
 from bot.config import Config
+from bot.chain import JUPITER_V6_PROGRAM
 from bot.jupiter import SOL_MINT, SwapResult, TransactionStatus
 from bot.portfolio import Portfolio
 from bot.risk import RiskManager
@@ -51,7 +52,7 @@ class FakeExecutor:
         self.results = list(results)
         self.calls = []
 
-    def swap(self, i, o, amount, *, allocation_usd=None):
+    def swap(self, i, o, amount, *, allocation_usd=None, before_broadcast=None):
         self.calls.append((i, o, amount))
         if self.results:
             return self.results.pop(0)
@@ -97,14 +98,36 @@ class FakeChain:
 
 
 def sell_tx(mint=MINT, token_pre=RAW, token_post=0, wsol_out=6_000_000, owner=WALLET):
-    """Parsed token -> SOL sell (wSOL output visible in postTokenBalances)."""
-    def bal(m, amount, dec):
-        return {"owner": owner, "mint": m, "uiTokenAmount": {"amount": str(amount), "decimals": dec}}
-    post = [bal(mint, token_post, 6), bal(SOL_MINT, wsol_out, 9)]
-    return {"transaction": {"message": {"accountKeys": [owner]}},
-            "meta": {"fee": 5000, "preTokenBalances": [bal(mint, token_pre, 6)],
-                     "postTokenBalances": post, "preBalances": [10**9], "postBalances": [10**9]}}
+    """Parsed token -> SOL sell into a PERSISTENT owner wSOL account.
 
+    Since the persistent-wSOL fix (Nick @ b9690ee) SOL out must be proven by
+    the strict parser, so this is a minimal provable shape: one top-level
+    Jupiter route whose single CPI moves ``wsol_out`` wSOL pool -> the owner's
+    wSOL account, with lamports reconciled (owner pays only the fee; the wSOL
+    account's lamports rise with its token balance). ``owner`` is the signer
+    whose balances these are.
+    """
+    wsol_acct, pool = "OwnerWsol111111111111111111111111111111111", "PoolWsol1111111111111111111111111111111111"
+    rent, fee = 2_039_280, 5000
+
+    def bal(m, amount, dec, idx=None):
+        e = {"owner": owner, "mint": m, "uiTokenAmount": {"amount": str(amount), "decimals": dec}}
+        if idx is not None:
+            e["accountIndex"] = idx
+        return e
+    transfer = {"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "parsed": {"type": "transferChecked", "info": {
+                    "source": pool, "destination": wsol_acct, "authority": "PoolAuth", "mint": SOL_MINT,
+                    "tokenAmount": {"amount": str(wsol_out), "decimals": 9}}}}
+    return {"transaction": {"message": {
+                "accountKeys": [owner, wsol_acct, pool, JUPITER_V6_PROGRAM],
+                "instructions": [{"programId": JUPITER_V6_PROGRAM, "accounts": [], "data": ""}]}},
+            "meta": {"err": None, "fee": fee,
+                     "innerInstructions": [{"index": 0, "instructions": [transfer] if wsol_out else []}],
+                     "preTokenBalances": [bal(mint, token_pre, 6), bal(SOL_MINT, 0, 9, 1)],
+                     "postTokenBalances": [bal(mint, token_post, 6), bal(SOL_MINT, wsol_out, 9, 1)],
+                     "preBalances": [10**9, rent, 10**10, 1],
+                     "postBalances": [10**9 - fee, rent + wsol_out, 10**10 - wsol_out, 1]}}
 
 class Notes:
     def __init__(self):

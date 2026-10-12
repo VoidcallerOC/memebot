@@ -264,7 +264,9 @@ def test_valid_armed_swap_within_cap_reaches_execution(monkeypatch, lamports, al
     executor._execute_live = lambda quote, amount, out, **kw: seen.append(amount) or SwapResult(
         ok=True, simulated=False, in_amount=amount, out_amount=out,
         status=TransactionStatus.CONFIRMED_SUCCESS)
-    assert executor.swap(SOL_MINT, TOKEN6, lamports, allocation_usd=allocation).ok
+    # every armed swap (buys too) must carry the pre-broadcast persistence callback
+    assert executor.swap(SOL_MINT, TOKEN6, lamports, allocation_usd=allocation,
+                         before_broadcast=lambda sig: True).ok
     assert seen == [lamports]
 
 
@@ -426,9 +428,11 @@ def test_live_entry_without_verified_decimals_records_nothing():
         ok=True, simulated=False, in_amount=1, out_amount=1, tx_signature="sig",
         status=TransactionStatus.CONFIRMED_SUCCESS, actual_in_amount=13_333_333,
         actual_out_amount=1_000_000_000_000, out_decimals=None))
+    bot._save = lambda: True                   # the buy intent is durable
     bot._seek_entry()
     assert bot.portfolio.positions == {}
-    assert bot._reconciliation_required is True
+    (intent,) = bot.portfolio.buy_intents      # unresolved (entries blocked), not recorded
+    assert intent["status"] == "unresolved" and "decimals unverified" in intent["resolution"]
 
 
 # 8 --------------------------------------------------------------- preflight
