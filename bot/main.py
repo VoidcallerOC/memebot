@@ -415,6 +415,10 @@ class TradingBot:
             log.error("live startup blocked: durable state saves (directory fsync) are "
                       "not supported on this platform")
             return
+        corrupt = self._corrupt_state_reason()
+        if corrupt and self.cfg.is_armed:
+            log.error("live startup blocked: %s", corrupt)
+            return
         mode = "LIVE — REAL MONEY" if self.cfg.is_armed else "DRY-RUN"
         if self.notifier.enabled:
             self.notifier.startup(mode)
@@ -446,7 +450,22 @@ class TradingBot:
         self._save()
         self._summary()
 
+    def _corrupt_state_reason(self) -> str | None:
+        """Operator-facing reason when persisted intents failed validation
+        (``Portfolio.corrupt``), else None. Their raw data is preserved."""
+        corrupt = getattr(self.portfolio, "corrupt", None) or {}
+        if not corrupt:
+            return None
+        return "; ".join(f"{name} corrupt ({why}): state recovery required"
+                         for name, why in sorted(corrupt.items()))
+
     def _tick(self) -> None:
+        corrupt = self._corrupt_state_reason()
+        if corrupt and self.cfg.is_armed:
+            # Never trade armed on state whose intents cannot be trusted.
+            log.error("trading halted: %s", corrupt)
+            self._running = False
+            return
         if self._open_sell_intents():
             if not self.cfg.is_armed:
                 log.error(
@@ -484,6 +503,10 @@ class TradingBot:
                 "new entries blocked: %d unresolved live sell intent(s) (%s)",
                 len(still_open), ", ".join(sorted({str(i.get("mint"))[:8] for i in still_open})),
             )
+            return
+        if corrupt:
+            # Paper: exits still simulated above; no new entries (conservative).
+            log.error("new entries blocked: %s", corrupt)
             return
         open_buys = self._open_buy_intents()
         if open_buys:
@@ -537,6 +560,10 @@ class TradingBot:
                            rung=_take_profit_rung(action.reason))
 
     def _seek_entry(self) -> None:
+        corrupt = self._corrupt_state_reason()
+        if corrupt:  # paper and armed alike: no new entry on untrusted state
+            log.error("entry search refused: %s", corrupt)
+            return
         for candidate in self.strategy.find_candidates():
             if self.portfolio.has(candidate.mint):
                 continue
@@ -994,6 +1021,10 @@ class TradingBot:
         Returns "opened", "next" (definitively not executed; the next
         candidate may be tried) or "stop" (end this tick's entry search).
         """
+        corrupt = self._corrupt_state_reason()
+        if corrupt:
+            log.error("live entry refused before quote/sign: %s", corrupt)
+            return "stop"
         intent = {
             "side": "buy",
             "mint": mint,

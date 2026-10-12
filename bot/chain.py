@@ -483,9 +483,8 @@ def extract_fill(
     owner's persistent wSOL token-balance delta is used when positive;
     otherwise native SOL proceeds are derived by ``_native_sol_proceeds``
     (temporary wSOL account closed in the same transaction) or left None.
-    For SOL input the same order applies on the input side: the persistent
-    wSOL delta, else the exact principal from ``_native_sol_spent``, else
-    the fee-adjusted lamport drop (``_native_delta``, may include rent).
+    For SOL input, ``actual_in_amount`` is set only from the exact principal
+    proven by ``_native_sol_spent``; otherwise it is None (incomplete fill).
     """
     meta = tx.get("meta")
     if not isinstance(meta, dict):
@@ -529,27 +528,17 @@ def extract_fill(
                 record.actual_in_amount = delta
                 record.in_decimals = pre_in[1]
     elif input_mint == SOL_MINT:
-        wsol_pre = pre.get(SOL_MINT)
-        wsol_post = post.get(SOL_MINT, (0, 9))
-        if wsol_pre is not None:
-            delta = wsol_pre[0] - wsol_post[0]
-            if delta > 0:
-                record.actual_in_amount = delta
-                record.in_decimals = 9
-        if record.actual_in_amount is None:
-            # Exact swap principal (excludes fee and new-account rent) when
-            # the parsed instructions and lamport balances prove it.
-            spent = _native_sol_spent(tx, owner)
-            if spent is not None:
-                record.actual_in_amount = spent
-                record.in_decimals = 9
-        if record.actual_in_amount is None:
-            # Fallback: owner lamport drop minus fee. It can over-state the
-            # principal by new-account rent, never under-state it.
-            native = _native_delta(tx, owner, fee_lamports or 0)
-            if native:
-                record.actual_in_amount = native
-                record.in_decimals = 9
+        # SOL in is accepted ONLY when ``_native_sol_spent`` proves the exact
+        # principal (parsed wSOL movements reconciled against every lamport
+        # balance of the owner + its wSOL accounts). No balance-delta
+        # fallback: an owner/wSOL net delta can be offset by other SOL moving
+        # in the same transaction (an incoming transfer UNDERSTATES the
+        # spend, rent OVERSTATES it). Unproven -> actual_in stays None, the
+        # fill is incomplete, and a live buy stays unresolved.
+        spent = _native_sol_spent(tx, owner)
+        if spent is not None:
+            record.actual_in_amount = spent
+            record.in_decimals = 9
 
     return record
 

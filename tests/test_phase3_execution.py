@@ -52,12 +52,16 @@ def parsed_swap_tx(*, owner=WALLET, out_mint=MINT, out_pre=0, out_post=25_000_00
 
 def test_extract_fill_uses_token_delta_and_native_sol_principal():
     fill = extract_fill(parsed_swap_tx(), WALLET, SOL_MINT, MINT)
-    assert fill.complete
     assert fill.actual_out_amount == 25_000_000
     assert fill.out_decimals == 6
-    assert fill.actual_in_amount == 500_000_000
-    assert fill.in_decimals == 9
     assert fill.fee_lamports == 5_000
+    # SOL in is accepted only when _native_sol_spent proves the exact
+    # principal; this tx has no parsed instructions, so the old owner
+    # lamport-delta fallback (500_000_000 here) is no longer used and the
+    # fill is incomplete (a live buy stays unresolved). See
+    # tests/test_p1_buy_review_fixes.py.
+    assert fill.actual_in_amount is None and fill.in_decimals is None
+    assert not fill.complete
 
 
 class FakeResponse:
@@ -142,9 +146,11 @@ def test_live_swap_attaches_getTransaction_fill(monkeypatch):
     assert result.status == TransactionStatus.CONFIRMED_SUCCESS
     assert result.tx_signature == "sig-fill"
     assert result.actual_out_amount == 25_000_000
-    assert result.actual_in_amount == 500_000_000
+    # unproven SOL principal (no parsed instructions): no actual_in, fill
+    # incomplete -> the entry path records nothing (stays unresolved)
+    assert result.actual_in_amount is None
     assert result.fee_lamports == 5_000
-    assert result.fill_source == "getTransaction"
+    assert result.fill_source is None
 
 
 def test_live_entry_opens_from_confirmed_raw_fill_and_persists_full_record(monkeypatch):
