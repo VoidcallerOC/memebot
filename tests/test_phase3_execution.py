@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 import types
 
-from bot.chain import extract_fill
+from bot.chain import extract_fill, JUPITER_V6_PROGRAM
 from bot.config import Config
 from bot.jupiter import JupiterClient, SwapExecutor, SwapResult, TransactionStatus
 import bot.main as main_module
@@ -32,23 +32,35 @@ def cfg(**overrides):
 
 def parsed_swap_tx(*, owner=WALLET, out_mint=MINT, out_pre=0, out_post=25_000_000,
                    sol_pre=2_000_000_000, sol_post=1_499_995_000, fee=5_000):
+    # Buy output attribution fix (Nick @ b8a2a95): the bought token must be
+    # provable, so the output arrives as the single pool -> owner
+    # transferChecked CPI of one top-level Jupiter route (SOL in stays
+    # unproven: no wSOL movement is modelled).
+    ata, pool = "OwnerTokenAta11111111111111111111111111111", "PoolTokenAcc11111111111111111111111111111"
+    transfer = {"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "parsed": {"type": "transferChecked", "info": {
+                    "source": pool, "destination": ata, "authority": "PoolAuth", "mint": out_mint,
+                    "tokenAmount": {"amount": str(out_post - out_pre), "decimals": 6}}}}
     return {
-        "transaction": {"message": {"accountKeys": [owner, "Other"]}},
+        "transaction": {"message": {
+            "accountKeys": [owner, ata, pool, JUPITER_V6_PROGRAM],
+            "instructions": [{"programId": JUPITER_V6_PROGRAM, "accounts": [], "data": ""}]}},
         "meta": {
+            "err": None,
             "fee": fee,
-            "preBalances": [sol_pre, 0],
-            "postBalances": [sol_post, 0],
+            "innerInstructions": [{"index": 0, "instructions": [transfer]}],
+            "preBalances": [sol_pre, 2_039_280, 2_039_280, 1],
+            "postBalances": [sol_post, 2_039_280, 2_039_280, 1],
             "preTokenBalances": [{
-                "owner": owner, "mint": out_mint,
+                "accountIndex": 1, "owner": owner, "mint": out_mint,
                 "uiTokenAmount": {"amount": str(out_pre), "decimals": 6, "uiAmount": out_pre / 1e6},
             }],
             "postTokenBalances": [{
-                "owner": owner, "mint": out_mint,
+                "accountIndex": 1, "owner": owner, "mint": out_mint,
                 "uiTokenAmount": {"amount": str(out_post), "decimals": 6, "uiAmount": out_post / 1e6},
             }],
         },
     }
-
 
 def test_extract_fill_uses_token_delta_and_native_sol_principal():
     fill = extract_fill(parsed_swap_tx(), WALLET, SOL_MINT, MINT)

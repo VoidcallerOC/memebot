@@ -543,6 +543,102 @@ def _native_sol_spent(tx: dict, owner: str) -> Optional[int]:
         return None
 
 
+_TOKEN_PROGRAMS = frozenset({"spl-token", "spl-token-2022"})
+# Token-program instructions that may touch an owner output-token account
+# without moving its balance (account set-up during the swap).
+_TOKEN_SETUP_TYPES = _WSOL_INIT_TYPES | frozenset({"initializeImmutableOwner", "getAccountDataSize"})
+
+
+def _route_token_received(tx: dict, owner: str, mint: str) -> Optional[int]:
+    """Raw units of ``mint`` a swap provably delivered to ``owner``, else None.
+
+    The bought token gets the same strictness as wSOL. Across the WHOLE
+    transaction (top-level and every inner group), the owner's ``mint`` token
+    accounts (from pre/postTokenBalances, initializeAccount* and ATA create)
+    must receive EXACTLY ONE ``transfer``/``transferChecked`` (SPL Token or
+    Token-2022), executed as a CPI of the single top-level Jupiter route,
+    from a non-owner account. Any other token-program instruction touching
+    those accounts (an outflow, owner -> owner, mintTo, burn, closeAccount,
+    ``transferCheckedWithFee``...) returns None. The owner's aggregate
+    pre/post token delta for ``mint`` must EQUAL the transfer amount, so a
+    Token-2022 transfer fee (received < sent) or any unseen movement fails
+    closed. Never raises.
+    """
+    try:
+        meta = tx.get("meta")
+        if not isinstance(meta, dict) or meta.get("err") is not None or not mint:
+            return None
+        keys = _account_keys(tx)
+        ixs = _parsed_instructions(tx)
+        route_ids = _swap_route_inner_ids(tx)
+        if ixs is None or route_ids is None:
+            return None
+        owned: set[str] = set()
+        for entry in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
+            if not isinstance(entry, dict) or entry.get("mint") != mint:
+                continue
+            if entry.get("owner") == owner:
+                idx = entry.get("accountIndex")
+                if not isinstance(idx, int) or not 0 <= idx < len(keys):
+                    return None
+                owned.add(keys[idx])
+        for ix in ixs:
+            parsed = ix.get("parsed")
+            if not isinstance(parsed, dict):
+                continue
+            info = parsed.get("info") or {}
+            kind = parsed.get("type")
+            if ix.get("program") in _TOKEN_PROGRAMS and kind in _WSOL_INIT_TYPES:
+                if info.get("mint") == mint and info.get("owner") == owner:
+                    owned.add(info.get("account"))
+            elif ix.get("program") == "spl-associated-token-account" and kind in _ATA_CREATE_TYPES:
+                if info.get("mint") == mint and info.get("wallet") == owner:
+                    owned.add(info.get("account"))
+        owned.discard(None)
+        if not owned or owner in owned:
+            return None
+
+        received: Optional[int] = None
+        for ix in ixs:
+            parsed = ix.get("parsed")
+            if not isinstance(parsed, dict) or ix.get("program") not in _TOKEN_PROGRAMS:
+                continue
+            info = parsed.get("info")
+            if not isinstance(info, dict):
+                return None
+            touched = {v for v in info.values() if isinstance(v, str)} & owned
+            if not touched:
+                continue
+            kind = parsed.get("type")
+            if kind in _TOKEN_SETUP_TYPES:
+                continue
+            if kind not in _TOKEN_TRANSFER_TYPES:
+                return None  # mint/burn/close/fee-transfer/... on our account
+            src, dst = info.get("source"), info.get("destination")
+            if src in owned or dst not in owned:
+                return None  # outflow or owner -> owner
+            if id(ix) not in route_ids or received is not None:
+                return None  # not a route CPI, or a second inflow
+            if kind == "transferChecked":
+                if info.get("mint") != mint:
+                    return None
+                amount = _ix_int((info.get("tokenAmount") or {}).get("amount"))
+            else:
+                amount = _ix_int(info.get("amount"))
+            if not amount:
+                return None
+            received = amount
+        if received is None:
+            return None
+        pre = _index_token_balances(meta.get("preTokenBalances") or [], owner).get(mint, (0, 0))
+        post = _index_token_balances(meta.get("postTokenBalances") or [], owner).get(mint)
+        if post is None or post[0] - pre[0] != received:
+            return None
+        return received
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def extract_fill(
     tx: dict,
     owner: str,
@@ -597,13 +693,16 @@ def extract_fill(
                 record.actual_out_amount = native
                 record.out_decimals = 9
     elif output_mint:
-        pre_out = pre.get(output_mint, (0, post.get(output_mint, (0, 0))[1]))
+        # Bought token: only the amount ``_route_token_received`` proves
+        # (exactly one route-CPI inflow from a non-owner account, nothing
+        # else touching the owner's accounts of that mint, aggregate delta
+        # equal). Never the bare balance delta: an unrelated incoming
+        # transfer of the same mint would inflate it.
+        got = _route_token_received(tx, owner, output_mint)
         post_out = post.get(output_mint)
-        if post_out is not None:
-            delta = post_out[0] - pre_out[0]
-            if delta > 0:
-                record.actual_out_amount = delta
-                record.out_decimals = post_out[1]
+        if got is not None and post_out is not None:
+            record.actual_out_amount = got
+            record.out_decimals = post_out[1]
 
     if input_mint and input_mint != SOL_MINT:
         pre_in = pre.get(input_mint)
