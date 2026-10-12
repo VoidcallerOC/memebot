@@ -25,6 +25,10 @@ LAMPORTS_PER_SOL = 1_000_000_000
 @dataclass
 class WalletTokenSnapshot:
     amounts: dict[str, float] = field(default_factory=dict)
+    # Exact raw units per mint from each account's ``tokenAmount.amount``
+    # string. Only a snapshot whose every account parsed is returned at all,
+    # so a mint absent here is PROVEN held at zero.
+    raw_amounts: dict[str, int] = field(default_factory=dict)
     commitment: str = "confirmed"
     programs: tuple[str, ...] = ()
 
@@ -814,17 +818,48 @@ def extract_fill(
     return record
 
 
-def _accounts_to_amounts(accounts: list) -> dict[str, float]:
-    balances: dict[str, float] = {}
-    for acct in accounts or []:
+def _accounts_to_raw(accounts: object) -> Optional[dict[str, tuple[int, int]]]:
+    """Per-mint (raw units, decimals) from a ``getTokenAccountsByOwner``
+    jsonParsed ``value`` list, or None if ANY entry is unreadable.
+
+    Authoritative is the exact raw ``tokenAmount.amount`` string (a
+    non-negative decimal integer). ``uiAmount`` is never used: it can be
+    null or omitted for a non-zero balance. A non-list value, an entry
+    missing its account data / mint / tokenAmount, a bad raw amount or bad
+    decimals makes the whole response unknown (never zero): a skipped
+    account could be the one holding the mint.
+    """
+    if not isinstance(accounts, list):
+        return None
+    out: dict[str, tuple[int, int]] = {}
+    for acct in accounts:
         try:
             info = acct["account"]["data"]["parsed"]["info"]
             mint = info["mint"]
-            ui = float(info["tokenAmount"]["uiAmount"] or 0)
-        except (KeyError, TypeError, ValueError):
-            continue
-        balances[mint] = balances.get(mint, 0.0) + ui
-    return balances
+            token_amount = info["tokenAmount"]
+            raw = token_amount["amount"]
+            decimals = token_amount["decimals"]
+        except (KeyError, TypeError, IndexError):
+            return None
+        if not isinstance(mint, str) or not mint:
+            return None
+        if not isinstance(raw, str) or not raw.isdigit() or not raw.isascii():
+            return None
+        if isinstance(decimals, bool) or not isinstance(decimals, int) or not 0 <= decimals <= 255:
+            return None
+        prev = out.get(mint)
+        if prev is not None and prev[1] != decimals:
+            return None
+        out[mint] = ((prev[0] if prev else 0) + int(raw), decimals)
+    return out
+
+
+def _accounts_to_amounts(accounts: object) -> Optional[dict[str, float]]:
+    """UI amounts (raw / 10**decimals) per mint, or None if unreadable."""
+    raw = _accounts_to_raw(accounts)
+    if raw is None:
+        return None
+    return {mint: units / 10 ** dec for mint, (units, dec) in raw.items()}
 
 
 def fetch_wallet_token_balances(
@@ -843,6 +878,7 @@ def fetch_wallet_token_balances(
     commitment = cfg.confirmation_commitment or "confirmed"
     programs = (SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM)
     merged: dict[str, float] = {}
+    raw_merged: dict[str, int] = {}
     for program_id in programs:
         try:
             result = rpc_call(
@@ -858,13 +894,18 @@ def fetch_wallet_token_balances(
         except Exception as exc:
             log.warning("token account fetch failed for %s: %s", program_id[:8], exc)
             return None
-        accounts = (result or {}).get("value") if isinstance(result, dict) else None
-        if accounts is None:
+        accounts = result.get("value") if isinstance(result, dict) else None
+        parsed = _accounts_to_raw(accounts)
+        if parsed is None:
+            # missing / partial / malformed response: balance UNKNOWN
+            log.warning("token account response for %s unreadable; balance unknown", program_id[:8])
             return None
-        for mint, amount in _accounts_to_amounts(accounts).items():
-            merged[mint] = merged.get(mint, 0.0) + amount
+        for mint, (units, dec) in parsed.items():
+            raw_merged[mint] = raw_merged.get(mint, 0) + units
+            merged[mint] = merged.get(mint, 0.0) + units / 10 ** dec
     return WalletTokenSnapshot(
         amounts=merged,
+        raw_amounts=raw_merged,
         commitment=commitment,
         programs=programs,
     )

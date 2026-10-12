@@ -130,7 +130,7 @@ class World:
             if params[1]["programId"] != TOKEN_2022_PROGRAM:
                 return Resp({"result": {"value": []}})
             accounts = [{"account": {"data": {"parsed": {"info": {
-                "mint": m, "tokenAmount": {"uiAmount": ui}}}}}}
+                "mint": m, "tokenAmount": {"uiAmount": ui, "amount": str(round(ui * 10**9)), "decimals": 9}}}}}}
                 for m, ui in self.wallet.items() if ui]
             return Resp({"result": {"value": accounts}})
         raise AssertionError(f"unexpected RPC method {method}")  # e.g. sendTransaction

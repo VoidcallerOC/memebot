@@ -1333,13 +1333,17 @@ class TradingBot:
             or now - started < BUY_INTENT_EXPIRY_SECONDS
         ):
             return "unknown", "outcome not yet known; waiting for blockhash expiry", None
-        if "amounts" not in balances:
-            balances["amounts"] = self._wallet_token_amounts()
-        amounts = balances["amounts"]
-        if amounts is None:
+        # Proof of absence comes ONLY from exact raw amounts of a fully
+        # readable snapshot; unknown is never zero.
+        if "raw" not in balances:
+            balances["raw"] = self._wallet_token_raw()
+        raw = balances["raw"]
+        if raw is None:
             return "unknown", "wallet balance unavailable", None
-        held = amounts.get(mint, 0.0)
-        if isinstance(held, (int, float)) and not isinstance(held, bool) and held == 0:
+        held = raw.get(mint, 0)
+        if isinstance(held, bool) or not isinstance(held, int) or held < 0:
+            return "unknown", "wallet balance unreadable", None
+        if held == 0:
             return "not_executed", "expired unconfirmed; wallet holds none of the token", None
         return ("unknown", "wallet holds the token but no confirmed, verified buy; operator "
                 "action required", None)
@@ -1549,6 +1553,21 @@ class TradingBot:
             log.warning("wallet balance fetch failed: %s", exc)
             return None
         return snapshot.amounts if snapshot is not None else None
+
+    def _wallet_token_raw(self) -> dict | None:
+        """Exact raw units per mint from a fully readable wallet snapshot, or
+        None when the balance is unknown (no wallet, RPC error, partial or
+        malformed response). A mint absent from a returned dict is proven 0."""
+        owner = self.cfg.burner_wallet_pubkey
+        if not owner:
+            return None
+        try:
+            snapshot = fetch_wallet_token_balances(self.cfg, owner, self.session)
+        except Exception as exc:
+            log.warning("wallet balance fetch failed: %s", exc)
+            return None
+        raw = getattr(snapshot, "raw_amounts", None) if snapshot is not None else None
+        return raw if isinstance(raw, dict) else None
 
     def _save(self) -> bool:
         """Persist state. False means the write is NOT known durable (it may

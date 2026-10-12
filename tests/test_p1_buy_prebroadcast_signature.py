@@ -213,7 +213,7 @@ class BWorld:
             if params[1]["programId"] != SPL_TOKEN_PROGRAM:
                 return Resp({"result": {"value": []}})
             return Resp({"result": {"value": [{"account": {"data": {"parsed": {"info": {
-                "mint": m, "tokenAmount": {"uiAmount": ui}}}}}} for m, ui in self.wallet.items() if ui]}})
+                "mint": m, "tokenAmount": {"uiAmount": ui, "amount": str(round(ui * 10**9)), "decimals": 9}}}}}} for m, ui in self.wallet.items() if ui]}})
         raise AssertionError(f"unexpected RPC {method}")
 
     def _send(self, params):
