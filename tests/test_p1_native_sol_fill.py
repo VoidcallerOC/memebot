@@ -286,8 +286,12 @@ def test_wsol_out_of_owner_account_outside_route_fails_closed():
     assert fill(tx).actual_out_amount is None
 
 
-def test_wsol_out_of_owner_account_inside_route_is_netted():
-    tx = real()  # a later route hop (CPI of the Jupiter instruction) moves 1,000 out
+def test_wsol_out_of_owner_account_inside_route_fails_closed():
+    # Route-attribution fix (Nick @ 7cc26cb): route membership is not proof.
+    # A sell has exactly one owner wSOL transfer (pool -> owner) and no owner
+    # wSOL outflow; an extra outflow, even as a route CPI, used to be netted
+    # (OUT - 1,000) and is now not provable.
+    tx = real()
     route = next(g for g in tx["meta"]["innerInstructions"] if g["index"] == 3)
     route["instructions"].append({"program": "spl-token", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
                                   "parsed": {"type": "transfer", "info": {
@@ -295,8 +299,7 @@ def test_wsol_out_of_owner_account_inside_route_is_netted():
                                       "authority": OWNER, "amount": "1000"}},
                                   "stackHeight": 2})
     bump_post(tx, OWNER_IDX, -1_000)
-    assert fill(tx).actual_out_amount == OUT_LAMPORTS - 1_000
-
+    assert fill(tx).actual_out_amount is None
 
 def test_unparseable_amount_fails_closed():
     tx = real()

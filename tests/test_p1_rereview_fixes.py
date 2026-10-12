@@ -42,11 +42,15 @@ FIX = pathlib.Path(__file__).parent / "fixtures"
 BUY_BASE, SELL_BASE = FIX / "synthetic_native_sol_buy.json", FIX / "native_sol_sell_fWueMsPH.json"
 BUY_WSOL = FIX / "synthetic_native_sol_buy_unrelated_wsol.json"
 SELL_WSOL = FIX / "synthetic_native_sol_sell_unrelated_wsol.json"
+BUY_ROUTE = FIX / "synthetic_native_sol_buy_route_inner_wsol.json"
+SELL_ROUTE = FIX / "synthetic_native_sol_sell_route_inner_wsol.json"
 PINS = {
     SELL_BASE: "730382ed56c73866e74cc80bbadfa75732c9ab943d3f4d8d971d61ec14be75b1",
     BUY_BASE: B.FIXTURE_SHA256,
     BUY_WSOL: "254e6e63578be4e78dff157309e046d4ad7c94ac55f8b9e8d2e4fb75676825ad",
     SELL_WSOL: "b1e7e556c408de2e4b7f02bec947166b89969925d252eb5da2d671e2afc33552",
+    BUY_ROUTE: "b14f2fd81c19decf9bf403de5275d4f824cebfd2b6572bcc41bdb0158b4dd06b",
+    SELL_ROUTE: "ce877bf58cd42a75694c4061bf0cce1fc89d4ea079a9253ef76b55ec0dd7f76a",
 }
 BUY_DONATION, SELL_DONATION = 4_000_000, 1_000_000
 
@@ -57,8 +61,9 @@ def tx_of(path):
 
 def into_route(tx):
     """Move the injected top-level transfer inside the Jupiter route group
-    (as if the route itself had made it): the net-flow amount the OLD parser
-    returned is then reproduced, proving the lamport equation reconciles."""
+    (as if the route itself had made it). The grouped lamport equation still
+    reconciles, so 7cc26cb (route-membership attribution) returned the skewed
+    net amount; the committed *_route_inner_wsol.json fixtures are exactly this."""
     tops = tx["transaction"]["message"]["instructions"]
     at = next(i for i, ix in enumerate(tops)
               if (ix.get("parsed") or {}).get("info", {}).get("source", "").startswith("SynthDonor"))
@@ -73,7 +78,8 @@ def into_route(tx):
 def test_fixtures_pinned_bases_unchanged_derivations_synthetic():
     for path, sha in PINS.items():
         assert hashlib.sha256(path.read_bytes()).hexdigest() == sha, path.name
-    for path, base in ((BUY_WSOL, BUY_BASE), (SELL_WSOL, SELL_BASE)):
+    for path, base in ((BUY_WSOL, BUY_BASE), (SELL_WSOL, SELL_BASE),
+                       (BUY_ROUTE, BUY_WSOL), (SELL_ROUTE, SELL_WSOL)):
         src = json.loads(path.read_text())["_source"]
         assert src["kind"] == "SYNTHETIC" and "NOT a real" in src["note"]
         assert src["derived_from"] == base.name and src["derived_from_sha256"] == PINS[base]
@@ -89,8 +95,7 @@ def test_base_buy_and_real_sell_still_parse_exactly():
 
 
 def test_buy_unrelated_wsol_old_value_understated_new_is_none():
-    old = _native_sol_spent(into_route(tx_of(BUY_WSOL)), B.OWNER_PLACEHOLDER)
-    assert old == B.SOL_IN - BUY_DONATION == 9_333_333       # what net flow reported
+    # d9f07b4 (net flow) returned 13,333,333 - 4,000,000 = 9,333,333 here.
     tx = tx_of(BUY_WSOL)
     assert _native_sol_spent(tx, B.OWNER_PLACEHOLDER) is None
     fill = extract_fill(tx, B.OWNER_PLACEHOLDER, SOL_MINT, B.MINT)
@@ -98,8 +103,7 @@ def test_buy_unrelated_wsol_old_value_understated_new_is_none():
 
 
 def test_sell_unrelated_wsol_old_value_overstated_new_is_none():
-    old = _native_sol_proceeds(into_route(tx_of(SELL_WSOL)), SELL_OWNER)
-    assert old == OUT_LAMPORTS + SELL_DONATION == 9_656_067
+    # d9f07b4 (net flow) returned 8,656,067 + 1,000,000 = 9,656,067 here.
     tx = tx_of(SELL_WSOL)
     assert _native_sol_proceeds(tx, SELL_OWNER) is None
     fill = extract_fill(tx, SELL_OWNER, SELL_MINT, SOL_MINT)
@@ -304,3 +308,97 @@ def test_unclassifiable_sell_intent_paper_opens_no_entry(bw, entry):
     assert B.run(paper, 2) == 2
     assert paper.entry_scans == [] and paper.jup.quotes == [] and paper.portfolio.positions == {}
     assert raw_field(bw, "pending_intents") == [entry]
+
+
+# -- Route attribution fix (Nick @ 7cc26cb): membership is not proof ------------------
+
+def route_group(tx):
+    tops = tx["transaction"]["message"]["instructions"]
+    idx = next(i for i, t in enumerate(tops) if t.get("programId") == JUPITER_V6_PROGRAM)
+    return next(g for g in tx["meta"]["innerInstructions"] if g["index"] == idx)["instructions"]
+
+
+def owner_wsol_transfer(tx):
+    return next(ix for ix in route_group(tx) if (ix.get("parsed") or {}).get("info", {}).get("mint") == SOL_MINT)
+
+
+def split(tx, first):
+    """Split the single owner wSOL transfer into two same-direction route
+    CPIs with the same total: balances and the equation are unchanged."""
+    ix = owner_wsol_transfer(tx)
+    amt = int(ix["parsed"]["info"]["tokenAmount"]["amount"])
+    two = copy.deepcopy(ix)
+    ix["parsed"]["info"]["tokenAmount"]["amount"] = str(first)
+    two["parsed"]["info"]["tokenAmount"]["amount"] = str(amt - first)
+    group = route_group(tx)
+    group.insert(group.index(ix) + 1, two)
+    return tx
+
+
+def test_route_inner_fixtures_equal_into_route_derivation():
+    assert tx_of(BUY_ROUTE) == into_route(tx_of(BUY_WSOL))
+    assert tx_of(SELL_ROUTE) == into_route(tx_of(SELL_WSOL))
+
+
+def test_route_inner_unrelated_wsol_buy_is_none_incomplete():
+    tx = tx_of(BUY_ROUTE)              # 7cc26cb returned 9,333,333 (true 13,333,333)
+    assert _native_sol_spent(tx, B.OWNER_PLACEHOLDER) is None
+    fill = extract_fill(tx, B.OWNER_PLACEHOLDER, SOL_MINT, B.MINT)
+    assert fill.actual_in_amount is None and not fill.complete
+
+
+def test_route_inner_unrelated_wsol_sell_is_none_incomplete():
+    tx = tx_of(SELL_ROUTE)             # 7cc26cb returned 9,656,067 (true 8,656,067)
+    assert _native_sol_proceeds(tx, SELL_OWNER) is None
+    fill = extract_fill(tx, SELL_OWNER, SELL_MINT, SOL_MINT)
+    assert fill.actual_out_amount is None and not fill.complete
+
+
+def test_two_same_direction_owner_wsol_transfers_fail_closed():
+    buy = split(tx_of(BUY_BASE), 6_666_666)           # two owner -> pool outflows
+    assert _native_sol_spent(buy, B.OWNER_PLACEHOLDER) is None
+    sell = split(tx_of(SELL_BASE), 4_000_000)          # two pool -> owner inflows
+    assert _native_sol_proceeds(sell, SELL_OWNER) is None
+
+
+def test_owner_wsol_to_owner_wsol_transfer_fails_closed():
+    for path, owner, fn in ((BUY_BASE, B.OWNER_PLACEHOLDER, _native_sol_spent),
+                            (SELL_BASE, SELL_OWNER, _native_sol_proceeds)):
+        tx = tx_of(path)
+        ix = copy.deepcopy(owner_wsol_transfer(tx))
+        info = ix["parsed"]["info"]
+        own = info["source"] if fn is _native_sol_spent else info["destination"]
+        info["source"] = info["destination"] = own
+        route_group(tx).append(ix)
+        assert fn(tx, owner) is None
+
+
+def test_buy_route_inner_unrelated_wsol_full_flow_unresolved(bw):
+    bw.fill_tx = json.loads(BUY_ROUTE.read_text().replace(B.OWNER_PLACEHOLDER, bw.owner))["result"]
+    bot = B.start(bw)
+    bot._tick()
+    (sig,) = bw.sends
+    scans = len(bot.entry_scans)
+    for _ in range(3):
+        bot._tick()
+    assert bw.sends == [sig] and len(bot.entry_scans) == scans
+    (intent,) = B.buys_of(B.persisted(bw))
+    assert intent["status"] == "unresolved" and intent["tx_signature"] == sig
+    assert bot.portfolio.positions == {} and B.persisted(bw)["portfolio"]["positions"] == []
+
+
+def test_sell_route_inner_unrelated_wsol_full_flow_unresolved(rw):
+    rw.fill_tx = json.loads(SELL_ROUTE.read_text().replace(SELL_OWNER, rw.owner))["result"]
+    bot = S.start(rw)
+    bot._tick()
+    (sig,) = rw.sends
+    for _ in range(3):
+        bot._tick()
+    rw.now += S.EXPIRY + 1
+    bot2 = S.boot(rw)
+    S.run(bot2, 3)
+    state = S.persisted(rw)
+    (intent,) = intents_of(state)
+    assert intent["status"] == "unresolved" and intent.get("booked_at") is None
+    assert rw.sends == [sig] and rw.builds == 1 and bot2.jup.quotes == []
+    assert state["portfolio"]["realized_pnl"] == 0.0 and position(state)["raw_tokens"] == IN_RAW

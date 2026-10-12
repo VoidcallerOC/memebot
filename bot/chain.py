@@ -310,6 +310,7 @@ def _native_sol_proceeds(tx: dict, owner: str) -> Optional[int]:
         group = wsol | {owner}
 
         wsol_in = wsol_out = rent_out = 0
+        n_in = n_out = 0  # owner wSOL transfers by direction (see below)
         for ix in ixs:
             parsed = ix.get("parsed")
             if not isinstance(parsed, dict):
@@ -339,8 +340,12 @@ def _native_sol_proceeds(tx: dict, owner: str) -> Optional[int]:
                     return None
                 if dst in wsol and src not in wsol:
                     wsol_in += amount
+                    n_in += 1
                 elif src in wsol and dst not in wsol:
                     wsol_out += amount
+                    n_out += 1
+                else:
+                    return None  # owner wSOL -> owner wSOL: not part of a sell
             elif program == "spl-token" and kind == "closeAccount":
                 acct, dst = info.get("account"), info.get("destination")
                 if acct in wsol and dst != owner:
@@ -365,6 +370,12 @@ def _native_sol_proceeds(tx: dict, owner: str) -> Optional[int]:
                 elif info.get("source") in group or info.get("destination") in group or \
                         info.get("newAccount") in group or info.get("account") in group:
                     return None  # any other system lamport move touching S
+        # Route membership alone proves nothing: a sell has EXACTLY ONE wSOL
+        # transfer touching the owner's wSOL accounts, pool -> owner, and no
+        # owner wSOL outflow anywhere. Anything else is not provably the
+        # swap's proceeds.
+        if n_in != 1 or n_out != 0:
+            return None
         proceeds = wsol_in - wsol_out
         if proceeds <= 0:
             return None
@@ -454,6 +465,7 @@ def _native_sol_spent(tx: dict, owner: str) -> Optional[int]:
         group = wsol | {owner}
 
         wsol_in = wsol_out = rent_out = 0
+        n_in = n_out = 0  # owner wSOL transfers by direction (see below)
         for ix in ixs:
             parsed = ix.get("parsed")
             if not isinstance(parsed, dict):
@@ -483,8 +495,12 @@ def _native_sol_spent(tx: dict, owner: str) -> Optional[int]:
                     return None
                 if src in wsol and dst not in wsol:
                     wsol_out += amount
+                    n_out += 1
                 elif dst in wsol and src not in wsol:
                     wsol_in += amount
+                    n_in += 1
+                else:
+                    return None  # owner wSOL -> owner wSOL: not part of a buy
             elif program == "spl-token" and kind == "closeAccount":
                 acct, dst = info.get("account"), info.get("destination")
                 if acct in wsol and dst != owner:
@@ -509,6 +525,12 @@ def _native_sol_spent(tx: dict, owner: str) -> Optional[int]:
                 elif info.get("source") in group or info.get("destination") in group or \
                         info.get("newAccount") in group or info.get("account") in group:
                     return None  # any other system lamport move touching S
+        # Route membership alone proves nothing: a buy has EXACTLY ONE wSOL
+        # transfer touching the owner's wSOL accounts, owner -> pool, and no
+        # owner wSOL inflow anywhere. Anything else is not provably the
+        # swap's principal.
+        if n_out != 1 or n_in != 0:
+            return None
         spent = wsol_out - wsol_in
         if spent <= 0:
             return None
