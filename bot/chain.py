@@ -184,14 +184,16 @@ def _parsed_instructions(tx: dict) -> Optional[list[dict]]:
     message = ((tx.get("transaction") or {}).get("message") or {})
     out: list[dict] = []
     for ix in message.get("instructions") or []:
-        if isinstance(ix, dict):
-            out.append(ix)
+        if not isinstance(ix, dict):
+            return None  # malformed instruction: nothing is provable
+        out.append(ix)
     for group in inner:
         if not isinstance(group, dict):
             return None
         for ix in group.get("instructions") or []:
-            if isinstance(ix, dict):
-                out.append(ix)
+            if not isinstance(ix, dict):
+                return None
+            out.append(ix)
     return out
 
 
@@ -222,6 +224,84 @@ def _swap_route_inner_ids(tx: dict) -> Optional[set[int]]:
     if len(groups) != 1 or not isinstance(groups[0].get("instructions"), list):
         return None
     return {id(ix) for ix in groups[0]["instructions"] if isinstance(ix, dict)}
+
+
+SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+_TOKEN_PROGRAM_IDS = {"spl-token": SPL_TOKEN_PROGRAM_ID, "spl-token-2022": TOKEN_2022_PROGRAM}
+_MALFORMED = object()
+
+
+def _ix_program_id(ix: dict, keys: list[str]) -> Optional[str]:
+    """``programId`` (jsonParsed) or ``keys[programIdIndex]`` (compiled), else None."""
+    pid = ix.get("programId")
+    if isinstance(pid, str) and pid:
+        return pid
+    idx = ix.get("programIdIndex")
+    if isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < len(keys):
+        return keys[idx]
+    return None
+
+
+def _ix_account_refs(ix: dict, keys: list[str]):
+    """Every account an instruction references, normalised to pubkeys:
+    ``accounts`` entries as strings, ``{"pubkey": ...}`` dicts or indices into
+    ``keys``, plus string values of ``parsed.info``. ``_MALFORMED`` if any
+    reference cannot be read (non-list ``accounts``, bad index, odd entry)."""
+    refs: set[str] = set()
+    accounts = ix.get("accounts", [])
+    if not isinstance(accounts, list):
+        return _MALFORMED
+    for ref in accounts:
+        if isinstance(ref, str):
+            refs.add(ref)
+        elif isinstance(ref, dict) and isinstance(ref.get("pubkey"), str):
+            refs.add(ref["pubkey"])
+        elif isinstance(ref, int) and not isinstance(ref, bool) and 0 <= ref < len(keys):
+            refs.add(keys[ref])
+        else:
+            return _MALFORMED
+    parsed = ix.get("parsed")
+    if isinstance(parsed, dict):
+        info = parsed.get("info")
+        if isinstance(info, dict):
+            refs.update(v for v in info.values() if isinstance(v, str))
+        elif info is not None:
+            return _MALFORMED
+    return refs
+
+
+def _opaque_token_touch(ix: object, keys: list[str], targets: set[str], decoded_labels) -> bool:
+    """True if ``ix`` must fail the fill closed: it is (or cannot be ruled out
+    as) a token-program instruction touching ``targets`` that the caller does
+    NOT decode.
+
+    Rule (raw ``data`` is never decoded):
+    * Cleanly decoded = ``parsed`` is a dict with a dict ``info``, the
+      ``program`` label is in ``decoded_labels`` and the program id (if
+      present) is that label's token program. Those are left to the caller.
+    * Otherwise, token program = label ``spl-token``/``spl-token-2022`` OR
+      program id (``programId`` / ``programIdIndex``) SPL Token / Token-2022.
+      Unknown program = no readable program id and no string label.
+    * A token-program or unknown-program instruction whose account refs (see
+      ``_ix_account_refs``) intersect ``targets``, or whose refs cannot be read
+      at all, fails closed. One that touches none of ``targets`` is ignored, as
+      is any instruction of a known non-token program.
+    * A non-dict instruction fails closed.
+    """
+    if not isinstance(ix, dict):
+        return True
+    label = ix.get("program")
+    pid = _ix_program_id(ix, keys)
+    parsed = ix.get("parsed")
+    if (isinstance(parsed, dict) and isinstance(parsed.get("info"), dict)
+            and label in decoded_labels and pid in (None, _TOKEN_PROGRAM_IDS.get(label))):
+        return False
+    is_token = label in _TOKEN_PROGRAM_IDS or pid in _TOKEN_PROGRAM_IDS.values()
+    unknown = pid is None and not isinstance(label, str)
+    if not (is_token or unknown):
+        return False
+    refs = _ix_account_refs(ix, keys)
+    return refs is _MALFORMED or bool(refs & targets)
 
 
 def _ix_int(value: Any) -> Optional[int]:
@@ -312,6 +392,8 @@ def _native_sol_proceeds(tx: dict, owner: str) -> Optional[int]:
         wsol_in = wsol_out = rent_out = 0
         n_in = n_out = 0  # owner wSOL transfers by direction (see below)
         for ix in ixs:
+            if _opaque_token_touch(ix, keys, wsol, {"spl-token"}):
+                return None  # undecoded token instruction on our wSOL account
             parsed = ix.get("parsed")
             if not isinstance(parsed, dict):
                 continue
@@ -467,6 +549,8 @@ def _native_sol_spent(tx: dict, owner: str) -> Optional[int]:
         wsol_in = wsol_out = rent_out = 0
         n_in = n_out = 0  # owner wSOL transfers by direction (see below)
         for ix in ixs:
+            if _opaque_token_touch(ix, keys, wsol, {"spl-token"}):
+                return None  # undecoded token instruction on our wSOL account
             parsed = ix.get("parsed")
             if not isinstance(parsed, dict):
                 continue
@@ -600,6 +684,8 @@ def _route_token_received(tx: dict, owner: str, mint: str) -> Optional[int]:
 
         received: Optional[int] = None
         for ix in ixs:
+            if _opaque_token_touch(ix, keys, owned, _TOKEN_PROGRAMS):
+                return None  # undecoded/unlabelled token instruction on our account
             parsed = ix.get("parsed")
             if not isinstance(parsed, dict) or ix.get("program") not in _TOKEN_PROGRAMS:
                 continue
