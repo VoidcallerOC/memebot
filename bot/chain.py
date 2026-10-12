@@ -233,6 +233,17 @@ def _swap_route_inner_ids(tx: dict) -> Optional[set[int]]:
 SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 _TOKEN_PROGRAM_IDS = {"spl-token": SPL_TOKEN_PROGRAM_ID, "spl-token-2022": TOKEN_2022_PROGRAM}
 _MALFORMED = object()
+# Real mainnet ``getTransaction(jsonParsed)`` responses label Token-2022
+# instructions ``"program": "spl-token"`` while ``programId`` is the
+# Token-2022 program (verified on landed Jupiter buys, e.g. 41WvNWct...).
+# The program id is authoritative: for the bought token (which may live on
+# either program) the label ``spl-token`` is accepted with EITHER token
+# program id; ``spl-token-2022`` only with Token-2022. Any other label/id
+# pairing stays undecoded (fail closed). wSOL parsers keep the strict 1:1 map.
+_OUTPUT_TOKEN_LABEL_IDS = {
+    "spl-token": frozenset({SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM}),
+    "spl-token-2022": frozenset({TOKEN_2022_PROGRAM}),
+}
 
 
 def _ix_program_id(ix: dict, keys: list[str]) -> Optional[str]:
@@ -274,7 +285,8 @@ def _ix_account_refs(ix: dict, keys: list[str]):
     return refs
 
 
-def _opaque_token_touch(ix: object, keys: list[str], targets: set[str], decoded_labels) -> bool:
+def _opaque_token_touch(ix: object, keys: list[str], targets: set[str], decoded_labels,
+                        label_ids=None) -> bool:
     """True if ``ix`` must fail the fill closed: it is (or cannot be ruled out
     as) a token-program instruction touching ``targets`` that the caller does
     NOT decode.
@@ -298,7 +310,9 @@ def _opaque_token_touch(ix: object, keys: list[str], targets: set[str], decoded_
     pid = _ix_program_id(ix, keys)
     parsed = ix.get("parsed")
     if (isinstance(parsed, dict) and isinstance(parsed.get("info"), dict)
-            and label in decoded_labels and pid in (None, _TOKEN_PROGRAM_IDS.get(label))):
+            and label in decoded_labels
+            and (pid is None or pid in (label_ids.get(label, ()) if label_ids is not None
+                                        else (_TOKEN_PROGRAM_IDS.get(label),)))):
         return False
     is_token = label in _TOKEN_PROGRAM_IDS or pid in _TOKEN_PROGRAM_IDS.values()
     unknown = pid is None and not isinstance(label, str)
@@ -688,7 +702,7 @@ def _route_token_received(tx: dict, owner: str, mint: str) -> Optional[int]:
 
         received: Optional[int] = None
         for ix in ixs:
-            if _opaque_token_touch(ix, keys, owned, _TOKEN_PROGRAMS):
+            if _opaque_token_touch(ix, keys, owned, _TOKEN_PROGRAMS, _OUTPUT_TOKEN_LABEL_IDS):
                 return None  # undecoded/unlabelled token instruction on our account
             parsed = ix.get("parsed")
             if not isinstance(parsed, dict) or ix.get("program") not in _TOKEN_PROGRAMS:
