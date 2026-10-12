@@ -275,6 +275,11 @@ class SwapExecutor:
         signature is durably saved) allows the broadcast; anything else, or
         an exception, aborts with nothing sent (the signed bytes are
         discarded, never re-signed, re-quoted or resent).
+
+        Mandatory where ``requires_pre_broadcast_callback`` says so (armed
+        sells): without a callable ``before_broadcast`` the swap is refused
+        before any quote, signing or broadcast (after the allocation ceiling
+        and SOL-exposure gates, which refuse first).
         """
         if self.cfg.is_armed and (
             not isinstance(allocation_usd, (int, float))
@@ -296,6 +301,9 @@ class SwapExecutor:
                     status=TransactionStatus.CONFIRMED_FAILURE,
                     error=exposure_error,
                 )
+        missing = self._missing_pre_broadcast_callback(input_mint, before_broadcast)
+        if missing is not None:
+            return missing
         if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
             return SwapResult(
                 ok=False, simulated=not self.cfg.is_armed, in_amount=amount,
@@ -330,6 +338,25 @@ class SwapExecutor:
             quote, amount, out_amount,
             input_mint=input_mint, output_mint=output_mint,
             before_broadcast=before_broadcast,
+        )
+
+    def requires_pre_broadcast_callback(self, input_mint: Optional[str]) -> bool:
+        """Armed submissions that must durably save their signature before
+        broadcast. A sell is any swap whose input is not native SOL (the same
+        input-mint test as the SOL exposure check); an unknown input fails
+        closed as a sell. Buys (SOL input) are not covered yet: extending the
+        rule to every armed submission is ``return self.cfg.is_armed``."""
+        return self.cfg.is_armed and input_mint != SOL_MINT
+
+    def _missing_pre_broadcast_callback(self, input_mint, before_broadcast) -> Optional[SwapResult]:
+        if not self.requires_pre_broadcast_callback(input_mint) or callable(before_broadcast):
+            return None
+        log.error("live swap refused before quote/sign: no pre-broadcast signature "
+                  "persistence callback for an armed sell")
+        return SwapResult(
+            ok=False, simulated=False, in_amount=0, out_amount=0,
+            status=TransactionStatus.CONFIRMED_FAILURE,
+            error="refused: armed sell without a pre-broadcast persistence callback; nothing sent",
         )
 
     def _armed_sol_exposure_error(self, amount: object, allocation_usd: float) -> Optional[str]:
@@ -390,6 +417,11 @@ class SwapExecutor:
                     status=TransactionStatus.CONFIRMED_FAILURE,
                     error="signer does not match BURNER_WALLET_PUBKEY",
                 )
+            # Defence in depth for direct callers: the same mandatory-callback
+            # rule as ``swap``, before the transaction is built or signed.
+            missing = self._missing_pre_broadcast_callback(input_mint, before_broadcast)
+            if missing is not None:
+                return missing
             swap_resp = self.session.post(
                 self.jup.swap_url,
                 json={

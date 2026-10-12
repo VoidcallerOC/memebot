@@ -178,7 +178,9 @@ def boundary(monkeypatch):
 
 
 def run(ex):
-    return ex._execute_live({"outAmount": "10"}, 5, 10, input_mint=MINT, output_mint=SOL_MINT)
+    # an armed sell must carry a pre-broadcast persistence callback (True: durable)
+    return ex._execute_live({"outAmount": "10"}, 5, 10, input_mint=MINT, output_mint=SOL_MINT,
+                            before_broadcast=lambda sig: True)
 
 
 @pytest.mark.parametrize("build, kind", [(legacy_tx, "Message"), (v0_tx, "MessageV0")])

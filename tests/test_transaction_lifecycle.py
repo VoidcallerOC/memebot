@@ -172,7 +172,8 @@ def run_live_execution(monkeypatch, status, tx=None):
     session = FakeSession(status=status_value, tx=tx, status_error=status_error)
     executor = SwapExecutor(cfg(), jup=JupiterClient(cfg()), session=session)
     executor._load_keypair = lambda _keypair: types.SimpleNamespace(pubkey=lambda: "PUBKEY")
-    return executor._execute_live({"outAmount": "10"}, 5, 10)
+    # unknown input is treated as an armed sell: it needs a durable pre-broadcast callback
+    return executor._execute_live({"outAmount": "10"}, 5, 10, before_broadcast=lambda sig: True)
 
 
 def test_submission_signature_but_confirmation_failure_is_not_success(monkeypatch):
