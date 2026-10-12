@@ -283,7 +283,7 @@ def test_presend_crash_after_replace_restarts_from_either_version_once(world, mo
 
 # -- booking: non-durable booking stays confirmed_unbooked, books exactly once ---------
 
-BOOKING_SAVE = {"on_time": 3, "delayed": 2}   # [pending,] confirmed_unbooked, booking
+BOOKING_SAVE = {"on_time": 4, "delayed": 2}   # [pending, signature,] confirmed_unbooked, booking
 
 
 def _to_booking_tick(world, bot, path):

@@ -282,9 +282,9 @@ def test_booking_save_failure_rolls_rung_back_and_recovers_once(world, monkeypat
     bot = live_tp(world)
     sells(world, SIG, IN_RAW)
     if fault == "save_false":
-        real = fail_saves(monkeypatch, {3})           # pending, confirmed_unbooked, booking
+        real = fail_saves(monkeypatch, {4})           # pending, signature, confirmed_unbooked, booking
     else:
-        install_faulty_os(monkeypatch, {3: "dir_fsync"}, path=world.state)  # the booking save
+        install_faulty_os(monkeypatch, {4: "dir_fsync"}, path=world.state)  # the booking save
     bot._tick()
     pos = bot.portfolio.positions[MINT]
     assert pos.ladder_filled == set() and pos.raw_tokens == RAW_DOUBLE
@@ -340,7 +340,7 @@ def test_crash_after_every_save_converges_to_one_sale_one_rung(world, monkeypatc
         run(boot(world), 2)                           # durable completion: no resell
         assert_tp50_once(world, sends=[SIG])
         k += 1
-    assert k - 1 == {"on_time": 3, "delayed": 2}[path]
+    assert k - 1 == {"on_time": 4, "delayed": 2}[path]
     assert_tp50_once(world, sends=[SIG])
 
 
@@ -360,8 +360,9 @@ def test_booked_rung_is_in_the_same_write_as_the_settlement(world, monkeypatch):
     monkeypatch.setattr(main_module, "save_state", spy)
     bot._tick()
     assert [[i["status"] for i in intents_of(s)] for s in writes] == [
-        ["pending"], ["confirmed_unbooked"], ["settled"]]
-    assert [ladder(s) for s in writes] == [[], [], [50.0]]
+        ["pending"], ["pending"], ["confirmed_unbooked"], ["settled"]]
+    assert [intents_of(s)[0]["tx_signature"] for s in writes] == [None, SIG, SIG, SIG]
+    assert [ladder(s) for s in writes] == [[], [], [], [50.0]]
     for s in writes:
         assert sorted(ladder(s)) == settled_rungs(s)
 

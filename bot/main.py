@@ -872,13 +872,51 @@ class TradingBot:
             self._save()
             return False
         tokens_to_sell = raw_amount / (10 ** valid_token_decimals(decimals))
+        pre_broadcast = {"refused": False}
+
+        def persist_signature(signature: str) -> bool:
+            """Durably save the signed transaction's exact signature on this
+            intent BEFORE it is broadcast. Only an explicit True from the
+            save allows the broadcast (no placeholders; no key or tx bytes
+            are stored)."""
+            intent["tx_signature"] = signature
+            intent["signed_at"] = time.time()
+            if self._save() is True:
+                return True
+            pre_broadcast["refused"] = True
+            return False
+
         result = self.executor.swap(
             pos.mint, SOL_MINT, raw_amount,
             allocation_usd=min(tokens_to_sell * price, self.cfg.max_position_usd()),
+            before_broadcast=persist_signature,
         )
-        intent["tx_signature"] = result.tx_signature
         intent["outcome"] = getattr(result.status, "value", str(result.status))
         intent["error"] = result.error
+        if pre_broadcast["refused"]:
+            # Signed but NOT broadcast (the bytes were discarded and can never
+            # land). Disk may hold the intent with or without this signature;
+            # either way a restart resolves it on evidence (signature status /
+            # blockhash expiry + unchanged wallet). In memory we know nothing
+            # was sent: the resolver clears it and the exit is re-evaluated
+            # with a NEW intent; this one is kept (with its signature) as audit.
+            intent["status"] = "blocked"
+            intent["error"] = "signature not durably saved before broadcast; nothing sent"
+            log.error("live sell for %s not broadcast: signature not durable", pos.symbol)
+            self._save()
+            return False
+        persisted = intent.get("tx_signature")
+        if persisted and result.tx_signature and result.tx_signature != persisted:
+            # Never replace the saved signature: resolve by it, fail closed.
+            intent["status"] = "unresolved"
+            intent["reported_signature"] = result.tx_signature
+            intent["resolution"] = "executor reported a different signature than was saved"
+            self._reconciliation_required = True
+            log.error("live sell for %s: signature mismatch; frozen", pos.symbol)
+            self._save()
+            return False
+        if not persisted:
+            intent["tx_signature"] = result.tx_signature
         if not result.ok or result.status != TransactionStatus.CONFIRMED_SUCCESS:
             intent["status"] = "unresolved"
             if result.status in {

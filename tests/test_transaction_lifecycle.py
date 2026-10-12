@@ -143,7 +143,8 @@ def install_fake_live_modules(monkeypatch, status):
     Versioned = type(
         "VersionedTransaction",
         (),
-        {"from_bytes": RawTx.from_bytes, "__init__": SignedTx.__init__, "__bytes__": SignedTx.__bytes__},
+        {"from_bytes": RawTx.from_bytes, "__init__": SignedTx.__init__, "__bytes__": SignedTx.__bytes__,
+         "signatures": ["sig"]},
     )
     modules = {
         "solders": types.ModuleType("solders"),
