@@ -211,6 +211,11 @@ def world(monkeypatch, tmp_path):
     w = World(tmp_path)
 
     class SpySigned:
+        def __init__(self, signature):
+            # A signed transaction is known on chain by its first signature:
+            # the one the send stub will return for it.
+            self.signatures = [signature]
+
         def __bytes__(self):
             return b"spy-signed"
 
@@ -220,7 +225,7 @@ def world(monkeypatch, tmp_path):
 
         def __new__(cls, message, signers):
             w.signs.append(type(message).__name__)
-            return SpySigned()
+            return SpySigned(w.sig_queue[0] if w.sig_queue else "UnqueuedSpySignature")
 
     spy = types.ModuleType("solders.transaction")
     spy.VersionedTransaction = SpyVersionedTransaction
@@ -636,18 +641,19 @@ def test_crash_after_every_save_never_loses_or_double_books(world, monkeypatch, 
         else:
             assert_booked_once(world, **expect)
         k += 1
-    # saves in the settling tick: on-time = pending, confirmed_unbooked, settled;
+    # saves in the settling tick: on-time = pending, signature (pre-broadcast),
+    # confirmed_unbooked, settled;
     # delayed = confirmed_unbooked, settled (main: pending, settled, booked / settled, booked)
-    assert k - 1 == {"on_time": 3, "delayed": 2}[path]
+    assert k - 1 == {"on_time": 4, "delayed": 2}[path]
     assert_booked_once(world, **expect)                # the uncrashed run as well
 
 
-def test_crash_after_send_before_signature_persisted_stays_frozen(world):
-    """Pre-existing window (not changed here): the process dies inside the swap
-    after the transaction was sent, before its signature reaches the state
-    file. The persisted intent is 'pending' with no signature: the mint stays
-    frozen and the wallet drop blocks startup reconciliation, so the sale is
-    neither re-sent nor booked without operator action."""
+def test_crash_after_send_resolves_by_the_signature_saved_before_broadcast(world):
+    """Formerly a gap: the process died inside the swap after the transaction
+    was sent, before its signature reached the state file, leaving a 'pending'
+    intent with no signature (frozen, operator action). The exact signature is
+    now durably saved BEFORE broadcast, so a restart resolves the sale by that
+    signature and books it exactly once, without resending."""
     bot = boot(world)
     open_position(bot, world)
     world.sig_queue = [SIG]
@@ -657,16 +663,12 @@ def test_crash_after_send_before_signature_persisted_stays_frozen(world):
     with pytest.raises(SystemExit):
         bot._tick()
     world.crash_after_send = False
-    world.now += main_module.SELL_INTENT_EXPIRY_SECONDS + 1
+    (intent,) = intents_of(persisted(world))
+    assert (intent["status"], intent["tx_signature"]) == ("pending", SIG)
     bot2 = boot(world)
-    assert run(bot2, 3) == 0                    # startup reconciliation not clean: blocked
-    state = persisted(world)
-    mine = intents_of(state)
-    assert [i["status"] for i in mine] == ["pending"] and mine[0]["tx_signature"] is None
-    assert "operator action required" in mine[0]["resolution"]
-    assert position(state)["tokens"] == FULL and state["portfolio"]["realized_pnl"] == 0.0
-    assert world.sends == [SIG]
-
+    assert run(bot2, 3) == 3
+    assert world.sends == [SIG] and len(bot2.notifier.sells) == 1
+    assert_booked_once(world)
 
 # -- the settlement state machine directly ------------------------------------------
 

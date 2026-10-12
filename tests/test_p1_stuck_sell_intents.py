@@ -51,7 +51,7 @@ class FakeExecutor:
         self.results = list(results)
         self.calls = []
 
-    def swap(self, i, o, amount, *, allocation_usd=None):
+    def swap(self, i, o, amount, *, allocation_usd=None, before_broadcast=None):
         self.calls.append((i, o, amount))
         if self.results:
             return self.results.pop(0)

@@ -8,7 +8,7 @@ import time
 from fractions import Fraction
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -191,6 +191,22 @@ class SwapResult:
     fill_source: Optional[str] = None
 
 
+_DEFAULT_SIGNATURE = "1" * 64   # base58 of 64 zero bytes: an unsigned slot
+
+
+def signed_tx_signature(signed: Any) -> Optional[str]:
+    """The first signature (base58) of a signed transaction: the id the
+    network will know it by. None if missing or the all-zero placeholder."""
+    try:
+        sigs = signed.signatures
+        value = str(sigs[0]) if sigs else ""
+    except Exception:
+        return None
+    if not value or value == _DEFAULT_SIGNATURE:
+        return None
+    return value
+
+
 def _status_from_rpc(value: Any, commitment: str) -> Optional[TransactionStatus]:
     if value is None:
         return None
@@ -249,7 +265,17 @@ class SwapExecutor:
         self.jup = jup or JupiterClient(cfg, self.session)
 
     def swap(self, input_mint: str, output_mint: str, amount: int,
-             *, allocation_usd: Optional[float] = None) -> SwapResult:
+             *, allocation_usd: Optional[float] = None,
+             before_broadcast: Optional[Callable[[str], bool]] = None) -> SwapResult:
+        """Quote, validate and (armed) execute a swap.
+
+        ``before_broadcast`` (armed sells): called with the exact signature of
+        the signed transaction (its first signature, base58) after signing and
+        before anything is broadcast. Only a return value of ``True`` (the
+        signature is durably saved) allows the broadcast; anything else, or
+        an exception, aborts with nothing sent (the signed bytes are
+        discarded, never re-signed, re-quoted or resent).
+        """
         if self.cfg.is_armed and (
             not isinstance(allocation_usd, (int, float))
             or isinstance(allocation_usd, bool)
@@ -303,6 +329,7 @@ class SwapExecutor:
         return self._execute_live(
             quote, amount, out_amount,
             input_mint=input_mint, output_mint=output_mint,
+            before_broadcast=before_broadcast,
         )
 
     def _armed_sol_exposure_error(self, amount: object, allocation_usd: float) -> Optional[str]:
@@ -342,6 +369,7 @@ class SwapExecutor:
         out_amount: int,
         input_mint: Optional[str] = None,
         output_mint: Optional[str] = None,
+        before_broadcast: Optional[Callable[[str], bool]] = None,
     ) -> SwapResult:
         try:
             from solders.keypair import Keypair
@@ -352,6 +380,7 @@ class SwapExecutor:
                 status=TransactionStatus.CONFIRMED_FAILURE,
                 error="solana/solders not installed; cannot trade live",
             )
+        signature: Optional[str] = None   # set once a broadcast may have happened
         try:
             keypair = self._load_keypair(Keypair)
             user_pubkey = str(keypair.pubkey())
@@ -392,7 +421,50 @@ class SwapExecutor:
                     status=TransactionStatus.CONFIRMED_FAILURE, error=version_error,
                 )
             signed = VersionedTransaction(tx.message, [keypair])
-            signature = send_raw_transaction(self.session, self.cfg.rpc_url, bytes(signed))
+            # The transaction's identity on chain is its first signature,
+            # known before broadcast; it never depends on the send response.
+            derived = signed_tx_signature(signed)
+            if derived is None:
+                log.error("live swap refused before broadcast: signed transaction has no "
+                          "usable first signature")
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    status=TransactionStatus.CONFIRMED_FAILURE,
+                    error="refused before broadcast: signed transaction has no signature",
+                )
+            if before_broadcast is not None:
+                try:
+                    durable = before_broadcast(derived) is True
+                except Exception as exc:
+                    log.error("pre-broadcast signature persistence raised: %s", exc)
+                    durable = False
+                if not durable:
+                    log.error("live swap NOT broadcast: signature %s was not durably saved",
+                              derived)
+                    return SwapResult(
+                        ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                        tx_signature=derived, status=TransactionStatus.CONFIRMED_FAILURE,
+                        error="signature not durably saved before broadcast; nothing sent",
+                    )
+            signature = derived
+            try:
+                reported = send_raw_transaction(self.session, self.cfg.rpc_url, bytes(signed))
+            except Exception as exc:
+                # The broadcast may or may not have reached the network: never
+                # resend; resolve by the (already saved) signature.
+                log.error("LIVE swap broadcast outcome unknown for %s: %s", signature, exc)
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    tx_signature=signature, status=TransactionStatus.UNKNOWN,
+                    error=f"broadcast outcome unknown: {exc}",
+                )
+            if reported != signature:
+                log.error("LIVE swap: RPC reported signature %s, signed %s", reported, signature)
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    tx_signature=signature, status=TransactionStatus.UNKNOWN,
+                    error=f"RPC reported a different signature ({reported})",
+                )
             log.info("LIVE swap submitted: %s", signature)
             status = self._confirm_transaction(self.session, signature)
             if status != TransactionStatus.CONFIRMED_SUCCESS:
@@ -417,7 +489,7 @@ class SwapExecutor:
             log.error("LIVE swap failed: %s", exc)
             return SwapResult(
                 ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
-                status=TransactionStatus.UNKNOWN, error=str(exc),
+                tx_signature=signature, status=TransactionStatus.UNKNOWN, error=str(exc),
             )
 
     def _extract_confirmed_fill(

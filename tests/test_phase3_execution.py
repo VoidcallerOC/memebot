@@ -111,7 +111,8 @@ def install_solders(monkeypatch):
             pass
         def __bytes__(self):
             return b"signed"
-    Versioned = type("VersionedTransaction", (), {"from_bytes": RawTx.from_bytes, "__init__": SignedTx.__init__, "__bytes__": SignedTx.__bytes__})
+    Versioned = type("VersionedTransaction", (), {"from_bytes": RawTx.from_bytes, "__init__": SignedTx.__init__, "__bytes__": SignedTx.__bytes__,
+                                               "signatures": ["sig-fill"]})
     modules = {
         "solders": types.ModuleType("solders"),
         "solders.keypair": types.ModuleType("solders.keypair"),

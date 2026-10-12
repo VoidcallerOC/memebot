@@ -177,7 +177,7 @@ def test_valid_quote_armed_still_reaches_execution(direction, threshold_present)
     (quote, amt, out, kw), = seen
     assert amt == amount and out == amount * 1000 and isinstance(out, int)
     assert quote["inAmount"] == str(amount)
-    assert kw == {"input_mint": i, "output_mint": o}
+    assert kw == {"input_mint": i, "output_mint": o, "before_broadcast": None}
 
 
 # -- callers: armed exits ----------------------------------------------------

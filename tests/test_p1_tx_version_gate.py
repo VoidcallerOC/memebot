@@ -147,6 +147,8 @@ def boundary(monkeypatch):
     events = []
 
     class SpySigned:
+        signatures = ["sig-test"]   # what the signed tx is known by on chain
+
         def __bytes__(self):
             return b"spy-signed"
 
