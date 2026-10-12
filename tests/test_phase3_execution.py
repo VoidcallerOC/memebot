@@ -181,7 +181,8 @@ def test_live_sell_without_settlement_does_not_reduce_position():
     bot = main_module.TradingBot.__new__(main_module.TradingBot)
     bot.cfg = cfg()
     bot.portfolio = Portfolio()
-    bot.portfolio.open(MINT, "TEST", 1.0, 5.0, 25.0, token_decimals=6)
+    bot.portfolio.open(MINT, "TEST", 1.0, 5.0, 25.0, token_decimals=6,
+                       raw_tokens=25_000_000, raw_tokens_initial=25_000_000)
     bot.executor = types.SimpleNamespace(swap=lambda *args, **kwargs: SwapResult(
         ok=False, simulated=False, in_amount=1, out_amount=0,
         status=TransactionStatus.TIMEOUT, error="timeout",

@@ -167,7 +167,7 @@ def make_bot(env, results=(), armed=True, load=False):
 
 
 def open_pos(bot, mint=MINT, symbol="A"):
-    bot.portfolio.open(mint, symbol, 1.0, 2.0, 2.0, token_decimals=6)
+    bot.portfolio.open(mint, symbol, 1.0, 2.0, 2.0, token_decimals=6, raw_tokens=2_000_000, raw_tokens_initial=2_000_000)
 
 
 def intents(bot):

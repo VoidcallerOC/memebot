@@ -234,7 +234,8 @@ def test_version_refusal_clears_sell_intent_for_retry(boundary, monkeypatch):
     for name in ("get_signature_status", "get_confirmed_transaction", "fetch_wallet_token_balances"):
         monkeypatch.setattr(main_module, name,
                             lambda *a, **k: (_ for _ in ()).throw(AssertionError("no chain lookup")))
-    bot.portfolio.open(MINT, "V", 1.0, 2.0, 2.0, token_decimals=6)
+    bot.portfolio.open(MINT, "V", 1.0, 2.0, 2.0, token_decimals=6,
+                       raw_tokens=2_000_000, raw_tokens_initial=2_000_000)
 
     assert bot._settle_live_sell(bot.portfolio.positions[MINT], 1.0, 0.5, "stop_loss") is False
     intent = bot.portfolio.pending_intents[-1]
