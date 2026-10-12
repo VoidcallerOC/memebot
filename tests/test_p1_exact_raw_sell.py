@@ -79,10 +79,10 @@ def test_entry_seeds_raw_holding_from_verified_fill():
         status=TransactionStatus.CONFIRMED_SUCCESS, actual_in_amount=10**8,
         actual_out_amount=123_456_789, fee_lamports=5000, in_decimals=9, out_decimals=8))
     bot.notifier = types.SimpleNamespace(buy=lambda *a: None)
-    bot._usd_to_lamports = lambda _usd: 1
+    bot._usd_to_lamports = lambda _usd: 10**8   # the fill's SOL in may not exceed this
     bot._sell_route_ok = lambda _m, _l: True
     bot._reconciliation_required = False
-    bot._save = lambda: None
+    bot._save = lambda: True                     # armed entries need durable saves
     bot._seek_entry()
     pos = bot.portfolio.positions[MINT]
     assert getattr(pos, "raw_tokens", None) == 123_456_789

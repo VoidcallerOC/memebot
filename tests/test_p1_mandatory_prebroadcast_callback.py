@@ -1,7 +1,7 @@
-"""P1: the pre-broadcast persistence callback is MANDATORY for armed sells.
+"""P1: the pre-broadcast persistence callback is MANDATORY for every armed swap.
 
-``SwapExecutor.requires_pre_broadcast_callback(input_mint)``: armed and the
-input is not native SOL (a sell; an unknown input fails closed as a sell).
+``SwapExecutor.requires_pre_broadcast_callback(input_mint)``: armed (sells
+since #39; armed BUYS too since the buy-path PR: ``return self.cfg.is_armed``).
 Without a callable ``before_broadcast`` such a swap is refused:
 
 * via ``swap``: before the quote (after the allocation / SOL-exposure gates):
@@ -12,9 +12,8 @@ Without a callable ``before_broadcast`` such a swap is refused:
 With a callback, only a return value that ``is True`` lets the transaction be
 broadcast; False / None / truthy non-True / an exception -> zero broadcasts,
 a definitive ``CONFIRMED_FAILURE`` that the sell path turns into a blocked /
-failed intent (rung retryable). Paper mode and armed BUYS (SOL input) are
-unchanged here; making the callback mandatory for buys is PR B (the guard's
-one-line change: ``return self.cfg.is_armed``).
+failed intent (rung retryable). Paper mode is unchanged. The buy path's own
+lifecycle tests live in ``test_p1_buy_prebroadcast_signature``.
 
 Real signing with a throwaway keypair and a fake RPC that verifies every
 broadcast, as in ``test_p1_prebroadcast_signature``.
@@ -158,7 +157,7 @@ def test_sell_e2e_with_production_callback_unchanged(rw):
     booked_once(rw, sig)
 
 
-# -- unchanged: paper, and armed buys (PR B scope) ------------------------------------
+# -- unchanged: paper; flipped by the buy-path PR: armed buys need the callback -------
 
 def test_paper_sell_without_callback_unchanged(rw):
     cfg = Config(live_trading=False, bankroll_usd=20.0, max_position_pct=10.0)
@@ -169,16 +168,18 @@ def test_paper_sell_without_callback_unchanged(rw):
     assert rw.builds == 0 and rw.sends == []
 
 
-def test_armed_buy_without_callback_still_broadcasts_pr_b_scope(rw):
-    """Documented scope boundary: armed buys (SOL input) do not require the
-    callback in this PR. PR B makes it mandatory for every armed submission."""
+def test_armed_buy_without_callback_now_refused_before_quote_build_sign_broadcast(rw):
+    """Flipped from #39's documented scope boundary: an armed buy (SOL input)
+    without the callback is refused like a sell (after the SOL-exposure
+    gate, whose SOL/USD price quote is the only quote made)."""
     ex = executor(rw)
-    assert ex.requires_pre_broadcast_callback(SOL_MINT) is False
-    rw.plan = ["drop"]
+    assert ex.requires_pre_broadcast_callback(SOL_MINT) is True
+    loads = counting(ex)
     result = ex.swap(SOL_MINT, MINT, 1_000_000, allocation_usd=2.0)
-    (sig,) = rw.sends
-    assert result.tx_signature == sig and rw.builds == 1
-    assert result.status == TransactionStatus.TIMEOUT       # not visible within timeout 0
+    assert result.ok is False and result.status == TransactionStatus.CONFIRMED_FAILURE
+    assert result.tx_signature is None and "armed buy without a pre-broadcast" in result.error
+    assert (SOL_MINT, MINT, 1_000_000) not in ex.jup.quotes        # no swap quote
+    assert loads == [] and rw.builds == 0 and rw.sends == []
 
 
 # -- the executed direction is the quote's, validated against the request ------------
@@ -256,12 +257,16 @@ def test_consistent_sell_quote_without_callback_refused_before_build(rw):
     assert rw.builds == 0 and rw.sends == [] and "pre-broadcast" in result.error
 
 
-def test_consistent_buy_quote_without_callback_still_broadcasts_pr_b_scope(rw):
+def test_consistent_buy_quote_without_callback_now_refused_before_build(rw):
+    """Flipped by the buy-path PR: direct ``_execute_live`` with a consistent
+    buy quote and no callback is refused after the signer check, before the
+    build: zero builds, signatures, broadcasts."""
     ex = executor(rw)
     rw.plan = ["drop"]
     result = ex._execute_live(BUY_QUOTE, 1_000_000, 1, input_mint=SOL_MINT, output_mint=MINT)
-    (sig,) = rw.sends
-    assert result.tx_signature == sig and rw.builds == 1
+    assert result.ok is False and result.status == TransactionStatus.CONFIRMED_FAILURE
+    assert result.tx_signature is None and "pre-broadcast" in result.error
+    assert rw.builds == 0 and rw.sends == []
 
 
 def test_swap_path_never_executes_a_quote_with_another_direction(rw):

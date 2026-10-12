@@ -215,6 +215,7 @@ def test_two_percent_loss_passes_and_armed_swap_reaches_execution(monkeypatch):
     jup = RouteJup(sell_ratio=Fraction(98, 100))
     cfg = armed_cfg()
     bot = make_bot(jup, cfg)
+    bot._save = lambda: True                   # armed entries need a durable buy intent
     executor = SwapExecutor(cfg, jup=jup, session=object())
     reached = []
     executor._execute_live = lambda quote, amount, out, **kw: reached.append(amount) or SwapResult(

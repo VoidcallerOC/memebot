@@ -327,7 +327,8 @@ def test_main_live_armed_does_not_use_decision_gate(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(bot, "_usd_to_lamports", lambda usd: 1)
     # Pre-buy sell-route gate is covered in tests/test_p1_sellability.py.
     monkeypatch.setattr(bot, "_sell_route_ok", lambda mint, lamports: True)
-    monkeypatch.setattr(bot, "_save", lambda: None)
+    # armed entries need a durable intent save (True) before quote/sign
+    monkeypatch.setattr(bot, "_save", lambda: True)
     bot._seek_entry()
     # Live path ignores decision gate — position may open if swap confirms.
     assert bot.portfolio.open_count == 1

@@ -96,13 +96,14 @@ def test_entry_with_out_of_range_fill_raw_records_no_position(out_raw):
         status=TransactionStatus.CONFIRMED_SUCCESS, actual_in_amount=10**8,
         actual_out_amount=out_raw, fee_lamports=5000, in_decimals=9, out_decimals=8))
     bot.notifier = types.SimpleNamespace(buy=lambda *a: (_ for _ in ()).throw(AssertionError("no buy")))
-    bot._usd_to_lamports = lambda _usd: 1
+    bot._usd_to_lamports = lambda _usd: 10**8   # SOL in is valid; only the raw out is bad
     bot._sell_route_ok = lambda _m, _l: True
     bot._reconciliation_required = False
-    bot._save = lambda: None
+    bot._save = lambda: True                     # armed entries need durable saves
     bot._seek_entry()
     assert bot.portfolio.positions == {}
-    assert bot._reconciliation_required is True
+    (intent,) = bot.portfolio.buy_intents        # unresolved: entries blocked, nothing recorded
+    assert intent["status"] == "unresolved" and "token output" in intent["resolution"]
 
 
 # -- corrupted persisted holdings fail closed before quote / sign / send ----------

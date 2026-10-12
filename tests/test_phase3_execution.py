@@ -135,7 +135,9 @@ def test_live_swap_attaches_getTransaction_fill(monkeypatch):
     executor = SwapExecutor(cfg(), jup=JupiterClient(cfg()), session=session)
     executor._load_keypair = lambda _keypair: types.SimpleNamespace(pubkey=lambda: WALLET)
     quote = {"inputMint": SOL_MINT, "outputMint": MINT, "outAmount": "1"}
-    result = executor._execute_live(quote, 5, 1, input_mint=SOL_MINT, output_mint=MINT)
+    # armed buys carry the pre-broadcast persistence callback (True: durable)
+    result = executor._execute_live(quote, 5, 1, input_mint=SOL_MINT, output_mint=MINT,
+                                    before_broadcast=lambda sig: True)
     assert result.ok
     assert result.status == TransactionStatus.CONFIRMED_SUCCESS
     assert result.tx_signature == "sig-fill"
@@ -161,11 +163,11 @@ def test_live_entry_opens_from_confirmed_raw_fill_and_persists_full_record(monke
         fill_source="getTransaction",
     ))
     bot.notifier = types.SimpleNamespace(buy=lambda *args: None)
-    bot._usd_to_lamports = lambda _usd: 1
+    bot._usd_to_lamports = lambda _usd: 500_000_000   # the fill's SOL in may not exceed this
     bot._sell_route_ok = lambda _mint, _lamports: True  # gate tested in test_p1_sellability
     bot._reconciliation_required = False
     saved = []
-    bot._save = lambda: saved.append(True)
+    bot._save = lambda: saved.append(True) or True
     bot._seek_entry()
     pos = bot.portfolio.positions[MINT]
     assert pos.tokens == 25.0
@@ -176,7 +178,11 @@ def test_live_entry_opens_from_confirmed_raw_fill_and_persists_full_record(monke
     assert pos.actual_in_amount == 500_000_000
     assert pos.fee_lamports == 5000
     assert pos.token_decimals == 6
-    assert saved == [True]
+    assert pos.raw_tokens == pos.raw_tokens_initial == 25_000_000
+    # intent (before quote/sign), fill evidence, then position + settled (one write)
+    assert len(saved) == 3
+    (intent,) = bot.portfolio.buy_intents
+    assert intent["status"] == "settled" and intent["tx_signature"] == "sig-fill"
 
 
 def test_live_sell_without_settlement_does_not_reduce_position():
