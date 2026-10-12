@@ -39,7 +39,7 @@ from .process_lock import ProcessLock
 from .reconcile import reconcile_wallet
 from .risk import RiskManager
 from .safety import SafetyScreener
-from .state import load_state, save_state
+from .state import durable_saves_supported, load_state, save_state
 from .strategy import build_strategy
 
 try:
@@ -335,6 +335,12 @@ class TradingBot:
 
     def run(self) -> None:
         self._banner()
+        if self.cfg.is_armed and not durable_saves_supported():
+            # Live sells require a durable intent before send; without
+            # directory fsync no save is ever durable, so refuse to trade.
+            log.error("live startup blocked: durable state saves (directory fsync) are "
+                      "not supported on this platform")
+            return
         mode = "LIVE — REAL MONEY" if self.cfg.is_armed else "DRY-RUN"
         if self.notifier.enabled:
             self.notifier.startup(mode)
@@ -1026,8 +1032,10 @@ class TradingBot:
         return snapshot.amounts if snapshot is not None else None
 
     def _save(self) -> bool:
-        """Persist state atomically. False means the write did NOT happen;
-        callers about to send or to treat a settlement as done must check."""
+        """Persist state. False means the write is NOT known durable (it may
+        not have happened, or the new file may be visible but not yet
+        durable); callers about to send or to treat a settlement as done must
+        check and fail closed. See ``bot.state.save_state``."""
         return save_state(self.cfg.state_file, self.portfolio, self.risk)
 
     def _usd_to_lamports(self, usd: float) -> int | None:
