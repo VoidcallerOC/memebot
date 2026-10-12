@@ -552,10 +552,11 @@ def extract_fill(
     """Deterministically read wallet token/SOL deltas from a parsed transaction.
 
     Amounts are raw integer units (lamports for SOL). A failed transaction
-    (``meta.err`` set) or missing meta yields no amounts. For SOL output the
-    owner's persistent wSOL token-balance delta is used when positive;
-    otherwise native SOL proceeds are derived by ``_native_sol_proceeds``
-    (temporary wSOL account closed in the same transaction) or left None.
+    (``meta.err`` set) or missing meta yields no amounts. For SOL output,
+    ``actual_out_amount`` is set only from the proceeds proven by
+    ``_native_sol_proceeds`` (temporary or persistent wSOL account); a
+    non-zero owner wSOL token-balance delta must equal that exactly, else
+    the fill is incomplete.
     For SOL input, ``actual_in_amount`` is set only from the exact principal
     proven by ``_native_sol_spent``; otherwise it is None (incomplete fill).
     """
@@ -578,7 +579,24 @@ def extract_fill(
     if meta.get("err") is not None:
         return record  # failed transaction: nothing was filled
 
-    if output_mint:
+    if output_mint == SOL_MINT:
+        # SOL out is accepted ONLY when ``_native_sol_proceeds`` proves it:
+        # exactly one pool -> owner wSOL transfer as a CPI of the single
+        # Jupiter route, no owner wSOL outflow, and every lamport of the owner
+        # + its wSOL accounts reconciled. This covers a persistent (never
+        # closed) wSOL account too: its lamports rise with its token balance.
+        # The owner's wSOL token-balance delta is NOT a fallback (an unrelated
+        # transfer into a persistent wSOL account inflates it); when non-zero
+        # it must equal the proven amount EXACTLY, else the fill is unproven.
+        native = _native_sol_proceeds(tx, owner)
+        if native is not None:
+            post_w = post.get(SOL_MINT)
+            pre_w = pre.get(SOL_MINT)
+            wsol_delta = (post_w[0] if post_w else 0) - (pre_w[0] if pre_w else 0)
+            if wsol_delta in (0, native):
+                record.actual_out_amount = native
+                record.out_decimals = 9
+    elif output_mint:
         pre_out = pre.get(output_mint, (0, post.get(output_mint, (0, 0))[1]))
         post_out = post.get(output_mint)
         if post_out is not None:
@@ -586,11 +604,6 @@ def extract_fill(
             if delta > 0:
                 record.actual_out_amount = delta
                 record.out_decimals = post_out[1]
-        if record.actual_out_amount is None and output_mint == SOL_MINT:
-            native = _native_sol_proceeds(tx, owner)
-            if native is not None:
-                record.actual_out_amount = native
-                record.out_decimals = 9
 
     if input_mint and input_mint != SOL_MINT:
         pre_in = pre.get(input_mint)

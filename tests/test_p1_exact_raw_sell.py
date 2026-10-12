@@ -20,6 +20,8 @@ from fractions import Fraction
 
 import pytest
 
+from tests.test_p1_stuck_sell_intents import sell_tx
+
 import bot.main as main_module
 from bot.jupiter import SOL_MINT, SwapResult, TransactionStatus
 from bot.portfolio import Portfolio, Position
@@ -204,16 +206,9 @@ def test_delayed_settlement_decrements_exactly_once(env):
     bot._tick()
     assert pos.raw_tokens == 123_456_789          # unknown: no decrement
     env.chain.status["sig-1"] = {"err": None, "confirmationStatus": "confirmed"}
-    env.chain.txs["sig-1"] = {
-        "transaction": {"message": {"accountKeys": ["WalletPubkey1111111111111111111111111111111"]}},
-        "meta": {"err": None, "fee": 5000, "innerInstructions": [],
-                 "preTokenBalances": [{"owner": "WalletPubkey1111111111111111111111111111111", "mint": MINT,
-                                       "uiTokenAmount": {"amount": "123456789", "decimals": 8}}],
-                 "postTokenBalances": [{"owner": "WalletPubkey1111111111111111111111111111111", "mint": MINT,
-                                        "uiTokenAmount": {"amount": "61728395", "decimals": 8}},
-                                       {"owner": "WalletPubkey1111111111111111111111111111111", "mint": SOL_MINT,
-                                        "uiTokenAmount": {"amount": "5000000", "decimals": 9}}],
-                 "preBalances": [10**9], "postBalances": [10**9]}}
+    # strictly provable persistent-wSOL sell (see test_p1_stuck_sell_intents.sell_tx)
+    env.chain.txs["sig-1"] = sell_tx(mint=MINT, token_pre=123_456_789, token_post=61_728_395,
+                                     wsol_out=5_000_000, owner="WalletPubkey1111111111111111111111111111111")
     for _ in range(3):
         bot._tick()
     assert intents(bot) == [(MINT, "settled")]

@@ -111,7 +111,11 @@ def test_real_fixture_temp_account_absent_from_token_balances():
 
 # -- persistent wSOL and token -> token keep existing behaviour ----------------
 
-def test_persistent_wsol_output_uses_token_balance_delta():
+def test_persistent_wsol_delta_accepted_only_when_equal_to_strict_result():
+    # Persistent wSOL fix (Nick @ b9690ee): this used to settle from the
+    # token-balance delta ALONE. Now the strict parser must prove it (the close
+    # removed but balances untouched still reconciles the owner + wSOL group:
+    # 8,656,067) and the non-zero token delta must equal that exactly.
     tx = real()
     remove(tx, find(tx, "closeAccount", account=TEMP))
     bal = lambda amt: {"accountIndex": TEMP_IDX, "mint": SOL, "owner": OWNER,
@@ -121,6 +125,8 @@ def test_persistent_wsol_output_uses_token_balance_delta():
     tx["meta"]["postTokenBalances"].append(bal(OUT_LAMPORTS))
     f = fill(tx)
     assert f.actual_out_amount == OUT_LAMPORTS and f.out_decimals == 9
+    tx["meta"]["postTokenBalances"][-1] = bal(OUT_LAMPORTS + 1)   # delta != strict result
+    assert fill(tx).actual_out_amount is None
 
 
 def test_token_to_token_output_unchanged():
