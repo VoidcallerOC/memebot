@@ -9,6 +9,7 @@ Run with: ``python -m bot.main``
 """
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import re
@@ -32,13 +33,13 @@ from .jupiter import (
     valid_token_decimals,
 )
 from .preflight import run_preflight
-from .portfolio import Portfolio
+from .portfolio import Portfolio, is_raw_units
 from .paths import log_resolved_paths, with_resolved_data_paths
 from .process_lock import ProcessLock
 from .reconcile import reconcile_wallet
 from .risk import RiskManager
 from .safety import SafetyScreener
-from .state import load_state, save_state
+from .state import durable_saves_supported, load_state, save_state
 from .strategy import build_strategy
 
 try:
@@ -107,8 +108,10 @@ def exact_raw_sell_amount(pos, fraction: object) -> tuple[int | None, str]:
     stop-loss) therefore sells exactly the current raw holding. Returns
     ``(None, reason)`` — and the caller refuses before submitting — for
     unverified decimals, a missing/malformed/inconsistent raw holding (e.g.
-    a legacy position persisted before raw tracking), an invalid fraction,
-    or a result of zero. Never derived from float token counts.
+    a legacy position persisted before raw tracking), a holding outside the
+    u64 range ``1 .. 2**64-1`` or above the amount bought, an invalid
+    fraction, or a result of zero. Never derived from float token counts;
+    nothing is clamped, truncated or repaired.
     """
     if valid_token_decimals(getattr(pos, "token_decimals", None)) is None:
         return None, "token decimals unverified"
@@ -122,14 +125,18 @@ def exact_raw_sell_amount(pos, fraction: object) -> tuple[int | None, str]:
             "no exact raw holding recorded (legacy or unverified position); operator "
             "action required: close or re-verify this position outside the bot"
         )
-    if not 0 < raw <= initial:
-        return None, f"raw holding inconsistent (held={raw}, bought={initial})"
+    if not (is_raw_units(raw) and is_raw_units(initial) and raw <= initial):
+        return None, (
+            f"raw holding inconsistent or out of range 1..2**64-1 (held={raw}, bought={initial})"
+        )
     frac = _exact_fraction(fraction)
     if frac is None:
         return None, f"invalid sell fraction {fraction!r}"
     amount = min(initial * frac.numerator // frac.denominator, raw)
     if amount <= 0:
         return None, "sell amount rounds to zero raw units"
+    if not is_raw_units(amount):  # unreachable given the checks above; never clamped
+        return None, "sell amount out of range 1..2**64-1"
     return amount, ""
 
 
@@ -141,10 +148,16 @@ def exact_raw_sell_amount(pos, fraction: object) -> tuple[int | None, str]:
 #              success without fill data); ``outcome`` records the status
 #   failed     terminal: evidence shows the sell did NOT execute; the position
 #              is untouched and normal exit management (retry) resumes
-#   settled    terminal: the sell executed and was booked exactly once
+#   confirmed_unbooked
+#              the sell is proven on chain and its verified fill evidence
+#              (actual in/out, fee) is persisted, but its accounting is not
+#              yet; booked exactly once from that stored evidence (also after
+#              a crash, at startup) with no further chain lookup
+#   settled    terminal: the sell executed and was booked exactly once; the
+#              booking and this status are persisted in the same atomic write
 # Open intents freeze sells of that mint and block new entries; they never
 # stop stop-loss / take-profit management of other positions.
-OPEN_SELL_INTENT_STATUSES = frozenset({"pending", "unresolved", "blocked"})
+OPEN_SELL_INTENT_STATUSES = frozenset({"pending", "unresolved", "blocked", "confirmed_unbooked"})
 TERMINAL_SELL_INTENTS_KEPT = 50
 # A Solana transaction's recent blockhash is valid for 150 slots (~60-90 s;
 # solana.com docs "Transactions" / "Confirmation & Expiration"). After this
@@ -322,6 +335,12 @@ class TradingBot:
 
     def run(self) -> None:
         self._banner()
+        if self.cfg.is_armed and not durable_saves_supported():
+            # Live sells require a durable intent before send; without
+            # directory fsync no save is ever durable, so refuse to trade.
+            log.error("live startup blocked: durable state saves (directory fsync) are "
+                      "not supported on this platform")
+            return
         mode = "LIVE — REAL MONEY" if self.cfg.is_armed else "DRY-RUN"
         if self.notifier.enabled:
             self.notifier.startup(mode)
@@ -504,6 +523,11 @@ class TradingBot:
                     self._reconciliation_required = True
                     log.error("confirmed live entry has unverified token decimals; no position recorded")
                     return
+                if not is_raw_units(result.actual_out_amount):
+                    self._reconciliation_required = True
+                    log.error("confirmed live entry fill raw output is not an integer in "
+                              "1..2**64-1; no position recorded")
+                    return
                 tokens = result.actual_out_amount / (10 ** decimals)
                 if tokens <= 0:
                     self._reconciliation_required = True
@@ -572,34 +596,174 @@ class TradingBot:
             if self._sell_frozen(mint):
                 log.error("%s: refusing %s; an earlier live sell is unresolved", symbol, reason)
                 return
-            raw_sold = self._settle_live_sell(pos, fraction, price, reason)
-            if not raw_sold:
-                return
-            self._book_sell(mint, fraction, price, reason, raw_sold=raw_sold)
+            # Settles and books atomically (or leaves an open intent).
+            self._settle_live_sell(pos, fraction, price, reason)
             return
         self._book_sell(mint, fraction, price, reason)
 
-    def _book_sell(self, mint: str, fraction: float, price: float, reason: str,
-                   *, raw_sold: int | None = None) -> None:
-        """Portfolio/risk accounting for one executed sell (the only booking path).
-
-        ``raw_sold`` is the exact confirmed raw amount for live positions that
-        track a raw holding; paper and legacy positions use the float path.
-        """
+    def _book_sell(self, mint: str, fraction: float, price: float, reason: str) -> None:
+        """Paper-sell accounting (live sells book via ``_book_confirmed_sell``)."""
         symbol = self.portfolio.positions[mint].symbol
         was_halted = self.risk.trading_halted()
-        pnl = self.portfolio.sell_fraction(mint, fraction, price, reason, raw_sold=raw_sold)
+        pnl = self.portfolio.sell_fraction(mint, fraction, price, reason)
         self.risk.record_realized_pnl(pnl)
         self.notifier.sell(symbol, fraction, price, reason, pnl)
         if self.risk.trading_halted() and not was_halted:
             self.notifier.halt(-self.risk.realized_pnl_today)
         self._save()
 
-    def _settle_live_sell(self, pos, fraction: float, price: float, reason: str) -> int | bool:
-        """Submit an armed sell; return the exact raw amount sold once it is
-        confirmed with a matching fill, else False (position untouched)."""
+    def _accounting_snapshot(self):
+        return (
+            copy.deepcopy(self.portfolio.positions),
+            self.portfolio.realized_pnl,
+            self.risk.to_dict(),
+        )
+
+    def _restore_accounting(self, snapshot) -> None:
+        self.portfolio.positions, self.portfolio.realized_pnl = snapshot[0], snapshot[1]
+        self.risk.load_dict(snapshot[2])
+
+    def _apply_sell_accounting(self, mint: str, fraction: float, price: float, reason: str,
+                               *, raw_sold: int | None = None):
+        """Live-sell portfolio + daily-risk accounting, in memory only.
+
+        ``raw_sold`` (positions that track a raw holding) is the exact,
+        fill-validated raw amount: the raw holding is decremented by exactly
+        that. All-or-nothing: if anything raises, positions, realized P&L and
+        the daily risk state are restored before re-raising, so memory never
+        holds a half-booked sell that a later save could persist.
+        """
+        symbol = self.portfolio.positions[mint].symbol
+        snapshot = self._accounting_snapshot()
+        try:
+            was_halted = self.risk.trading_halted()
+            pnl = self.portfolio.sell_fraction(mint, fraction, price, reason, raw_sold=raw_sold)
+            self.risk.record_realized_pnl(pnl)
+            newly_halted = self.risk.trading_halted() and not was_halted
+        except BaseException:
+            self._restore_accounting(snapshot)
+            raise
+        return symbol, pnl, newly_halted
+
+    def _notify_sell(self, symbol, fraction, price, reason, pnl, newly_halted) -> None:
+        self.notifier.sell(symbol, fraction, price, reason, pnl)
+        if newly_halted:
+            self.notifier.halt(-self.risk.realized_pnl_today)
+
+    @staticmethod
+    def _tracks_raw(pos) -> bool:
+        """True unless the position is legacy (no raw fields at all)."""
+        return (
+            getattr(pos, "raw_tokens", None) is not None
+            or getattr(pos, "raw_tokens_initial", None) is not None
+        )
+
+    def _confirmed_fill_problem(self, intent: dict) -> str | None:
+        """Why stored fill evidence cannot settle ``intent``, or None if it can.
+
+        Every raw amount must be an int (not bool) in ``1 .. 2**64-1``; the
+        on-chain input must equal the intent's persisted ``raw_amount``; the
+        position must still be tracked and, if it tracks a raw holding, that
+        holding must be consistent and cover ``raw_amount``. Nothing is
+        clamped or repaired.
+        """
+        raw_amount = intent.get("raw_amount")
+        if not is_raw_units(raw_amount):
+            return "intent raw_amount is not an integer in 1..2**64-1"
+        if not intent.get("tx_signature"):
+            return "confirmed sell has no transaction signature"
+        if not is_raw_units(intent.get("actual_in_amount")) or (
+            intent.get("actual_in_amount") != raw_amount
+        ):
+            return "on-chain input amount does not match the intent raw_amount"
+        if not is_raw_units(intent.get("actual_out_amount")):
+            return "on-chain output amount missing, not positive or out of range"
+        pos = self.portfolio.positions.get(intent.get("mint"))
+        if pos is None:
+            return "position no longer tracked"
+        if self._tracks_raw(pos):
+            held, initial = pos.raw_tokens, pos.raw_tokens_initial
+            if not (is_raw_units(held) and is_raw_units(initial) and held <= initial):
+                return f"raw holding inconsistent (held={held!r}, bought={initial!r})"
+            if raw_amount > held:
+                return f"raw_amount {raw_amount} exceeds the current raw holding {held}"
+        return None
+
+    def _record_confirmed_fill(self, intent: dict, fill, detail: str) -> None:
+        """Persist verified fill evidence before any accounting.
+
+        Best effort: the commit point is the booking save (which carries this
+        evidence too). If this save fails and the process dies, the persisted
+        intent is still the earlier open one, so nothing is lost or doubled.
+        """
+        intent["status"] = "confirmed_unbooked"
+        intent["resolution"] = detail
+        intent["actual_in_amount"] = fill.actual_in_amount
+        intent["actual_out_amount"] = fill.actual_out_amount
+        intent["fee_lamports"] = fill.fee_lamports
+        intent["confirmed_at"] = time.time()
+        self._save()
+
+    def _book_confirmed_sell(self, intent: dict) -> bool:
+        """Book a ``confirmed_unbooked`` intent exactly once from its evidence.
+
+        Accounting (raw holding decremented by exactly the intent's persisted
+        ``raw_amount``, position, realized P&L, daily risk) and the intent's
+        transition to ``settled`` are persisted in ONE atomic state write, so a
+        crash leaves either the unbooked intent (booked on the next run) or the
+        booked, settled one; never both or neither. If that write fails, the
+        in-memory booking is rolled back and the intent stays
+        ``confirmed_unbooked`` (frozen, retried next tick): memory never treats
+        a settlement as done that is not on disk. Returns True if booked.
+        """
+        if intent.get("status") != "confirmed_unbooked" or intent.get("booked_at") is not None:
+            return False
+        mint = intent.get("mint")
+        problem = self._confirmed_fill_problem(intent)
+        if problem is not None:
+            reason = f"confirmed sell cannot be booked: {problem}; operator action required"
+            if intent.get("resolution") != reason:
+                intent["resolution"] = reason
+                self._save()
+            log.error("live sell for %s %s", str(mint)[:8], reason)
+            return False
+        pos = self.portfolio.positions[mint]
+        # Legacy positions (no raw fields) keep the float path for an intent
+        # already in flight; they can never submit a new live sell.
+        raw_sold = intent["raw_amount"] if self._tracks_raw(pos) else None
+        fraction, price, reason = intent["fraction"], intent["requested_price"], intent["reason"]
+        snapshot = self._accounting_snapshot()
+        symbol, pnl, newly_halted = self._apply_sell_accounting(
+            mint, fraction, price, reason, raw_sold=raw_sold,
+        )
+        intent["status"] = "settled"
+        intent["booked_at"] = time.time()
+        intent["booked_pnl"] = pnl
+        intent["booked_raw"] = raw_sold
+        if self._save() is False:  # one atomic write: accounting + settled intent
+            self._restore_accounting(snapshot)
+            intent["status"] = "confirmed_unbooked"
+            for key in ("booked_at", "booked_pnl", "booked_raw"):
+                intent.pop(key, None)
+            intent["resolution"] = "booking not durable (state save failed); retried next tick"
+            log.error("live sell for %s confirmed but its booking could not be saved; "
+                      "rolled back in memory, retried next tick", str(mint)[:8])
+            return False
+        self._notify_sell(symbol, fraction, price, reason, pnl, newly_halted)
+        return True
+
+    def _settle_live_sell(self, pos, fraction: float, price: float, reason: str) -> bool:
+        """Submit an armed sell of exactly ``exact_raw_sell_amount`` raw units.
+
+        The intent, carrying that exact ``raw_amount``, must be durably saved
+        before anything is quoted, signed or sent. Once the swap confirms, the
+        fill must prove ``actual_in == raw_amount``; it is then booked (and the
+        raw holding decremented by ``raw_amount``) via
+        ``_book_confirmed_sell``. Returns True once booked.
+        """
         tokens_to_sell = min(pos.original_tokens * fraction, pos.tokens)
         decimals = pos.token_decimals
+        raw_amount, refusal = exact_raw_sell_amount(pos, fraction)
         intent = {
             "mint": pos.mint,
             "fraction": fraction,
@@ -608,18 +772,16 @@ class TradingBot:
             "status": "pending",
             "tx_signature": None,
             "created_at": time.time(),
-            "raw_amount": None,
+            "raw_amount": raw_amount,
         }
         self.portfolio.pending_intents.append(intent)
-        self._save()
+        durable = self._save()
         if decimals is None or tokens_to_sell <= 0:
             intent["status"] = "blocked"
             self._reconciliation_required = True
             log.error("live sell fail-closed for %s: missing decimals or size", pos.symbol)
             self._save()
             return False
-        raw_amount, refusal = exact_raw_sell_amount(pos, fraction)
-        intent["raw_amount"] = raw_amount
         if raw_amount is None:
             # Definitive pre-submit refusal: nothing sent, so no chain
             # uncertainty and no reconciliation; the intent is cleared by the
@@ -627,6 +789,14 @@ class TradingBot:
             intent["status"] = "blocked"
             intent["error"] = refusal
             log.error("live sell refused before submit for %s: %s", pos.symbol, refusal)
+            self._save()
+            return False
+        if durable is False:
+            # Never send without a durable intent: after a crash the sale would
+            # be invisible on restart and the exit could be sent again.
+            intent["status"] = "blocked"
+            intent["error"] = "state save failed before submit; nothing sent"
+            log.error("live sell refused before submit for %s: state not durable", pos.symbol)
             self._save()
             return False
         tokens_to_sell = raw_amount / (10 ** valid_token_decimals(decimals))
@@ -654,18 +824,22 @@ class TradingBot:
             log.error("live sell confirmed without fill data for %s", pos.symbol)
             self._save()
             return False
-        if result.actual_in_amount != raw_amount:
+        intent["actual_in_amount"] = result.actual_in_amount
+        intent["actual_out_amount"] = result.actual_out_amount
+        intent["fee_lamports"] = result.fee_lamports
+        problem = self._confirmed_fill_problem(intent)
+        if problem is not None:
+            # Validated (incl. actual_in == raw_amount) before anything
+            # bookable is persisted; the same check guards every booking.
             intent["status"] = "unresolved"
+            intent["resolution"] = f"confirmed fill does not prove the intended sell: {problem}"
             self._reconciliation_required = True
-            log.error(
-                "live sell fill for %s sold %s raw, intended %s; not booked",
-                pos.symbol, result.actual_in_amount, raw_amount,
-            )
+            log.error("live sell for %s not booked: %s", pos.symbol, problem)
             self._save()
             return False
-        intent["status"] = "settled"
-        self._save()
-        return raw_amount
+        self._record_confirmed_fill(intent, result, "confirmed at submit with on-chain fill")
+        return self._book_confirmed_sell(intent)
+
 
     # -- live sell intent resolution -----------------------------------------
 
@@ -687,10 +861,13 @@ class TradingBot:
           error; or the blockhash window has passed
           (``SELL_INTENT_EXPIRY_SECONDS``), the signature is not confirmed and
           the wallet still holds the tokens.
-        * EXECUTED (-> ``settled``, booked once): the signature is confirmed
-          without error AND ``getTransaction`` gives a complete fill whose
-          ``actual_in_amount`` equals the intent's ``raw_amount``. It is booked
-          by the same accounting as an on-time confirmed live sell.
+        * EXECUTED (-> ``confirmed_unbooked`` -> ``settled``, booked once): the
+          signature is confirmed without error AND ``getTransaction`` gives a
+          complete fill whose ``actual_in_amount`` equals the intent's
+          ``raw_amount``. The evidence is persisted first; booking and the
+          ``settled`` transition then share one atomic save. A
+          ``confirmed_unbooked`` intent found later (e.g. after a crash) is
+          booked from its stored evidence without another chain lookup.
         * Anything else stays open (the mint stays frozen, entries stay
           blocked) with an explicit operator-visible reason. No fill, price or
           P&L is ever invented.
@@ -699,6 +876,12 @@ class TradingBot:
         balances: dict = {}
         changed = False
         for intent in self._open_sell_intents():
+            if intent.get("status") == "confirmed_unbooked":
+                # Proven on chain with stored evidence: book it, no chain lookup.
+                if self._book_confirmed_sell(intent):
+                    log.warning("live sell intent for %s booked from stored fill evidence",
+                                str(intent.get("mint"))[:8])
+                continue
             if "created_at" not in intent and "first_seen_at" not in intent:
                 intent["first_seen_at"] = now  # legacy intent: start its clock now
                 changed = True
@@ -715,20 +898,11 @@ class TradingBot:
                 continue
             if verdict == "executed" and fill is not None:
                 mint = intent["mint"]
-                intent["status"] = "settled"
-                intent["resolution"] = detail
                 intent["resolved_at"] = now
-                intent["actual_in_amount"] = fill.actual_in_amount
-                intent["actual_out_amount"] = fill.actual_out_amount
-                intent["fee_lamports"] = fill.fee_lamports
-                self._save()  # status flips before booking: never booked twice
-                pos = self.portfolio.positions[mint]
-                exact = isinstance(pos.raw_tokens, int) and not isinstance(pos.raw_tokens, bool)
-                self._book_sell(
-                    mint, intent["fraction"], intent["requested_price"], intent["reason"],
-                    raw_sold=intent["raw_amount"] if exact else None,
-                )
-                log.warning("live sell intent for %s settled from on-chain fill", mint[:8])
+                # Evidence is persisted first, then booking + settled in one save.
+                self._record_confirmed_fill(intent, fill, detail)
+                if self._book_confirmed_sell(intent):
+                    log.warning("live sell intent for %s settled from on-chain fill", mint[:8])
                 continue
             if intent.get("resolution") != detail:
                 intent["resolution"] = detail
@@ -857,8 +1031,12 @@ class TradingBot:
             return None
         return snapshot.amounts if snapshot is not None else None
 
-    def _save(self) -> None:
-        save_state(self.cfg.state_file, self.portfolio, self.risk)
+    def _save(self) -> bool:
+        """Persist state. False means the write is NOT known durable (it may
+        not have happened, or the new file may be visible but not yet
+        durable); callers about to send or to treat a settlement as done must
+        check and fail closed. See ``bot.state.save_state``."""
+        return save_state(self.cfg.state_file, self.portfolio, self.risk)
 
     def _usd_to_lamports(self, usd: float) -> int | None:
         """Lamports worth at most ``usd`` at a verified SOL/USD price, or None.

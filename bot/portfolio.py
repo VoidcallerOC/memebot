@@ -11,6 +11,19 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
 
+# Raw (smallest-unit) SPL amounts are u64: the same bound as
+# ``jupiter.parse_raw_amount``. Raw holdings and raw sell amounts outside
+# 1..2**64-1 (or not a real int) are rejected, never clamped or repaired.
+MAX_RAW_UNITS = 2**64 - 1
+
+
+def is_raw_units(value: object) -> bool:
+    """True for an int (not bool) in ``1 .. MAX_RAW_UNITS``."""
+    return (
+        isinstance(value, int) and not isinstance(value, bool)
+        and 0 < value <= MAX_RAW_UNITS
+    )
+
 
 @dataclass
 class Position:
@@ -141,14 +154,15 @@ class Portfolio:
                   reason: str) -> float:
         dec = pos.token_decimals
         raw = pos.raw_tokens
+        initial = pos.raw_tokens_initial
         if (
-            isinstance(raw_sold, bool) or not isinstance(raw_sold, int)
-            or isinstance(raw, bool) or not isinstance(raw, int)
+            not is_raw_units(raw_sold) or not is_raw_units(raw) or not is_raw_units(initial)
             or isinstance(dec, bool) or not isinstance(dec, int) or not 0 <= dec <= 18
-            or not 0 < raw_sold <= raw
+            or not raw_sold <= raw <= initial
         ):
             raise ValueError(
-                f"invalid exact raw sell for {pos.symbol}: sold={raw_sold!r} held={raw!r} decimals={dec!r}"
+                f"invalid exact raw sell for {pos.symbol}: sold={raw_sold!r} held={raw!r} "
+                f"bought={initial!r} decimals={dec!r}"
             )
         tokens_to_sell = raw_sold / (10 ** dec)
         proceeds = tokens_to_sell * current_price
