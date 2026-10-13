@@ -48,13 +48,13 @@ from tests.swap_tx_factory import conformant_unsigned_tx, direct_route
 from tests.test_p1_state_durability import install as install_faulty_os
 
 # Runs the REAL direct-route quote gate and pre-sign validator (see conftest).
-pytestmark = pytest.mark.real_swap_policy
+pytestmark = [pytest.mark.real_swap_policy, pytest.mark.usefixtures("no_exit_backoff")]
 
 
 class DirectJup(Jup):
     """The shared fake's quotes as single-step 100% direct routes."""
 
-    def quote(self, i, o, amount):
+    def quote(self, i, o, amount, **_kw):
         q = super().quote(i, o, amount)
         return direct_route(q) if isinstance(q, dict) and "outAmount" in q else q
 

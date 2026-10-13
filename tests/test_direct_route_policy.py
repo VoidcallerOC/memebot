@@ -179,13 +179,20 @@ class Resp:
         return self.payload
 
 
-def test_quote_request_is_direct_only():
+def test_executable_quote_request_is_direct_only():
     s = CaptureSession({"outAmount": "1"})
-    JupiterClient(Config(), s).quote(SOL_MINT, USDC, 123)
+    JupiterClient(Config(), s).quote(SOL_MINT, USDC, 123, direct_only=True)
     ((url, params),) = s.gets
     assert url.endswith("/quote")
     assert params == {"inputMint": SOL_MINT, "outputMint": USDC, "amount": "123",
                       "slippageBps": "150", "onlyDirectRoutes": "true"}
+
+
+def test_default_quote_request_is_not_direct_only():
+    s = CaptureSession({"outAmount": "1"})
+    JupiterClient(Config(), s).quote(SOL_MINT, USDC, 123)
+    ((url, params),) = s.gets
+    assert "onlyDirectRoutes" not in params
 
 
 def test_swap_request_body_is_capped_and_has_no_auto_tip_or_fee_account():
@@ -470,7 +477,7 @@ class FakeJup:
     def _headers(self):
         return {}
 
-    def quote(self, i, o, amount):
+    def quote(self, i, o, amount, **_kw):
         self.quotes.append((i, o, amount))
         if (i, o, amount) == (SOL_MINT, USDC, 10**9):
             return {"inputMint": i, "outputMint": o, "inAmount": str(amount), "outAmount": "100000000"}
@@ -574,7 +581,7 @@ def test_unresolvable_lookup_table_refuses_before_signing():
     ex = executor(w, FakeJup())
     q = case("buy_sol_bonk")[0]
     jup = FakeJup()
-    jup.quote = lambda i, o, amount: q if (i, o) != (SOL_MINT, USDC) else {
+    jup.quote = lambda i, o, amount, **_kw: q if (i, o) != (SOL_MINT, USDC) else {
         "inputMint": i, "outputMint": o, "inAmount": str(amount), "outAmount": "100000000"}
     ex.jup = jup
     calls = []

@@ -276,9 +276,14 @@ def test_swap_path_never_executes_a_quote_with_another_direction(rw):
     ex = executor(rw)
 
     class FlippedJup(Jup):
-        def quote(self, i, o, amount):
+        def quote(self, i, o, amount, **_kw):
             return super().quote(o, i, amount)       # answers for the other direction
     ex.jup = FlippedJup()
     result = sell(ex, before_broadcast=lambda sig: True)
     assert result.status == TransactionStatus.CONFIRMED_FAILURE and "invalid quote" in result.error
     assert rw.builds == 0 and rw.sends == []
+
+
+# Written before the per-position exit backoff: these tests re-run an exit on
+# the next tick, so the delay is zeroed (counter/alert still real).
+pytestmark = pytest.mark.usefixtures("no_exit_backoff")

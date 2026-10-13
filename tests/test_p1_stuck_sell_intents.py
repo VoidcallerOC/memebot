@@ -535,3 +535,8 @@ def test_terminal_intents_are_pruned(env):
     assert all(i["status"] == "failed" for i in kept)
     assert kept[0]["n"] == 21                       # oldest terminal entries dropped
     assert kept[-1]["resolution"] == "refused before send"  # newest kept
+
+
+# Written before the per-position exit backoff: these tests re-run an exit on
+# the next tick, so the delay is zeroed (counter/alert still real).
+pytestmark = pytest.mark.usefixtures("no_exit_backoff")

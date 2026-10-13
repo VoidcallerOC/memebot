@@ -114,6 +114,19 @@ def buy_intent_problem(entry: object) -> str | None:
     return None
 
 
+def _nonneg_int(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _finite_or_none(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
 @dataclass
 class Position:
     mint: str
@@ -134,6 +147,12 @@ class Position:
     # legacy positions persisted before these fields existed.
     raw_tokens: int | None = None
     raw_tokens_initial: int | None = None
+    # Live exit retry state (persisted, survives restart): consecutive failed
+    # sell attempts, earliest time (epoch s) of the next attempt, and whether
+    # the operator was alerted for the current failure streak.
+    exit_failures: int = 0
+    exit_retry_at: float | None = None
+    exit_failure_alerted: bool = False
 
     @property
     def original_tokens(self) -> float:
@@ -164,6 +183,9 @@ class Position:
             "fee_lamports": self.fee_lamports,
             "raw_tokens": self.raw_tokens,
             "raw_tokens_initial": self.raw_tokens_initial,
+            "exit_failures": self.exit_failures,
+            "exit_retry_at": self.exit_retry_at,
+            "exit_failure_alerted": self.exit_failure_alerted,
         }
 
     @classmethod
@@ -184,6 +206,9 @@ class Position:
             fee_lamports=d.get("fee_lamports"),
             raw_tokens=d.get("raw_tokens"),
             raw_tokens_initial=d.get("raw_tokens_initial"),
+            exit_failures=_nonneg_int(d.get("exit_failures")),
+            exit_retry_at=_finite_or_none(d.get("exit_retry_at")),
+            exit_failure_alerted=d.get("exit_failure_alerted") is True,
         )
 
 

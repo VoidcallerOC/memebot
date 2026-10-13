@@ -269,14 +269,21 @@ class JupiterClient:
     def _headers(self) -> dict:
         return {"x-api-key": self.cfg.jupiter_api_key} if self.cfg.jupiter_api_key else {}
 
-    def quote(self, input_mint: str, output_mint: str, amount: int) -> Optional[dict]:
+    def quote(self, input_mint: str, output_mint: str, amount: int, *,
+              direct_only: bool = False) -> Optional[dict]:
+        """Jupiter quote. ``direct_only=True`` (executable swap quotes and the
+        pre-buy exit-route check) asks Jupiter for single-hop routes only;
+        the default (price discovery: USD marks, SOL/USD) lets Jupiter route
+        through any pool, so a token whose only liquidity is e.g. a SOL pool
+        still gets a token->USDC mark. A price quote is never executed."""
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount),
             "slippageBps": str(self.cfg.max_slippage_bps),
-            "onlyDirectRoutes": "true",
         }
+        if direct_only is True:
+            params["onlyDirectRoutes"] = "true"
         try:
             resp = self.session.get(self.quote_url, params=params, headers=self._headers(), timeout=HTTP_TIMEOUT)
             resp.raise_for_status()
@@ -342,7 +349,7 @@ class SwapExecutor:
                 out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
                 error="swap amount is not a positive integer raw amount",
             )
-        quote = self.jup.quote(input_mint, output_mint, amount)
+        quote = self.jup.quote(input_mint, output_mint, amount, direct_only=True)
         if quote is None:
             return SwapResult(
                 ok=False, simulated=not self.cfg.is_armed, in_amount=amount,

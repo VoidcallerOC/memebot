@@ -221,7 +221,7 @@ def test_version_refusal_clears_sell_intent_for_retry(boundary, monkeypatch):
     class Jup:
         quote_url, swap_url = "https://jupiter.test/quote", "https://jupiter.test/swap"
 
-        def quote(self, i, o, amount):
+        def quote(self, i, o, amount, **_kw):
             return {"inputMint": i, "outputMint": o, "inAmount": str(amount), "outAmount": "5000000",
                     "otherAmountThreshold": "4925000", "swapMode": "ExactIn", "slippageBps": 150}
 

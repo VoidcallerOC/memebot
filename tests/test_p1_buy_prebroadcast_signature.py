@@ -108,7 +108,7 @@ class BJup:
         self.quotes = []
         self.sol_usd = sol_usd
 
-    def quote(self, i, o, amount):
+    def quote(self, i, o, amount, **_kw):
         self.quotes.append((i, o, amount))
         if (i, o) == (SOL_MINT, USDC_MINT):
             out = self.sol_usd * 10**6 * amount // 10**9
@@ -850,10 +850,14 @@ def test_quote_route_policy_rejection_never_builds_signs_or_sends(bw):
     """A multi-hop quote is refused before /swap: no build, no signature, no
     broadcast; the intent is definitively failed (never unresolved)."""
     class MultiHop(BJup):
-        def quote(self, i, o, amount):
+        buy_quotes = 0
+
+        def quote(self, i, o, amount, **_kw):
             q = super().quote(i, o, amount)
             if (i, o) == (SOL_MINT, MINT):
-                q["routePlan"] = q["routePlan"] * 2
+                self.buy_quotes += 1
+                if self.buy_quotes > 1:  # pre-buy check passes; executable quote is multi-hop
+                    q["routePlan"] = q["routePlan"] * 2
             return q
     bot = start(bw, jup=MultiHop())
     bot._tick()
@@ -863,6 +867,21 @@ def test_quote_route_policy_rejection_never_builds_signs_or_sends(bw):
     assert intent["resolution"] == "refused before send (no transaction)"
     assert "route policy" in intent["error"]
     assert bot.portfolio.positions == {} and not bot._open_buy_intents()
+
+
+def test_prebuy_exit_route_check_applies_route_policy(bw):
+    """A token only reachable by a multi-hop route is skipped at the pre-buy
+    check (same policy as the executable swap): no intent, no build, no send."""
+    class MultiHop(BJup):
+        def quote(self, i, o, amount, **_kw):
+            q = super().quote(i, o, amount)
+            if MINT in (i, o):
+                q["routePlan"] = q["routePlan"] * 2
+            return q
+    bot = start(bw, jup=MultiHop())
+    bot._tick()
+    assert bw.builds == 0 and bw.sends == [] and "sendTransaction" not in bw.rpc
+    assert buys_of(persisted(bw)) == [] and bot.portfolio.positions == {}
 
 
 def test_presign_policy_rejection_never_signs_or_sends(bw):

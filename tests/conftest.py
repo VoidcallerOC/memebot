@@ -32,4 +32,16 @@ def _legacy_fixture_swap_policy(request, monkeypatch):
     import bot.jupiter as jupiter
     monkeypatch.setattr(jupiter, "route_quote_error", lambda *a, **k: None)
     monkeypatch.setattr(jupiter, "swap_transaction_error", lambda *a, **k: None)
+    import bot.main as main
+    monkeypatch.setattr(main, "route_quote_error", lambda *a, **k: None)
     yield
+
+
+@pytest.fixture
+def no_exit_backoff(monkeypatch):
+    """For lifecycle tests written before the per-position exit backoff that
+    re-run an exit on the very next tick: zero delay between attempts. The
+    failure counter and alerting still run; the backoff itself is covered by
+    ``tests/test_exit_retry_backoff.py`` (no stub)."""
+    import bot.main as main
+    monkeypatch.setattr(main.TradingBot, "_exit_backoff_seconds", lambda self, n: 0.0)

@@ -191,6 +191,13 @@ def _swap_transaction_error(message, keys, owner, input_mint, output_mint, amoun
     wsol_ata = _ata(owner, SOL_MINT, SPL_TOKEN_PROGRAM)
     token_atas = _owner_atas(owner, token_mint)
     out_amount = int(quote["outAmount"])
+    flags = _account_flags(message, len(keys))
+    if flags is None:
+        return "message header / lookup counts inconsistent with account keys"
+    amm_keys = _quote_amm_keys(quote)
+    if amm_keys is None:
+        return "quote routePlan ammKey missing"
+    created = {"wsol": 0, "token": None}
 
     seen = {"limit": None, "price": None, "transfer": None, "sync": None,
             "route": None, "close": None}
@@ -227,6 +234,27 @@ def _swap_transaction_error(message, keys, owner, input_mint, output_mint, amoun
                 return f"{where}: ATA create for an unexpected mint/program"
             if ata != _ata(owner, mint, token_prog):
                 return f"{where}: ATA address is not the owner's ATA"
+            err = _flags_error(flags, idxs, ATA_CREATE_FLAGS)
+            if err:
+                return f"{where}: {err}"
+            # Observed builds: exactly one wSOL ATA create (classic program),
+            # plus, in buys only, one create of the owner's ATA for the
+            # bought mint. Anything else (duplicates, both token programs,
+            # a token ATA create in a sell) is refused.
+            if mint == SOL_MINT:
+                if token_prog != SPL_TOKEN_PROGRAM:
+                    return f"{where}: wSOL ATA create not under the classic token program"
+                if created["wsol"]:
+                    return f"{where}: duplicate wSOL ATA create"
+                created["wsol"] += 1
+            else:
+                if not buy:
+                    return f"{where}: token ATA create in a sell"
+                if created["token"] is not None:
+                    return f"{where}: duplicate token ATA create"
+                if seen["route"] is not None:
+                    return f"{where}: token ATA create after the route"
+                created["token"] = (ata, token_prog)
         elif program == SYSTEM_PROGRAM:
             if not buy:
                 return f"{where}: SOL transfer in a sell"
@@ -236,6 +264,9 @@ def _swap_transaction_error(message, keys, owner, input_mint, output_mint, amoun
                 return f"{where}: only a system Transfer is allowed"
             if accts != [owner, wsol_ata]:
                 return f"{where}: SOL transfer not owner -> owner's wSOL ATA"
+            err = _flags_error(flags, idxs, ((True, True), (False, True)))
+            if err:
+                return f"{where}: {err}"
             if int.from_bytes(data[4:12], "little") != amount:
                 return f"{where}: wSOL funding amount does not match swap amount"
             seen["transfer"] = pos
@@ -245,12 +276,18 @@ def _swap_transaction_error(message, keys, owner, input_mint, output_mint, amoun
                     return f"{where}: unexpected SyncNative"
                 if accts != [wsol_ata]:
                     return f"{where}: SyncNative not on the owner's wSOL ATA"
+                err = _flags_error(flags, idxs, ((False, True),))
+                if err:
+                    return f"{where}: {err}"
                 seen["sync"] = pos
             elif data == b"\x09":
                 if seen["close"] is not None or seen["route"] is None:
                     return f"{where}: unexpected CloseAccount"
                 if accts != [wsol_ata, owner, owner]:
                     return f"{where}: CloseAccount not owner's wSOL ATA -> owner"
+                err = _flags_error(flags, idxs, ((False, True), (True, True), (True, True)))
+                if err:
+                    return f"{where}: {err}"
                 seen["close"] = pos
             else:
                 return f"{where}: token instruction not allowed"
@@ -261,6 +298,18 @@ def _swap_transaction_error(message, keys, owner, input_mint, output_mint, amoun
                 return f"{where}: route before wSOL funding"
             err = _route_ix_error(data, accts, owner, input_mint, output_mint, amount,
                                   out_amount, slippage_bps, wsol_ata, token_atas, buy)
+            if err is None:
+                err = _flags_error(flags, idxs[:len(ROUTE_FIXED_FLAGS)], ROUTE_FIXED_FLAGS)
+            if err is None and not amm_keys <= set(accts[len(ROUTE_FIXED_FLAGS):]):
+                err = "quote ammKey not among the route's AMM accounts"
+            if err is None and buy:
+                expected = (accts[3], accts[0])
+                if created["token"] is not None and created["token"] != expected:
+                    err = "token ATA created does not match the route destination/program"
+                elif accts[3] != _ata(owner, token_mint, accts[0]):
+                    err = "route destination is not the owner's ATA under the route token program"
+            if err is None and not buy and accts[0] != SPL_TOKEN_PROGRAM:
+                err = "sell route token program is not the wSOL (classic) program"
             if err:
                 return f"{where}: {err}"
             seen["route"] = pos
@@ -268,6 +317,8 @@ def _swap_transaction_error(message, keys, owner, input_mint, output_mint, amoun
             return f"{where}: program not allowed"
     if seen["route"] is None:
         return "no Jupiter route instruction"
+    if created["wsol"] != 1:
+        return "wSOL ATA create missing"
     if seen["close"] is None:
         return "wSOL account is not closed back to the owner"
     if buy and seen["transfer"] is None:
@@ -280,6 +331,70 @@ def _swap_transaction_error(message, keys, owner, input_mint, output_mint, amoun
     if fee > max_fee:
         return f"priority fee {fee} lamports exceeds cap {max_fee}"
     return None
+
+
+# (signer, writable) of each account, as compiled into the message, for the
+# fixed account slots observed in every real dry-run build. Message-level
+# flags: an account is writable/signer if ANY instruction needs it so.
+ROUTE_FIXED_FLAGS = (
+    (False, False),  # 0 token program (of the output side)
+    (True, True),    # 1 owner (fee payer, sole signer)
+    (False, True),   # 2 source token account
+    (False, True),   # 3 destination token account
+    (False, False),  # 4 destination override = Jupiter program (none)
+    (False, False),  # 5 destination mint
+    (False, False),  # 6 platform fee account = Jupiter program (none)
+    (False, False),  # 7 event authority
+    (False, False),  # 8 Jupiter program
+)
+ATA_CREATE_FLAGS = (
+    (True, True), (False, True), (True, True),
+    (False, False), (False, False), (False, False),
+)
+
+
+def _account_flags(message, n_keys):
+    """[(signer, writable)] per resolved key index from the compiled header
+    and the lookup tables' writable/readonly sections, or None."""
+    h = message.header
+    n_static = len(message.account_keys)
+    n_sig = h.num_required_signatures
+    n_ro_signed = h.num_readonly_signed_accounts
+    n_ro_unsigned = h.num_readonly_unsigned_accounts
+    if n_sig > n_static or n_ro_signed > n_sig or n_ro_unsigned > n_static - n_sig:
+        return None
+    lookups = list(getattr(message, "address_table_lookups", None) or [])
+    n_alt_w = sum(len(bytes(l.writable_indexes)) for l in lookups)
+    n_alt_r = sum(len(bytes(l.readonly_indexes)) for l in lookups)
+    if n_static + n_alt_w + n_alt_r != n_keys:
+        return None
+    out = []
+    for i in range(n_keys):
+        if i < n_sig:
+            out.append((True, i < n_sig - n_ro_signed))
+        elif i < n_static:
+            out.append((False, i < n_static - n_ro_unsigned))
+        else:
+            out.append((False, i < n_static + n_alt_w))
+    return out
+
+
+def _flags_error(flags, idxs, expected):
+    for slot, (i, want) in enumerate(zip(idxs, expected)):
+        if flags[i] != want:
+            return f"account slot {slot} signer/writable flags {flags[i]} != expected {want}"
+    return None
+
+
+def _quote_amm_keys(quote):
+    keys = set()
+    for step in quote.get("routePlan") or []:
+        info = step.get("swapInfo") if isinstance(step, dict) else None
+        key = info.get("ammKey") if isinstance(info, dict) else None
+        if not isinstance(key, str) or not key:
+            return None
+        keys.add(key)
+    return keys or None
 
 
 def _route_ix_error(data, accts, owner, input_mint, output_mint, amount, out_amount,

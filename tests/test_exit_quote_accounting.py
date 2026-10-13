@@ -279,7 +279,7 @@ def _bind_quotes(bot, payloads):
     """Drive ``_price_usd`` through real parsing, not a patched return value."""
     seq = iter(payloads)
 
-    def quote(input_mint, output_mint, amount):
+    def quote(input_mint, output_mint, amount, **_kw):
         assert input_mint == MINT
         assert output_mint == USDC_MINT
         assert amount == 1_000_000
@@ -728,7 +728,7 @@ def test_quote_request_uses_usdc_not_a_zero_fill():
     """``_price_usd`` asks Jupiter for USDC out of 1 whole token; it does not invent 0."""
     seen = {}
 
-    def quote(input_mint, output_mint, amount):
+    def quote(input_mint, output_mint, amount, **_kw):
         seen["args"] = (input_mint, output_mint, amount)
         return None
 

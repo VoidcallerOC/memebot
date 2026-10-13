@@ -48,7 +48,7 @@ class FakeJup:
         self.sol_override = sol_override
         self.calls = []
 
-    def quote(self, input_mint, output_mint, amount):
+    def quote(self, input_mint, output_mint, amount, **_kw):
         self.calls.append((input_mint, output_mint, amount))
         if input_mint == SOL_MINT and output_mint == USDC_MINT and self.sol_override is not _UNSET:
             value = self.sol_override
@@ -406,7 +406,7 @@ def test_position_with_unknown_decimals_is_held_without_a_mark():
 
 def test_inconsistent_mark_quote_units_give_no_mark():
     class Lying(FakeJup):
-        def quote(self, i, o, amount):
+        def quote(self, i, o, amount, **_kw):
             q = super().quote(i, o, amount)
             q["inAmount"] = str(10 ** 6)
             return q

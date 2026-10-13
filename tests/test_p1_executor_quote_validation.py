@@ -52,7 +52,7 @@ class FakeJup:
         self.marks = marks or {}
         self.calls = []
 
-    def quote(self, i, o, amount):
+    def quote(self, i, o, amount, **_kw):
         self.calls.append((i, o, amount))
         if i == SOL_MINT and o == USDC_MINT:
             return {"inputMint": i, "outputMint": o, "inAmount": str(amount),
