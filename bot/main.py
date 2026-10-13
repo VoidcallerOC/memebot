@@ -580,6 +580,10 @@ class TradingBot:
         for candidate in self.strategy.find_candidates():
             if self.portfolio.has(candidate.mint):
                 continue
+            if self._reentry_cooldown_active(candidate.mint):
+                log.info("entry skipped for %s: stop-loss re-entry cooldown active",
+                         str(candidate.mint)[:8])
+                continue
             if self._buy_frozen(candidate.mint):
                 # Defence in depth (all entries are blocked while a buy intent
                 # is open): never a second buy of a mint whose buy is unresolved.
@@ -718,6 +722,23 @@ class TradingBot:
             return
         self._book_sell(mint, fraction, price, reason, rung=rung)
 
+    def _prune_reentry_cooldowns(self) -> None:
+        self.portfolio.prune_reentry_cooldowns(
+            time.time(), float(self.cfg.stop_loss_reentry_cooldown_seconds))
+
+    def _reentry_cooldown_active(self, mint: str) -> bool:
+        """True while a stop-loss re-entry cooldown blocks buying ``mint``."""
+        self._prune_reentry_cooldowns()
+        return mint in self.portfolio.reentry_cooldowns
+
+    def _start_reentry_cooldown(self, mint: str, reason: str) -> None:
+        """Start the cooldown only for a booked stop-loss that closed the
+        position (partial / take-profit sells never start it)."""
+        seconds = self.cfg.stop_loss_reentry_cooldown_seconds
+        if reason != "stop_loss" or seconds <= 0 or mint in self.portfolio.positions:
+            return
+        self.portfolio.reentry_cooldowns[mint] = time.time() + seconds
+
     def _exit_backoff_seconds(self, failures: int) -> float:
         """Bounded exponential backoff: base * 2**(failures-1), capped at max."""
         base = float(self.cfg.exit_retry_base_seconds)
@@ -772,6 +793,7 @@ class TradingBot:
         pnl = self.portfolio.sell_fraction(mint, fraction, price, reason)
         self.risk.record_realized_pnl(pnl)
         self._mark_rung_filled(mint, rung)
+        self._start_reentry_cooldown(mint, reason)
         self.notifier.sell(symbol, fraction, price, reason, pnl)
         if self.risk.trading_halted() and not was_halted:
             self.notifier.halt(-self.risk.realized_pnl_today)
@@ -914,12 +936,18 @@ class TradingBot:
         self._mark_rung_filled(mint, _intent_rung(intent))
         if mint in self.portfolio.positions:  # partial sell: the exit works again
             self._reset_exit_failures(self.portfolio.positions[mint])
+        prev_cooldown = self.portfolio.reentry_cooldowns.get(mint)
+        self._start_reentry_cooldown(mint, reason)  # same atomic save as the booking
         intent["status"] = "settled"
         intent["booked_at"] = time.time()
         intent["booked_pnl"] = pnl
         intent["booked_raw"] = raw_sold
         if self._save() is False:  # one atomic write: accounting + settled intent
             self._restore_accounting(snapshot)
+            if prev_cooldown is None:
+                self.portfolio.reentry_cooldowns.pop(mint, None)
+            else:
+                self.portfolio.reentry_cooldowns[mint] = prev_cooldown
             intent["status"] = "confirmed_unbooked"
             for key in ("booked_at", "booked_pnl", "booked_raw"):
                 intent.pop(key, None)
@@ -1645,6 +1673,7 @@ class TradingBot:
         not have happened, or the new file may be visible but not yet
         durable); callers about to send or to treat a settlement as done must
         check and fail closed. See ``bot.state.save_state``."""
+        self._prune_reentry_cooldowns()
         return save_state(self.cfg.state_file, self.portfolio, self.risk)
 
     def _usd_to_lamports(self, usd: float) -> int | None:

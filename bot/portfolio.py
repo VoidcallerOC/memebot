@@ -114,6 +114,25 @@ def buy_intent_problem(entry: object) -> str | None:
     return None
 
 
+def _load_reentry_cooldowns(raw: object) -> dict[str, float]:
+    """Absent / null (legacy) -> {}. A malformed field or entry is dropped
+    with an error log, never marked corrupt: a cooldown only delays re-entry
+    and carries no exposure or settlement evidence, so it must not halt
+    trading (unlike intents); positions and intents keep failing closed."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        log.error("state reentry_cooldowns is not an object; ignored (cooldowns dropped)")
+        return {}
+    out: dict[str, float] = {}
+    for mint, until in raw.items():
+        if isinstance(mint, str) and mint and _real_number(until):
+            out[mint] = float(until)
+        else:
+            log.error("state reentry_cooldowns entry %r malformed; ignored", str(mint)[:8])
+    return out
+
+
 def _nonneg_int(value) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
@@ -227,6 +246,11 @@ class Portfolio:
         # refuses armed trading and all new entries while any is set.
         self.corrupt: dict[str, str] = {}
         self._raw_corrupt: dict[str, object] = {}
+        # Stop-loss re-entry cooldowns: canonical mint -> expiry (epoch s).
+        # Set only when a stop-loss sell is booked and the position is closed;
+        # new buys of that mint are refused until expiry. Persisted; absent in
+        # legacy state (loads as empty).
+        self.reentry_cooldowns: dict[str, float] = {}
 
     def open(self, mint: str, symbol: str, entry_price: float,
              size_usd: float, tokens: float, **fill) -> Position:
@@ -240,6 +264,16 @@ class Portfolio:
 
     def has(self, mint: str) -> bool:
         return mint in self.positions
+
+    def prune_reentry_cooldowns(self, now: float, max_seconds: float) -> None:
+        """Drop expired cooldowns (expiry <= now) and clamp any expiry beyond
+        ``now + max_seconds`` (clock moved back, setting lowered) to it."""
+        horizon = now + max_seconds
+        for mint, until in list(self.reentry_cooldowns.items()):
+            if until <= now:
+                del self.reentry_cooldowns[mint]
+            elif until > horizon:
+                self.reentry_cooldowns[mint] = horizon
 
     @property
     def open_count(self) -> int:
@@ -321,6 +355,7 @@ class Portfolio:
                 copy.deepcopy(self._raw_corrupt["buy_intents"])
                 if "buy_intents" in self.corrupt else list(self.buy_intents)
             ),
+            "reentry_cooldowns": dict(sorted(self.reentry_cooldowns.items())),
         }
 
     def load_dict(self, d: dict) -> None:
@@ -372,6 +407,7 @@ class Portfolio:
             else:
                 self._mark_corrupt("buy_intents", raw_buys, problem)
                 self.buy_intents = []
+        self.reentry_cooldowns = _load_reentry_cooldowns(d.get("reentry_cooldowns"))
 
     def _mark_corrupt(self, name: str, raw: object, reason: str) -> None:
         self.corrupt[name] = reason

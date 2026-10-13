@@ -129,6 +129,9 @@ class Config:
     exit_retry_base_seconds: float = 30.0
     exit_retry_max_seconds: float = 900.0
     exit_failure_alert_threshold: int = 3
+    # After a stop-loss sell is booked and closes the position, refuse new
+    # buys of that mint for this many seconds (persisted). 0 disables.
+    stop_loss_reentry_cooldown_seconds: int = 900
 
     # Token safety screen
     min_liquidity_usd: float = 20000.0
@@ -200,6 +203,7 @@ def load_config() -> Config:
         exit_retry_base_seconds=_get_float("EXIT_RETRY_BASE_SECONDS", 30.0),
         exit_retry_max_seconds=_get_float("EXIT_RETRY_MAX_SECONDS", 900.0),
         exit_failure_alert_threshold=_get_int("EXIT_FAILURE_ALERT_THRESHOLD", 3),
+        stop_loss_reentry_cooldown_seconds=_get_int("STOP_LOSS_REENTRY_COOLDOWN_SECONDS", 900),
         min_liquidity_usd=_get_float("MIN_LIQUIDITY_USD", 20000.0),
         require_liquidity_locked=_get_bool("REQUIRE_LIQUIDITY_LOCKED", True),
         require_mint_revoked=_get_bool("REQUIRE_MINT_REVOKED", True),
@@ -249,6 +253,8 @@ def _validate(cfg: Config) -> None:
         problems.append("EXIT_RETRY_MAX_SECONDS must be in [EXIT_RETRY_BASE_SECONDS, 86400]")
     if not 1 <= cfg.exit_failure_alert_threshold <= 1000:
         problems.append("EXIT_FAILURE_ALERT_THRESHOLD must be in [1, 1000]")
+    if not 0 <= cfg.stop_loss_reentry_cooldown_seconds <= 604800:
+        problems.append("STOP_LOSS_REENTRY_COOLDOWN_SECONDS must be in [0, 604800]")
     ladder_total = sum(frac for _, frac in cfg.take_profit_ladder)
     if ladder_total > 1.0 + 1e-9:
         problems.append(
