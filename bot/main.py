@@ -40,6 +40,7 @@ from .reconcile import reconcile_wallet
 from .risk import RiskManager
 from .safety import SafetyScreener
 from .state import durable_saves_supported, load_state, save_state
+from .swap_policy import route_quote_error
 from .strategy import build_strategy
 
 try:
@@ -159,6 +160,18 @@ def exact_raw_sell_amount(pos, fraction: object) -> tuple[int | None, str]:
 # stop stop-loss / take-profit management of other positions.
 OPEN_SELL_INTENT_STATUSES = frozenset({"pending", "unresolved", "blocked", "confirmed_unbooked"})
 TERMINAL_SELL_INTENTS_KEPT = 50
+
+
+def _exit_attempt_failed(intent: dict) -> bool:
+    """True iff this sell attempt definitively did NOT sell: refused before
+    any send (``blocked``) or a ``confirmed_failure`` outcome. Possibly-sent
+    (submitted/timeout/unknown) and proven-sold (``confirmed_unbooked``)
+    attempts are not exit failures: they stay frozen by their open intent and
+    are resolved on chain evidence."""
+    status = intent.get("status")
+    if status == "blocked":
+        return True
+    return status == "unresolved" and intent.get("outcome") == TransactionStatus.CONFIRMED_FAILURE.value
 
 
 def _rung_value(value) -> float | None:
@@ -688,10 +701,66 @@ class TradingBot:
             if self._sell_frozen(mint):
                 log.error("%s: refusing %s; an earlier live sell is unresolved", symbol, reason)
                 return
+            now = time.time()
+            retry_at = pos.exit_retry_at
+            if retry_at is not None and now < retry_at:
+                log.warning(
+                    "%s: %s deferred; exit backoff after %d consecutive failed sell(s), "
+                    "next attempt in %.0fs", symbol, reason, pos.exit_failures, retry_at - now,
+                )
+                return
             # Settles and books atomically (or leaves an open intent).
-            self._settle_live_sell(pos, fraction, price, reason, rung=rung)
+            n_before = len(self.portfolio.pending_intents)
+            if not self._settle_live_sell(pos, fraction, price, reason, rung=rung):
+                attempt = self.portfolio.pending_intents[n_before:]
+                if attempt and _exit_attempt_failed(attempt[-1]):
+                    self._record_exit_failure(mint, reason, attempt[-1])
             return
         self._book_sell(mint, fraction, price, reason, rung=rung)
+
+    def _exit_backoff_seconds(self, failures: int) -> float:
+        """Bounded exponential backoff: base * 2**(failures-1), capped at max."""
+        base = float(self.cfg.exit_retry_base_seconds)
+        cap = float(self.cfg.exit_retry_max_seconds)
+        return min(cap, base * (2 ** min(max(failures - 1, 0), 32)))
+
+    def _record_exit_failure(self, mint: str, reason: str, intent: dict) -> None:
+        """A live sell attempt did not settle: count it on the position, push
+        the next attempt out (backoff), alert once per failure streak at the
+        threshold. The position, cost basis and P&L are never touched here;
+        an unresolved (possibly sent) sell stays frozen by its intent."""
+        pos = self.portfolio.positions.get(mint)
+        if pos is None:
+            return
+        pos.exit_failures += 1
+        delay = self._exit_backoff_seconds(pos.exit_failures)
+        pos.exit_retry_at = time.time() + delay
+        error = intent.get("error") or intent.get("resolution") or intent.get("status") or "unknown"
+        log.error(
+            "%s: live %s failed (%d consecutive); next attempt in %.0fs: %s",
+            pos.symbol, reason, pos.exit_failures, delay, error,
+        )
+        threshold = self.cfg.exit_failure_alert_threshold
+        if pos.exit_failures >= threshold and not pos.exit_failure_alerted:
+            notifier = getattr(self, "notifier", None)
+            log.critical("%s: exit failing repeatedly (%d attempts); operator action needed",
+                         pos.symbol, pos.exit_failures)
+            if getattr(notifier, "enabled", False):
+                notifier.send(
+                    f"🚨 EXIT STUCK {pos.symbol} ({mint[:8]}): {pos.exit_failures} consecutive "
+                    f"failed live sells ({reason}); last error: {error}. Position still OPEN, "
+                    f"retrying with backoff (next in {delay:.0f}s, max "
+                    f"{self.cfg.exit_retry_max_seconds:.0f}s). Check route/liquidity and "
+                    f"consider a manual exit."
+                )
+            pos.exit_failure_alerted = True
+        self._save()
+
+    @staticmethod
+    def _reset_exit_failures(pos) -> None:
+        pos.exit_failures = 0
+        pos.exit_retry_at = None
+        pos.exit_failure_alerted = False
 
     def _book_sell(self, mint: str, fraction: float, price: float, reason: str,
                    *, rung: float | None = None) -> None:
@@ -843,6 +912,8 @@ class TradingBot:
         # booking (the snapshot above covers it, so a failed save rolls the
         # rung back too).
         self._mark_rung_filled(mint, _intent_rung(intent))
+        if mint in self.portfolio.positions:  # partial sell: the exit works again
+            self._reset_exit_failures(self.portfolio.positions[mint])
         intent["status"] = "settled"
         intent["booked_at"] = time.time()
         intent["booked_pnl"] = pnl
@@ -1635,20 +1706,30 @@ class TradingBot:
             log.warning("sell-route check %s: quote client unavailable", short)
             return False
         try:
-            buy_quote = jup.quote(SOL_MINT, mint, lamports)
+            buy_quote = jup.quote(SOL_MINT, mint, lamports, direct_only=True)
         except Exception as exc:
             log.warning("sell-route check %s: buy quote failed (%s)", short, type(exc).__name__)
             return False
         token_min, reason = _validated_route_out(buy_quote, SOL_MINT, mint, lamports)
+        if token_min is not None:
+            # Same direct-route policy the executable swap enforces: never
+            # buy a token whose exit could only be a route we refuse to sign.
+            policy = route_quote_error(buy_quote, SOL_MINT, mint, lamports, self.cfg.max_slippage_bps)
+            if policy is not None:
+                token_min, reason = None, f"route policy: {policy}"
         if token_min is None:
             log.warning("sell-route check %s: buy quote rejected: %s", short, reason)
             return False
         try:
-            sell_quote = jup.quote(mint, SOL_MINT, token_min)
+            sell_quote = jup.quote(mint, SOL_MINT, token_min, direct_only=True)
         except Exception as exc:
             log.warning("sell-route check %s: sell quote failed (%s)", short, type(exc).__name__)
             return False
         sell_min_out, reason = _validated_route_out(sell_quote, mint, SOL_MINT, token_min)
+        if sell_min_out is not None:
+            policy = route_quote_error(sell_quote, mint, SOL_MINT, token_min, self.cfg.max_slippage_bps)
+            if policy is not None:
+                sell_min_out, reason = None, f"route policy: {policy}"
         if sell_min_out is None:
             log.warning("sell-route check %s: sell quote rejected: %s", short, reason)
             return False

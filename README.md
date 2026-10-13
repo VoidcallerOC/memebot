@@ -170,11 +170,42 @@ See `config.example.env` for every knob, but the important ones:
 | `TAKE_PROFIT_LADDER` | Profit targets / sell fractions | `50:0.5,100:0.25,300:0.25` |
 | `MAX_OPEN_POSITIONS` | Concurrent positions allowed | `3` |
 | `JUPITER_BASE_URL` | Jupiter swap API base | `https://lite-api.jup.ag/swap/v1` |
+| `PRIORITY_FEE_MAX_LAMPORTS` | Cap on the per-swap priority fee (1..200000) | `50000` |
+| `EXIT_RETRY_BASE_SECONDS` | First backoff after a failed live exit (1..3600) | `30` |
+| `EXIT_RETRY_MAX_SECONDS` | Backoff cap between failed exit attempts (base..86400) | `900` |
+| `EXIT_FAILURE_ALERT_THRESHOLD` | Consecutive failed exits before one operator alert (1..1000) | `3` |
 
 > **Jupiter endpoint:** the bot quotes and swaps through Jupiter. The legacy
 > `quote-api.jup.ag/v6` host was deprecated on 2025-10-01, so the default is now
 > the keyless free tier `lite-api.jup.ag/swap/v1`. With a Jupiter API key, set
 > `JUPITER_API_KEY` and point `JUPITER_BASE_URL` at `https://api.jup.ag/swap/v1`.
+>
+> **Direct-route policy** (`bot/swap_policy.py`): quotes are requested with
+> `onlyDirectRoutes=true` and refused unless they are a single 100% SOL<->token
+> step with no platform fee; the unsigned `/swap` transaction is then checked
+> against an instruction allowlist (ComputeBudget limit/price, idempotent ATA
+> creation for the owner, owner -> own wSOL funding + syncNative, exactly one
+> Jupiter `route`, wSOL close back to the owner) before it is signed.
+> Executable swap quotes (and the pre-buy exit-route check, so the bot never
+> buys a token it could only exit via a refused route) use
+> `onlyDirectRoutes=true`; **price marks do not** (token->USDC marks may route
+> through SOL), so stop-loss / take-profit keep evaluating. The validator also
+> checks compiled signer/writable flags of the fixed route slots and of ATA /
+> transfer / close instructions, allows exactly one wSOL ATA create (classic
+> program) and, in buys only, one create of the owner's ATA for the bought mint
+> under the route's token program, and requires each quote `ammKey` among the
+> route's accounts. Known limitation: real builds pass the owner and its ATAs
+> again in AMM account slots, so those slots are not restricted.
+>
+> **Failed live exits:** each definitively failed sell (refused before send,
+> or failed on chain) increments a per-position counter persisted in state and
+> delays the next attempt (`EXIT_RETRY_BASE_SECONDS * 2^(n-1)`, capped at
+> `EXIT_RETRY_MAX_SECONDS`); this applies to stop-losses too (worst case one
+> attempt per cap interval). At `EXIT_FAILURE_ALERT_THRESHOLD` one alert is
+> sent per failure streak. The position is never closed and no P&L is booked
+> on a refusal; a settled sell resets the counter. Possibly-sent sells are not
+> counted: they freeze the mint until resolved on chain evidence (alerted
+> separately).
 
 ## Architecture
 

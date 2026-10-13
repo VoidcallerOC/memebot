@@ -9,6 +9,7 @@ is a deliberate, explicit act and never an accident.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -24,6 +25,9 @@ log = logging.getLogger(__name__)
 # One authoritative hard ceiling for the controlled live experiment. This is
 # intentionally independent of BANKROLL_USD and strategy configuration.
 MAX_EXPERIMENT_USD = 20.0
+
+# Hard upper bound for PRIORITY_FEE_MAX_LAMPORTS (0.0002 SOL per swap).
+PRIORITY_FEE_HARD_CEILING_LAMPORTS = 200_000
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -115,6 +119,16 @@ class Config:
         default_factory=lambda: [(50.0, 0.5), (100.0, 0.25), (300.0, 0.25)]
     )
     max_slippage_bps: int = 150
+    # Cap on the Jupiter-estimated priority fee per swap (lamports), sent as
+    # prioritizationFeeLamports.priorityLevelWithMaxLamports.maxLamports and
+    # re-checked on the unsigned transaction (limit x price) before signing.
+    priority_fee_max_lamports: int = 50_000
+    # Failed live exits (sell refused / not executed): bounded exponential
+    # backoff between attempts per position (base * 2**(n-1), capped), and an
+    # operator alert once the consecutive-failure count reaches the threshold.
+    exit_retry_base_seconds: float = 30.0
+    exit_retry_max_seconds: float = 900.0
+    exit_failure_alert_threshold: int = 3
 
     # Token safety screen
     min_liquidity_usd: float = 20000.0
@@ -182,6 +196,10 @@ def load_config() -> Config:
         daily_loss_limit_pct=_get_float("DAILY_LOSS_LIMIT_PCT", 10.0),
         take_profit_ladder=_parse_ladder(ladder_raw),
         max_slippage_bps=_get_int("MAX_SLIPPAGE_BPS", 150),
+        priority_fee_max_lamports=_get_int("PRIORITY_FEE_MAX_LAMPORTS", 50_000),
+        exit_retry_base_seconds=_get_float("EXIT_RETRY_BASE_SECONDS", 30.0),
+        exit_retry_max_seconds=_get_float("EXIT_RETRY_MAX_SECONDS", 900.0),
+        exit_failure_alert_threshold=_get_int("EXIT_FAILURE_ALERT_THRESHOLD", 3),
         min_liquidity_usd=_get_float("MIN_LIQUIDITY_USD", 20000.0),
         require_liquidity_locked=_get_bool("REQUIRE_LIQUIDITY_LOCKED", True),
         require_mint_revoked=_get_bool("REQUIRE_MINT_REVOKED", True),
@@ -219,6 +237,18 @@ def _validate(cfg: Config) -> None:
         problems.append("STOP_LOSS_PCT must be in (0, 100)")
     if cfg.bankroll_usd <= 0:
         problems.append("BANKROLL_USD must be > 0")
+    if not 1 <= cfg.priority_fee_max_lamports <= PRIORITY_FEE_HARD_CEILING_LAMPORTS:
+        problems.append(
+            "PRIORITY_FEE_MAX_LAMPORTS must be in "
+            f"[1, {PRIORITY_FEE_HARD_CEILING_LAMPORTS}]"
+        )
+    if not (math.isfinite(cfg.exit_retry_base_seconds) and 1 <= cfg.exit_retry_base_seconds <= 3600):
+        problems.append("EXIT_RETRY_BASE_SECONDS must be in [1, 3600]")
+    if not (math.isfinite(cfg.exit_retry_max_seconds)
+            and cfg.exit_retry_base_seconds <= cfg.exit_retry_max_seconds <= 86400):
+        problems.append("EXIT_RETRY_MAX_SECONDS must be in [EXIT_RETRY_BASE_SECONDS, 86400]")
+    if not 1 <= cfg.exit_failure_alert_threshold <= 1000:
+        problems.append("EXIT_FAILURE_ALERT_THRESHOLD must be in [1, 1000]")
     ladder_total = sum(frac for _, frac in cfg.take_profit_ladder)
     if ladder_total > 1.0 + 1e-9:
         problems.append(

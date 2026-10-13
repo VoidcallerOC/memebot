@@ -18,7 +18,14 @@ from .chain import (
     get_signature_status,
     send_raw_transaction,
 )
+from .chain import rpc_call
 from .config import MAX_EXPERIMENT_USD, Config
+from .swap_policy import (
+    ADDRESS_LOOKUP_TABLE_PROGRAM,
+    resolve_account_keys,
+    route_quote_error,
+    swap_transaction_error,
+)
 
 log = logging.getLogger(__name__)
 HTTP_TIMEOUT = 12
@@ -39,6 +46,10 @@ LIVE_ALLOCATION_TOLERANCE = Fraction(105, 100)
 # Jupiter amount, so anything above 18 cannot be quoted as one whole token.
 MAX_QUOTABLE_DECIMALS = 18
 _U64_MAX = 2 ** 64 - 1
+# Jupiter priority-fee estimate level; the lamport cap is
+# ``Config.priority_fee_max_lamports``. No Jito tip, platform fee, feeAccount
+# or referral is ever requested.
+PRIORITY_LEVEL = "medium"
 _CANONICAL_RAW_INT = re.compile(r"^(0|[1-9][0-9]*)$")
 
 
@@ -258,13 +269,21 @@ class JupiterClient:
     def _headers(self) -> dict:
         return {"x-api-key": self.cfg.jupiter_api_key} if self.cfg.jupiter_api_key else {}
 
-    def quote(self, input_mint: str, output_mint: str, amount: int) -> Optional[dict]:
+    def quote(self, input_mint: str, output_mint: str, amount: int, *,
+              direct_only: bool = False) -> Optional[dict]:
+        """Jupiter quote. ``direct_only=True`` (executable swap quotes and the
+        pre-buy exit-route check) asks Jupiter for single-hop routes only;
+        the default (price discovery: USD marks, SOL/USD) lets Jupiter route
+        through any pool, so a token whose only liquidity is e.g. a SOL pool
+        still gets a token->USDC mark. A price quote is never executed."""
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount),
             "slippageBps": str(self.cfg.max_slippage_bps),
         }
+        if direct_only is True:
+            params["onlyDirectRoutes"] = "true"
         try:
             resp = self.session.get(self.quote_url, params=params, headers=self._headers(), timeout=HTTP_TIMEOUT)
             resp.raise_for_status()
@@ -330,7 +349,7 @@ class SwapExecutor:
                 out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
                 error="swap amount is not a positive integer raw amount",
             )
-        quote = self.jup.quote(input_mint, output_mint, amount)
+        quote = self.jup.quote(input_mint, output_mint, amount, direct_only=True)
         if quote is None:
             return SwapResult(
                 ok=False, simulated=not self.cfg.is_armed, in_amount=amount,
@@ -346,6 +365,16 @@ class SwapExecutor:
                 ok=False, simulated=not self.cfg.is_armed, in_amount=amount,
                 out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
                 error=f"invalid quote: {quote_error}",
+            )
+        route_error = route_quote_error(
+            quote, input_mint, output_mint, amount, self.cfg.max_slippage_bps,
+        )
+        if route_error is not None:
+            log.warning("swap refused before execution (route policy): %s", route_error)
+            return SwapResult(
+                ok=False, simulated=not self.cfg.is_armed, in_amount=amount,
+                out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
+                error=f"route policy: {route_error}",
             )
         out_amount = parse_raw_amount(quote["outAmount"])
         if not self.cfg.is_armed:
@@ -429,6 +458,16 @@ class SwapExecutor:
                 status=TransactionStatus.CONFIRMED_FAILURE,
                 error=f"refused before signing: {direction_error}",
             )
+        route_error = route_quote_error(
+            quote, input_mint, output_mint, amount, self.cfg.max_slippage_bps,
+        )
+        if route_error is not None:
+            log.error("live swap refused before build (route policy): %s", route_error)
+            return SwapResult(
+                ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                status=TransactionStatus.CONFIRMED_FAILURE,
+                error=f"refused before signing: route policy: {route_error}",
+            )
         try:
             from solders.keypair import Keypair
             from solders.transaction import VersionedTransaction
@@ -455,13 +494,7 @@ class SwapExecutor:
                 return missing
             swap_resp = self.session.post(
                 self.jup.swap_url,
-                json={
-                    "quoteResponse": quote,
-                    "userPublicKey": user_pubkey,
-                    "wrapAndUnwrapSol": True,
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": "auto",
-                },
+                json=self.swap_request_body(quote, user_pubkey),
                 headers=self.jup._headers(), timeout=HTTP_TIMEOUT,
             )
             swap_resp.raise_for_status()
@@ -482,6 +515,19 @@ class SwapExecutor:
                 return SwapResult(
                     ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
                     status=TransactionStatus.CONFIRMED_FAILURE, error=version_error,
+                )
+            tx_error = swap_transaction_error(
+                tx.message, self._resolve_account_keys(tx.message),
+                owner=user_pubkey, input_mint=input_mint, output_mint=output_mint,
+                amount=amount, quote=quote, slippage_bps=self.cfg.max_slippage_bps,
+                max_priority_fee_lamports=self.cfg.priority_fee_max_lamports,
+            )
+            if tx_error is not None:
+                log.error("live swap refused before signing (tx policy): %s", tx_error)
+                return SwapResult(
+                    ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
+                    status=TransactionStatus.CONFIRMED_FAILURE,
+                    error=f"refused before signing: transaction policy: {tx_error}",
                 )
             signed = VersionedTransaction(tx.message, [keypair])
             # The transaction's identity on chain is its first signature,
@@ -554,6 +600,51 @@ class SwapExecutor:
                 ok=False, simulated=False, in_amount=amount, out_amount=out_amount,
                 tx_signature=signature, status=TransactionStatus.UNKNOWN, error=str(exc),
             )
+
+    def swap_request_body(self, quote: dict, user_pubkey: str) -> dict:
+        """The exact ``/swap`` request: capped priority-fee estimate, no Jito
+        tip, platform fee, feeAccount or referral."""
+        return {
+            "quoteResponse": quote,
+            "userPublicKey": user_pubkey,
+            "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFeeLamports": {
+                "priorityLevelWithMaxLamports": {
+                    "priorityLevel": PRIORITY_LEVEL,
+                    "maxLamports": self.cfg.priority_fee_max_lamports,
+                },
+            },
+        }
+
+    def _resolve_account_keys(self, message: Any) -> Optional[list]:
+        """All account keys of ``message``, resolving address lookup tables
+        with one read-only ``getMultipleAccounts`` call. None on any failure
+        (missing/foreign-owned/undecodable table): the caller refuses."""
+        lookups = list(getattr(message, "address_table_lookups", None) or [])
+        if not lookups:
+            return resolve_account_keys(message, {})
+        try:
+            import base64
+            from solders.address_lookup_table_account import AddressLookupTable
+            addrs = [str(l.account_key) for l in lookups]
+            result = rpc_call(
+                self.session, self.cfg.rpc_url, "getMultipleAccounts",
+                [addrs, {"encoding": "base64", "commitment": "confirmed"}],
+            )
+            values = (result or {}).get("value")
+            if not isinstance(values, list) or len(values) != len(addrs):
+                return None
+            tables = {}
+            for addr, value in zip(addrs, values):
+                if not isinstance(value, dict) or value.get("owner") != ADDRESS_LOOKUP_TABLE_PROGRAM:
+                    return None
+                table = AddressLookupTable.deserialize(base64.b64decode(value["data"][0]))
+                tables[addr] = [str(a) for a in table.addresses]
+            return resolve_account_keys(message, tables)
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            log.error("address lookup table resolution failed: %s", exc)
+            return None
 
     def _extract_confirmed_fill(
         self,

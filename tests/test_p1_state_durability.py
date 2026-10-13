@@ -364,3 +364,8 @@ def test_booking_crash_after_replace_restarts_from_either_version_once(world, mo
     run(bot3, 2)
     assert bot3.notifier.sells == []
     assert_booked_once(world)
+
+
+# Written before the per-position exit backoff: these tests re-run an exit on
+# the next tick, so the delay is zeroed (counter/alert still real).
+pytestmark = pytest.mark.usefixtures("no_exit_backoff")

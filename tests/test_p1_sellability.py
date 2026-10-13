@@ -50,7 +50,7 @@ class RouteJup:
             raise override
         return override(default, amount)
 
-    def quote(self, input_mint, output_mint, amount):
+    def quote(self, input_mint, output_mint, amount, **_kw):
         self.calls.append((input_mint, output_mint, amount))
         q = {"inputMint": input_mint, "outputMint": output_mint,
              "inAmount": str(amount), "swapMode": "ExactIn"}

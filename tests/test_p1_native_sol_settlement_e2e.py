@@ -174,7 +174,7 @@ class Jup:
     def __init__(self):
         self.quotes = []
 
-    def quote(self, i, o, amount):
+    def quote(self, i, o, amount, **_kw):
         self.quotes.append((i, o, amount))
         return {"inputMint": i, "outputMint": o, "inAmount": str(amount),
                 "outAmount": str(OUT_LAMPORTS), "otherAmountThreshold": str(OUT_LAMPORTS * 99 // 100),

@@ -525,3 +525,8 @@ def test_legacy_load_never_fabricates_rungs_or_sales(world):
     bot = boot(world)
     assert bot.portfolio.positions[MINT].ladder_filled == set()
     assert bot.portfolio.pending_intents == [] and bot.portfolio.realized_pnl == 0.0
+
+
+# Written before the per-position exit backoff: these tests re-run an exit on
+# the next tick, so the delay is zeroed (counter/alert still real).
+pytestmark = pytest.mark.usefixtures("no_exit_backoff")

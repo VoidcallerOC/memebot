@@ -339,3 +339,8 @@ def test_on_time_confirmed_without_valid_proceeds_never_books(world, out):
     assert intent["status"] == "unresolved" and bot._sell_frozen(MINT)
     assert position(state)["raw_tokens"] == IN_RAW and state["portfolio"]["realized_pnl"] == 0.0
     assert state["risk"]["realized_pnl_today"] == 0.0 and bot.notifier.sells == []
+
+
+# Written before the per-position exit backoff: these tests re-run an exit on
+# the next tick, so the delay is zeroed (counter/alert still real).
+pytestmark = pytest.mark.usefixtures("no_exit_backoff")

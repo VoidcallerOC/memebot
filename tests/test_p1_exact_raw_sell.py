@@ -283,3 +283,8 @@ def test_paper_sell_unchanged_float_path(env):
     assert pos.tokens == 1.0 and pos.raw_tokens is None
     assert bot.portfolio.realized_pnl == pytest.approx(1.0)
     assert bot.executor.calls == []
+
+
+# Written before the per-position exit backoff: these tests re-run an exit on
+# the next tick, so the delay is zeroed (counter/alert still real).
+pytestmark = pytest.mark.usefixtures("no_exit_backoff")
