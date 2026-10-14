@@ -174,6 +174,7 @@ See `config.example.env` for every knob, but the important ones:
 | `EXIT_RETRY_BASE_SECONDS` | First backoff after a failed live exit (1..3600) | `30` |
 | `EXIT_RETRY_MAX_SECONDS` | Backoff cap between failed exit attempts (base..86400) | `900` |
 | `EXIT_FAILURE_ALERT_THRESHOLD` | Consecutive failed exits before one operator alert (1..1000) | `3` |
+| `STOP_LOSS_REENTRY_COOLDOWN_SECONDS` | No re-buy of a mint for this long after a stop-loss closed it (0..604800; 0 = off) | `900` |
 
 > **Jupiter endpoint:** the bot quotes and swaps through Jupiter. The legacy
 > `quote-api.jup.ag/v6` host was deprecated on 2025-10-01, so the default is now
@@ -206,6 +207,13 @@ See `config.example.env` for every knob, but the important ones:
 > on a refusal; a settled sell resets the counter. Possibly-sent sells are not
 > counted: they freeze the mint until resolved on chain evidence (alerted
 > separately).
+>
+> **Stop-loss re-entry cooldown:** once a stop-loss sell is booked (paper, or
+> live after the confirmed fill settles) and closes the position, new buys of
+> that mint address are skipped for `STOP_LOSS_REENTRY_COOLDOWN_SECONDS`. The
+> cooldown is persisted in state; failed, refused or unresolved sells,
+> partial sells and take-profit exits never start it. Malformed persisted
+> cooldown entries are dropped with an error log (they hold no exposure).
 
 ## Architecture
 
