@@ -29,6 +29,12 @@ MAX_EXPERIMENT_USD = 20.0
 # Hard upper bound for PRIORITY_FEE_MAX_LAMPORTS (0.0002 SOL per swap).
 PRIORITY_FEE_HARD_CEILING_LAMPORTS = 200_000
 
+# Supported LOG_LEVEL values (case/whitespace-insensitive). Unlike the numeric
+# getters below, an unsupported value is a configuration ERROR, not a warn-and-
+# default: a typo must never silently hide (or flood) operator diagnostics.
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+DEFAULT_LOG_LEVEL = "INFO"
+
 
 def _get_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -50,6 +56,17 @@ def _get_float(name: str, default: float) -> float:
 
 def _get_int(name: str, default: int) -> int:
     return int(_get_float(name, default))
+
+
+def _normalize_log_level(raw: str | None) -> str:
+    """``LOG_LEVEL`` normalized to upper case; absent/blank -> INFO.
+
+    The result is NOT validated here; ``_validate`` rejects anything outside
+    ``LOG_LEVELS`` with a clear configuration error.
+    """
+    if raw is None or raw.strip() == "":
+        return DEFAULT_LOG_LEVEL
+    return raw.strip().upper()
 
 
 def _parse_ladder(raw: str) -> list[tuple[float, float]]:
@@ -143,6 +160,9 @@ class Config:
     # Loop
     poll_interval_seconds: int = 15
 
+    # Logging: one of LOG_LEVELS. DEBUG adds per-tick diagnostics only.
+    log_level: str = DEFAULT_LOG_LEVEL
+
     # Strategy / candidate source: "boosted" (DexScreener) or "smart_money".
     strategy: str = "boosted"
     smart_money_wallets: list[str] = field(default_factory=list)
@@ -210,6 +230,7 @@ def load_config() -> Config:
         require_freeze_revoked=_get_bool("REQUIRE_FREEZE_REVOKED", True),
         max_top_holder_pct=_get_float("MAX_TOP_HOLDER_PCT", 25.0),
         poll_interval_seconds=_get_int("POLL_INTERVAL_SECONDS", 15),
+        log_level=_normalize_log_level(os.getenv("LOG_LEVEL")),
         strategy=os.getenv("STRATEGY", "boosted").strip().lower(),
         smart_money_wallets=_parse_wallets(
             os.getenv("SMART_MONEY_WALLETS", ""),
@@ -255,6 +276,10 @@ def _validate(cfg: Config) -> None:
         problems.append("EXIT_FAILURE_ALERT_THRESHOLD must be in [1, 1000]")
     if not 0 <= cfg.stop_loss_reentry_cooldown_seconds <= 604800:
         problems.append("STOP_LOSS_REENTRY_COOLDOWN_SECONDS must be in [0, 604800]")
+    if cfg.log_level not in LOG_LEVELS:
+        problems.append(
+            f"LOG_LEVEL must be one of {', '.join(LOG_LEVELS)} (got {cfg.log_level[:32]!r})"
+        )
     ladder_total = sum(frac for _, frac in cfg.take_profit_ladder)
     if ladder_total > 1.0 + 1e-9:
         problems.append(

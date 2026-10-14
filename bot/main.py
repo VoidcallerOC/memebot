@@ -18,6 +18,7 @@ import sys
 import time
 from enum import Enum
 from fractions import Fraction
+from time import perf_counter as _perf_counter  # tick timing only (never patched by tests)
 
 import requests
 
@@ -52,11 +53,51 @@ log = logging.getLogger("bot")
 
 
 def _setup_logging() -> None:
+    # Starts at INFO so anything load_config() logs is visible; main() then
+    # applies the validated LOG_LEVEL via _apply_log_level().
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+def _apply_log_level(level: str) -> None:
+    """Set the root level to a validated ``Config.log_level`` name."""
+    logging.getLogger().setLevel(getattr(logging, level))
+
+
+def _debug(msg: str, *args) -> None:
+    """DEBUG diagnostic that can never affect trading.
+
+    Lazy %-formatting with simple values, skipped entirely unless DEBUG is
+    enabled, and any exception raised while logging (a raising handler or
+    filter, a bad ``__repr__``/format) is swallowed so a diagnostic can never
+    abort a tick or alter a decision. Callers pass only values the tick
+    already computed: no I/O happens here.
+    """
+    try:
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(msg, *args, stacklevel=2)
+    except Exception:  # pragma: no cover - exercised via a raising handler test
+        pass
+
+
+def _short(mint: object) -> str:
+    """Consistent, safe short form of a mint for diagnostics."""
+    try:
+        return str(mint)[:8]
+    except Exception:
+        return "?"
+
+
+def _change_pct(entry: object, current: object) -> float | None:
+    try:
+        if entry and entry > 0:
+            return (current / entry - 1.0) * 100.0
+    except Exception:
+        pass
+    return None
 
 
 class ExitQuoteKind(Enum):
@@ -314,6 +355,7 @@ def _price_usd(jup: JupiterClient, mint: str, decimals: int | None) -> float | N
         log.warning("no verified decimals for %s — no mark", mint)
         return None
     raw_in = 10 ** decimals
+    _debug("price read %s: quoting 1 whole token (decimals=%s) to USDC", _short(mint), decimals)
     quote = jup.quote(mint, USDC_MINT, raw_in)
     if isinstance(quote, dict) and (
         ("inAmount" in quote and parse_raw_amount(quote["inAmount"]) != raw_in)
@@ -327,6 +369,7 @@ def _price_usd(jup: JupiterClient, mint: str, decimals: int | None) -> float | N
         log.warning("malformed exit quote for %s — not an executable price", mint)
         return None
     if kind is not ExitQuoteKind.PRICE or not _is_executable_mark(price):
+        _debug("price read %s: no quote/outAmount (missing)", _short(mint))
         return None
     return float(price)
 
@@ -473,6 +516,16 @@ class TradingBot:
                          for name, why in sorted(corrupt.items()))
 
     def _tick(self) -> None:
+        started = _perf_counter()
+        _debug("tick start: %d open position(s), %d pending intent(s)",
+               len(self.portfolio.positions), len(self.portfolio.pending_intents))
+        try:
+            self._tick_body()
+        finally:
+            _debug("tick end: %.3fs elapsed, %d open position(s)",
+                   _perf_counter() - started, len(self.portfolio.positions))
+
+    def _tick_body(self) -> None:
         corrupt = self._corrupt_state_reason()
         if corrupt and self.cfg.is_armed:
             # Never trade armed on state whose intents cannot be trusted.
@@ -531,6 +584,10 @@ class TradingBot:
             return
         if self.risk.can_open_new_position(self.portfolio.open_count):
             self._seek_entry()
+        else:
+            _debug("entry search skipped: risk gate (open=%d, max=%d, daily_halt=%s)",
+                   self.portfolio.open_count, self.cfg.max_open_positions,
+                   getattr(self.risk, "_halted_today", None))
 
     def _manage_positions(self) -> None:
         for mint in list(self.portfolio.positions.keys()):
@@ -552,6 +609,9 @@ class TradingBot:
             # Missing and malformed quotes are not marks. Numeric 0.0 is.
             # Refuse anything else before exit rules or portfolio accounting.
             if not _is_executable_mark(price):
+                _debug("position %s (%s): price %s -> hold (no exit evaluation)",
+                       _short(mint), pos.symbol,
+                       "missing (None)" if price is None else "invalid/rejected")
                 if price is None:
                     log.warning(
                         "%s: exit quote unavailable — holding position and cost basis",
@@ -563,7 +623,10 @@ class TradingBot:
                         pos.symbol,
                     )
                 continue
-            for action in self.risk.evaluate_exit(pos.entry_price, price, pos.ladder_filled):
+            actions = self.risk.evaluate_exit(pos.entry_price, price, pos.ladder_filled)
+            if log.isEnabledFor(logging.DEBUG):
+                self._debug_exit_eval(mint, pos, price, actions)
+            for action in actions:
                 # A take-profit rung is NOT consumed here: it is marked filled
                 # only together with the sale's booking (paper: after the
                 # accounting; live: in the settlement's atomic save). Until
@@ -572,6 +635,25 @@ class TradingBot:
                 self._sell(mint, action.fraction, price, action.reason,
                            rung=_take_profit_rung(action.reason))
 
+    def _debug_exit_eval(self, mint, pos, price, actions) -> None:
+        """DEBUG: stop-loss / take-profit inputs and outcome. Pure reads of
+        values already computed; never raises."""
+        try:
+            filled = pos.ladder_filled
+            next_rung = next((t for t, _ in self.cfg.take_profit_ladder if t not in filled), None)
+            sl_price = self.risk.stop_loss_price(pos.entry_price)
+            change = _change_pct(pos.entry_price, price)
+            reasons = [a.reason for a in actions]
+        except Exception:
+            return
+        _debug("position %s (%s): price ok %.10g | entry %.10g change %s "
+               "SL<=%.10g (%.4g%%) next TP %s -> %s",
+               _short(mint), pos.symbol, price, pos.entry_price,
+               "n/a" if change is None else "%+.2f%%" % change,
+               sl_price, self.cfg.stop_loss_pct,
+               "none" if next_rung is None else "+%g%%" % next_rung,
+               ("exit requested: " + ", ".join(reasons)) if reasons else "no threshold crossed")
+
     def _seek_entry(self) -> None:
         corrupt = self._corrupt_state_reason()
         if corrupt:  # paper and armed alike: no new entry on untrusted state
@@ -579,6 +661,7 @@ class TradingBot:
             return
         for candidate in self.strategy.find_candidates():
             if self.portfolio.has(candidate.mint):
+                _debug("entry skipped for %s: already held", _short(candidate.mint))
                 continue
             if self._reentry_cooldown_active(candidate.mint):
                 log.info("entry skipped for %s: stop-loss re-entry cooldown active",
@@ -589,12 +672,18 @@ class TradingBot:
                 # is open): never a second buy of a mint whose buy is unresolved.
                 log.error("entry skipped for %s: an unresolved live buy of this mint exists",
                           str(candidate.mint)[:8])
+                _debug("entry skipped for %s: buy frozen (rejected before screening)",
+                       _short(candidate.mint))
                 continue
             # One DexScreener TokenSnapshot per candidate for safety + decision parity.
             market_snap = self._candidate_market_snapshot(candidate.mint)
             safety = self.screener.screen(candidate.mint, snapshot=market_snap)
             decision_shadow = getattr(self, "decision_shadow", None)
             if not safety.passed or safety.price_usd <= 0:
+                _debug("entry rejected for %s: safety screen (passed=%s, price>0=%s, "
+                       "%d reason(s)) before quoting", _short(candidate.mint),
+                       bool(safety.passed), safety.price_usd > 0,
+                       len(getattr(safety, "reasons", None) or ()))
                 # Still journal counterfactual when shadow is on (rejected by safety).
                 if decision_shadow is not None and not self.cfg.is_armed:
                     try:
@@ -639,6 +728,8 @@ class TradingBot:
                     "entry skipped for %s: pre-buy sell route missing or uneconomic",
                     safety.symbol,
                 )
+                _debug("entry rejected for %s: sell route gate (before swapping)",
+                       _short(candidate.mint))
                 continue
             if self.cfg.is_armed:
                 # Durable buy intent + pre-broadcast signature; the position is
@@ -712,6 +803,8 @@ class TradingBot:
                     "%s: %s deferred; exit backoff after %d consecutive failed sell(s), "
                     "next attempt in %.0fs", symbol, reason, pos.exit_failures, retry_at - now,
                 )
+                _debug("position %s (%s): exit backoff active -> skip %s this tick",
+                       _short(mint), symbol, reason)
                 return
             # Settles and books atomically (or leaves an open intent).
             n_before = len(self.portfolio.pending_intents)
@@ -1824,6 +1917,8 @@ def main() -> int:
     except ValueError as exc:
         log.error("%s", exc)
         return 2
+    _apply_log_level(cfg.log_level)
+    _debug("log level set to %s", cfg.log_level)
     log_resolved_paths(
         state_file=cfg.state_file,
         process_lock_file=cfg.process_lock_file,
