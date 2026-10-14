@@ -215,6 +215,22 @@ See `config.example.env` for every knob, but the important ones:
 > partial sells and take-profit exits never start it. Malformed persisted
 > cooldown entries are dropped with an error log (they hold no exposure).
 
+## Logging
+
+`LOG_LEVEL` sets verbosity: `DEBUG`, `INFO` (default when unset or blank),
+`WARNING`, `ERROR` or `CRITICAL`, case- and whitespace-insensitive. Any other
+value is a configuration error and the bot exits (code 2) instead of silently
+falling back. Logging starts at INFO so configuration-load messages are shown,
+then switches to `LOG_LEVEL` once the config is validated.
+
+`DEBUG` is observability only: per tick it logs start/end and elapsed time,
+each open position's price read (ok / missing / invalid) and its stop-loss /
+take-profit inputs (entry, current, change %, stop-loss price, next rung) and
+outcome, and why entry candidates were skipped. It uses values the tick
+already has (no extra quotes or RPC calls), cannot change any decision, and
+never logs keys, tokens, webhooks, headers or signed transactions. Mints are
+shown as their first 8 characters.
+
 ## Architecture
 
 ```
