@@ -84,12 +84,15 @@ def test_main_exits_2_on_invalid_level_before_anything_starts(monkeypatch):
 @pytest.mark.parametrize("level", LOG_LEVELS)
 def test_apply_log_level_sets_root(level):
     root = logging.getLogger()
-    before = root.level
+    urllib3_log = logging.getLogger("urllib3")
+    before_root, before_urllib3 = root.level, urllib3_log.level
     try:
         main_module._apply_log_level(level)
         assert root.level == getattr(logging, level)
+        assert urllib3_log.level == logging.WARNING
     finally:
-        root.setLevel(before)
+        root.setLevel(before_root)
+        urllib3_log.setLevel(before_urllib3)
 
 
 # --- DEBUG diagnostics ------------------------------------------------------
