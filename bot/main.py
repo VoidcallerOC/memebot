@@ -63,8 +63,15 @@ def _setup_logging() -> None:
 
 
 def _apply_log_level(level: str) -> None:
-    """Set the root level to a validated ``Config.log_level`` name."""
+    """Set the root level to a validated ``Config.log_level`` name.
+
+    Memebot loggers follow that level, so ``LOG_LEVEL=DEBUG`` still emits
+    per-tick diagnostics. urllib3 is held at WARNING: its DEBUG records are
+    routine HTTP traces, and quote URLs in those traces include mints.
+    urllib3 WARNING and ERROR still emit. This only changes logger levels.
+    """
     logging.getLogger().setLevel(getattr(logging, level))
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def _debug(msg: str, *args) -> None:
