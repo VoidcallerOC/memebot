@@ -19,6 +19,7 @@ import time
 from enum import Enum
 from fractions import Fraction
 from time import perf_counter as _perf_counter  # tick timing only (never patched by tests)
+from time import monotonic  # SOL/USD cache freshness (immune to tests patching ``time``)
 
 import requests
 
@@ -423,7 +424,7 @@ SOL_USD_CACHE_TTL_S = 45.0
 
 class _SolUsdCache:
     """In-process, short-TTL cache of ``sol_usdc_raw_per_sol`` (USDC raw per
-    1 SOL). Freshness uses ``time.monotonic``; a value older than the TTL is
+    1 SOL). Freshness uses ``monotonic``; a value older than the TTL is
     never served. Only positive integers are cached; a failed (re)fetch
     returns None (fail closed) and is not cached, never stale data."""
 
@@ -433,7 +434,7 @@ class _SolUsdCache:
         self._at: float | None = None
 
     def get(self, jup) -> int | None:
-        now = time.monotonic()
+        now = monotonic()
         if self._value is not None and self._at is not None and 0 <= now - self._at < self.ttl:
             return self._value
         self._value = self._at = None

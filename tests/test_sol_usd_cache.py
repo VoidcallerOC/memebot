@@ -34,7 +34,7 @@ class SolJup:
 @pytest.fixture
 def clock(monkeypatch):
     t = [1000.0]
-    monkeypatch.setattr(main_module.time, "monotonic", lambda: t[0])
+    monkeypatch.setattr(main_module, "monotonic", lambda: t[0])
     return t
 
 
