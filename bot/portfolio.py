@@ -146,6 +146,9 @@ def _finite_or_none(value) -> float | None:
     return value if math.isfinite(value) else None
 
 
+PAPER_EXIT_QUOTES_KEPT = 50
+
+
 @dataclass
 class Position:
     mint: str
@@ -251,6 +254,9 @@ class Portfolio:
         # new buys of that mint are refused until expiry. Persisted; absent in
         # legacy state (loads as empty).
         self.reentry_cooldowns: dict[str, float] = {}
+        # Paper (DRY-RUN) exit quote audit records, newest last, bounded.
+        # Optional in state; absent / malformed in legacy state -> [].
+        self.paper_exit_quotes: list[dict] = []
 
     def open(self, mint: str, symbol: str, entry_price: float,
              size_usd: float, tokens: float, **fill) -> Position:
@@ -261,6 +267,10 @@ class Portfolio:
         self.positions[mint] = pos
         log.info("OPEN  %s: $%.2f @ %.8f (%.2f tokens)", symbol, size_usd, entry_price, tokens)
         return pos
+
+    def record_paper_exit_quote(self, record: dict) -> None:
+        self.paper_exit_quotes.append(record)
+        del self.paper_exit_quotes[:-PAPER_EXIT_QUOTES_KEPT]
 
     def has(self, mint: str) -> bool:
         return mint in self.positions
@@ -356,6 +366,7 @@ class Portfolio:
                 if "buy_intents" in self.corrupt else list(self.buy_intents)
             ),
             "reentry_cooldowns": dict(sorted(self.reentry_cooldowns.items())),
+            "paper_exit_quotes": list(self.paper_exit_quotes),
         }
 
     def load_dict(self, d: dict) -> None:
@@ -408,6 +419,11 @@ class Portfolio:
                 self._mark_corrupt("buy_intents", raw_buys, problem)
                 self.buy_intents = []
         self.reentry_cooldowns = _load_reentry_cooldowns(d.get("reentry_cooldowns"))
+        quotes = d.get("paper_exit_quotes")
+        self.paper_exit_quotes = (
+            [q for q in quotes if isinstance(q, dict)][-PAPER_EXIT_QUOTES_KEPT:]
+            if isinstance(quotes, list) else []
+        )
 
     def _mark_corrupt(self, name: str, raw: object, reason: str) -> None:
         self.corrupt[name] = reason
