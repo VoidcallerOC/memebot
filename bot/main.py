@@ -417,6 +417,33 @@ def _validated_route_out(
     return min_out, ""
 
 
+# Paper-only SOL/USD cache TTL (seconds). Deliberately a constant, not a knob.
+SOL_USD_CACHE_TTL_S = 45.0
+
+
+class _SolUsdCache:
+    """In-process, short-TTL cache of ``sol_usdc_raw_per_sol`` (USDC raw per
+    1 SOL). Freshness uses ``time.monotonic``; a value older than the TTL is
+    never served. Only positive integers are cached; a failed (re)fetch
+    returns None (fail closed) and is not cached, never stale data."""
+
+    def __init__(self, ttl: float = SOL_USD_CACHE_TTL_S):
+        self.ttl = ttl
+        self._value: int | None = None
+        self._at: float | None = None
+
+    def get(self, jup) -> int | None:
+        now = time.monotonic()
+        if self._value is not None and self._at is not None and 0 <= now - self._at < self.ttl:
+            return self._value
+        self._value = self._at = None
+        out = sol_usdc_raw_per_sol(jup)
+        if isinstance(out, bool) or not isinstance(out, int) or out <= 0:
+            return None
+        self._value, self._at = out, now
+        return out
+
+
 class _PaperQuoteError(Exception):
     """A paper exit quote that must not be booked."""
 
@@ -883,7 +910,7 @@ class TradingBot:
             min_out = parse_raw_amount(quote.get("otherAmountThreshold"))
             record["quoted_out_lamports"], record["min_out_lamports"] = out, min_out
             record["quoted_proceeds_sol"] = out / LAMPORTS_PER_SOL
-            usdc_per_sol = sol_usdc_raw_per_sol(self.jup)
+            usdc_per_sol = self._sol_usdc_raw()
             if usdc_per_sol is None:
                 raise _PaperQuoteError("SOL/USD price unavailable")
             usd = float(Fraction(out * usdc_per_sol, LAMPORTS_PER_SOL * USDC_RAW_PER_USD))
@@ -1872,6 +1899,17 @@ class TradingBot:
         self._prune_reentry_cooldowns()
         return save_state(self.cfg.state_file, self.portfolio, self.risk)
 
+    def _sol_usdc_raw(self) -> int | None:
+        """SOL/USD (USDC raw per SOL) for sizing and paper exits. Armed: always
+        a fresh, uncached quote (live sizing stays exactly as before). Paper:
+        served from a short-TTL cache (``SOL_USD_CACHE_TTL_S``)."""
+        if self.cfg.is_armed:
+            return sol_usdc_raw_per_sol(self.jup)
+        cache = getattr(self, "_sol_usd_cache", None)
+        if cache is None:
+            cache = self._sol_usd_cache = _SolUsdCache()
+        return cache.get(self.jup)
+
     def _usd_to_lamports(self, usd: float) -> int | None:
         """Lamports worth at most ``usd`` at a verified SOL/USD price, or None.
 
@@ -1887,7 +1925,7 @@ class TradingBot:
             return None
         if not math.isfinite(usd) or usd <= 0:
             return None
-        out_raw = sol_usdc_raw_per_sol(self.jup)
+        out_raw = self._sol_usdc_raw()
         if out_raw is None:
             return None
         lamports = (Fraction(usd) * LAMPORTS_PER_SOL * USDC_RAW_PER_USD) // out_raw
