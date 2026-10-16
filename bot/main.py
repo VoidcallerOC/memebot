@@ -31,7 +31,7 @@ from .config import Config, load_config
 from .jupiter import (
     MAX_EXPERIMENT_USD, JupiterClient, LAMPORTS_PER_SOL, SOL_MINT, USDC_MINT, USDC_RAW_PER_USD,
     SwapExecutor, TransactionStatus, parse_raw_amount, sol_usdc_raw_per_sol,
-    valid_token_decimals,
+    swap_quote_error, valid_token_decimals,
 )
 from .preflight import run_preflight
 from .portfolio import Portfolio, is_raw_units
@@ -415,6 +415,10 @@ def _validated_route_out(
     if min_out > out_raw:
         return None, "quote otherAmountThreshold exceeds outAmount"
     return min_out, ""
+
+
+class _PaperQuoteError(Exception):
+    """A paper exit quote that must not be booked."""
 
 
 class TradingBot:
@@ -820,7 +824,99 @@ class TradingBot:
                 if attempt and _exit_attempt_failed(attempt[-1]):
                     self._record_exit_failure(mint, reason, attempt[-1])
             return
-        self._book_sell(mint, fraction, price, reason, rung=rung)
+        # Paper only (never reached when armed): one read-only full-size quote.
+        book_price = self._paper_exit_quote(mint, pos, fraction, price, reason)
+        self._book_sell(mint, fraction, book_price, reason, rung=rung)
+
+    def _paper_exit_raw_amount(self, pos, fraction: float) -> int | None:
+        """Raw units a paper exit of ``fraction`` represents: the exact live
+        amount when the position tracks raw units, else floor of the same
+        float quantity ``Portfolio.sell_fraction`` books (paper positions do
+        not track raw holdings)."""
+        raw, _ = exact_raw_sell_amount(pos, fraction)
+        if raw is not None:
+            return raw
+        dec = valid_token_decimals(pos.token_decimals)
+        tokens = min(pos.original_tokens * fraction, pos.tokens)
+        if dec is None or not isinstance(tokens, (int, float)) or not math.isfinite(tokens) \
+                or tokens <= 0:
+            return None
+        amount = int(Fraction(tokens) * (10 ** dec))
+        return amount if is_raw_units(amount) else None
+
+    def _paper_exit_quote(self, mint: str, pos, fraction: float, price: float,
+                          reason: str) -> float:
+        """Quote the full paper exit like a live sell would (token->SOL,
+        exact raw amount, direct route, same read-only validators), record it,
+        and return the per-token USD price to BOOK.
+
+        Booking: the quoted ``outAmount`` (expected fill; live books the actual
+        fill, which equals outAmount absent price movement; min-out is only the
+        reject floor and is recorded as worst case). Falls back to the trigger
+        ``price`` with a warning on any failure. Never raises, never retries,
+        never changes the exit decision. Extra network: 1 token->SOL quote,
+        plus 1 SOL/USD quote only when that quote is valid."""
+        tokens = min(pos.original_tokens * fraction, pos.tokens)
+        record = {
+            "ts": time.time(), "mint": mint, "symbol": pos.symbol, "reason": reason,
+            "fraction": fraction, "trigger_price": price,
+            "trigger_proceeds_usd": tokens * price, "raw_amount": None,
+            "quoted_out_lamports": None, "min_out_lamports": None,
+            "quoted_proceeds_sol": None, "quoted_proceeds_usd": None,
+            "min_out_proceeds_usd": None, "gap_pct": None,
+            "booked": "trigger", "error": None,
+        }
+        book_price = price
+        try:
+            raw = self._paper_exit_raw_amount(pos, fraction)
+            record["raw_amount"] = raw
+            if raw is None or tokens <= 0:
+                raise _PaperQuoteError("no exact raw sell amount")
+            quote = self.jup.quote(mint, SOL_MINT, raw, direct_only=True)
+            if quote is None:
+                raise _PaperQuoteError("no route / quote unavailable")
+            err = swap_quote_error(quote, mint, SOL_MINT, raw) or route_quote_error(
+                quote, mint, SOL_MINT, raw, self.cfg.max_slippage_bps)
+            if err:
+                raise _PaperQuoteError(f"invalid quote: {err}")
+            out = parse_raw_amount(quote["outAmount"])
+            min_out = parse_raw_amount(quote.get("otherAmountThreshold"))
+            record["quoted_out_lamports"], record["min_out_lamports"] = out, min_out
+            record["quoted_proceeds_sol"] = out / LAMPORTS_PER_SOL
+            usdc_per_sol = sol_usdc_raw_per_sol(self.jup)
+            if usdc_per_sol is None:
+                raise _PaperQuoteError("SOL/USD price unavailable")
+            usd = float(Fraction(out * usdc_per_sol, LAMPORTS_PER_SOL * USDC_RAW_PER_USD))
+            record["quoted_proceeds_usd"] = usd
+            if min_out is not None:
+                record["min_out_proceeds_usd"] = float(
+                    Fraction(min_out * usdc_per_sol, LAMPORTS_PER_SOL * USDC_RAW_PER_USD))
+            trig = record["trigger_proceeds_usd"]
+            if trig > 0:
+                record["gap_pct"] = (usd - trig) / trig * 100.0
+            book_price = usd / tokens
+            if not _is_executable_mark(book_price):
+                book_price = price
+                raise _PaperQuoteError("quoted proceeds not a finite price")
+            record["booked"] = "quote"
+            log.info(
+                "[DRY-RUN] %s %s exit quote: trigger $%.8f, trigger proceeds $%.4f, quoted "
+                "%.9f SOL = $%.4f, min-out $%s, gap %s%% — booked at quoted proceeds",
+                pos.symbol, reason, price, trig, record["quoted_proceeds_sol"], usd,
+                "n/a" if record["min_out_proceeds_usd"] is None
+                else f"{record['min_out_proceeds_usd']:.4f}",
+                "n/a" if record["gap_pct"] is None else f"{record['gap_pct']:.2f}",
+            )
+        except Exception as exc:  # noqa: BLE001 - never block a paper exit
+            record["error"] = str(exc)
+            log.warning(
+                "[DRY-RUN] %s %s: exit quote unavailable, booked at trigger price "
+                "(trigger $%.8f, proceeds $%.4f): %s",
+                pos.symbol, reason, price, record["trigger_proceeds_usd"], exc,
+            )
+            book_price = price
+        self.portfolio.record_paper_exit_quote(record)
+        return book_price
 
     def _prune_reentry_cooldowns(self) -> None:
         self.portfolio.prune_reentry_cooldowns(
