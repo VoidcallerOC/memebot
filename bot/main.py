@@ -1900,9 +1900,10 @@ class TradingBot:
         return save_state(self.cfg.state_file, self.portfolio, self.risk)
 
     def _sol_usdc_raw(self) -> int | None:
-        """SOL/USD (USDC raw per SOL) for sizing and paper exits. Armed: always
-        a fresh, uncached quote (live sizing stays exactly as before). Paper:
-        served from a short-TTL cache (``SOL_USD_CACHE_TTL_S``)."""
+        """Paper-only SOL/USD (USDC raw per SOL) from a short-TTL cache
+        (``SOL_USD_CACHE_TTL_S``), for paper sizing and paper exits. Live
+        sizing never calls this; if armed anyway, it returns a fresh,
+        uncached quote (defensive guard)."""
         if self.cfg.is_armed:
             return sol_usdc_raw_per_sol(self.jup)
         cache = getattr(self, "_sol_usd_cache", None)
@@ -1925,7 +1926,10 @@ class TradingBot:
             return None
         if not math.isfinite(usd) or usd <= 0:
             return None
-        out_raw = self._sol_usdc_raw()
+        # Live sizing: always a fresh, uncached quote (original path).
+        # Paper sizing: short-TTL cache.
+        out_raw = (sol_usdc_raw_per_sol(self.jup) if self.cfg.is_armed
+                   else self._sol_usdc_raw())
         if out_raw is None:
             return None
         lamports = (Fraction(usd) * LAMPORTS_PER_SOL * USDC_RAW_PER_USD) // out_raw

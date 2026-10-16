@@ -105,3 +105,13 @@ def test_cache_guard_rejects_invalid_even_if_helper_returns_it(clock, monkeypatc
     c = main_module._SolUsdCache()
     assert c.get(None) is None
     assert c.get(None) == 200_000_000 and seq == []
+
+
+def test_live_sizing_bypasses_paper_cache_wrapper(clock, monkeypatch):
+    jup = FakeJup()
+    bot = _bot(jup)
+    monkeypatch.setattr(type(bot.cfg), "is_armed", property(lambda self: True))
+    monkeypatch.setattr(bot, "_sol_usdc_raw",
+                        lambda: (_ for _ in ()).throw(AssertionError("live via cache")))
+    assert bot._usd_to_lamports(2.0) == bot._usd_to_lamports(2.0) == 10_000_000
+    assert len(jup.calls) == 2
