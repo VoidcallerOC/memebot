@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import re
 import time
 from fractions import Fraction
@@ -253,10 +254,53 @@ def _status_from_rpc(value: Any, commitment: str) -> Optional[TransactionStatus]
     return TransactionStatus.CONFIRMED_SUCCESS if confirmation in required else None
 
 
+# Endpoint-wide Jupiter quote 429 cooldown (constants, not settings).
+RATE_LIMIT_BASE_S = 2.0
+RATE_LIMIT_MAX_S = 60.0
+RATE_LIMIT_JITTER = 0.25
+RATE_LIMIT_MAX_EXP = 6  # 2s * 2**6 = 128s > cap; bounds the exponent
+
+# ``JupiterClient.last_error_kind`` values (None after a successful quote).
+QUOTE_RATE_LIMITED = "rate_limited"
+QUOTE_NO_ROUTE = "no_route"
+QUOTE_HTTP_ERROR = "http_error"
+QUOTE_TIMEOUT = "timeout"
+QUOTE_NETWORK_ERROR = "network_error"
+
+
+def quote_failure_reason(jup: Any, default: str = "no route / quote unavailable") -> str:
+    """Cause of the client's last failed quote, for logs/errors only.
+
+    Only a rate limit changes the text; every other failure keeps the
+    caller's existing message (``default``) so non-429 behaviour is unchanged."""
+    kind = getattr(jup, "last_error_kind", None)
+    if kind == QUOTE_RATE_LIMITED:
+        return "rate-limited (HTTP 429 / cooldown)"
+    return default
+
+
+def _retry_after_seconds(resp: Any) -> Optional[float]:
+    try:
+        raw = resp.headers.get("Retry-After")
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val < 0:
+        return None
+    return min(val, RATE_LIMIT_MAX_S)
+
+
 class JupiterClient:
     def __init__(self, cfg: Config, session: Optional[requests.Session] = None):
         self.cfg = cfg
         self.session = session or requests.Session()
+        # Shared (per client = per endpoint) 429 cooldown, monotonic clock.
+        self._rl_not_before: float = 0.0
+        self._rl_streak: int = 0
+        self.last_error_kind: Optional[str] = None
 
     @property
     def quote_url(self) -> str:
@@ -269,13 +313,44 @@ class JupiterClient:
     def _headers(self) -> dict:
         return {"x-api-key": self.cfg.jupiter_api_key} if self.cfg.jupiter_api_key else {}
 
+    def rate_limit_remaining(self) -> float:
+        return max(0.0, self._rl_not_before - time.monotonic())
+
+    def _note_rate_limited(self, resp: Any) -> float:
+        self._rl_streak += 1
+        delay = _retry_after_seconds(resp)
+        if delay is None:
+            # Exponent capped: 2s * 2**5 already exceeds the 60s cap, and an
+            # uncapped 2**streak would overflow float after ~1025 429s.
+            exp = min(self._rl_streak - 1, RATE_LIMIT_MAX_EXP)
+            base = min(RATE_LIMIT_BASE_S * (2 ** exp), RATE_LIMIT_MAX_S)
+            delay = base * random.uniform(1 - RATE_LIMIT_JITTER, 1 + RATE_LIMIT_JITTER)
+            delay = min(delay, RATE_LIMIT_MAX_S)
+        # Never shorten an active cooldown (e.g. a bypassed 429 with a short
+        # Retry-After, or after a bypassed success reset the streak).
+        now = time.monotonic()
+        self._rl_not_before = max(self._rl_not_before, now + delay)
+        return self._rl_not_before - now
+
     def quote(self, input_mint: str, output_mint: str, amount: int, *,
-              direct_only: bool = False) -> Optional[dict]:
+              direct_only: bool = False, bypass_cooldown: bool = False) -> Optional[dict]:
         """Jupiter quote. ``direct_only=True`` (executable swap quotes and the
         pre-buy exit-route check) asks Jupiter for single-hop routes only;
         the default (price discovery: USD marks, SOL/USD) lets Jupiter route
         through any pool, so a token whose only liquidity is e.g. a SOL pool
-        still gets a token->USDC mark. A price quote is never executed."""
+        still gets a token->USDC mark. A price quote is never executed.
+
+        After an HTTP 429 the endpoint is cooled down (Retry-After, else
+        2s,4s,8s.. capped 60s, +-25% jitter): calls return None immediately
+        with no request (fail closed, same value as a 429). ``bypass_cooldown``
+        is only for armed live sell execution quotes and armed held-position
+        exit marks; a 429 can only extend, never shorten, the cooldown. ``last_error_kind``
+        names the cause of the last failure (None after success)."""
+        remaining = self.rate_limit_remaining()
+        if remaining > 0 and not bypass_cooldown:
+            self.last_error_kind = QUOTE_RATE_LIMITED
+            log.debug("jupiter quote skipped: rate-limit cooldown %.1fs remaining", remaining)
+            return None
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
@@ -286,13 +361,29 @@ class JupiterClient:
             params["onlyDirectRoutes"] = "true"
         try:
             resp = self.session.get(self.quote_url, params=params, headers=self._headers(), timeout=HTTP_TIMEOUT)
+            if getattr(resp, "status_code", None) == 429:
+                delay = self._note_rate_limited(resp)
+                self.last_error_kind = QUOTE_RATE_LIMITED
+                log.debug("jupiter quote rate-limited (%s->%s): HTTP 429, cooldown %.1fs",
+                          input_mint[:4], output_mint[:4], delay)
+                return None
             resp.raise_for_status()
             data = resp.json()
-            return data if data and "outAmount" in data else None
+            self._rl_streak = 0
+            if data and "outAmount" in data:
+                self.last_error_kind = None
+                return data
+            self.last_error_kind = QUOTE_NO_ROUTE
+            return None
         except Exception as exc:
+            if isinstance(exc, requests.Timeout):
+                self.last_error_kind = QUOTE_TIMEOUT
+            elif isinstance(exc, requests.HTTPError):
+                self.last_error_kind = QUOTE_HTTP_ERROR
+            else:
+                self.last_error_kind = QUOTE_NETWORK_ERROR
             log.debug("jupiter quote failed (%s->%s): %s", input_mint[:4], output_mint[:4], exc)
             return None
-
 
 class SwapExecutor:
     """Turns a quote into a fill and resolves submitted transaction status."""
@@ -349,12 +440,20 @@ class SwapExecutor:
                 out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
                 error="swap amount is not a positive integer raw amount",
             )
-        quote = self.jup.quote(input_mint, output_mint, amount, direct_only=True)
+        # Armed live SELLS (token -> SOL) bypass the 429 cooldown: an
+        # executable live sell (e.g. a stop) must never be suppressed
+        # client-side; a real 429 still fails closed exactly as before (exit
+        # retry backoff applies). Armed buys (SOL -> token) honour it.
+        if self.cfg.is_armed and output_mint == SOL_MINT and input_mint != SOL_MINT:
+            quote = self.jup.quote(input_mint, output_mint, amount, direct_only=True,
+                                   bypass_cooldown=True)
+        else:
+            quote = self.jup.quote(input_mint, output_mint, amount, direct_only=True)
         if quote is None:
             return SwapResult(
                 ok=False, simulated=not self.cfg.is_armed, in_amount=amount,
                 out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
-                error="no route / quote unavailable",
+                error=quote_failure_reason(self.jup),
             )
         # Validate before anything is booked, built, signed or sent. A bad
         # quote is the same clean failure as "no route" (nothing submitted).

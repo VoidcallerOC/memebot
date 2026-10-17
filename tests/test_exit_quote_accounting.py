@@ -67,7 +67,7 @@ def _open(bot, *, entry_price=1.0, size_usd=100.0, tokens=100.0):
 
 
 def _stub_price(monkeypatch, value):
-    def _price(_jup, mint, _decimals):
+    def _price(_jup, mint, _decimals, **_kw):
         assert mint == MINT
         return value() if callable(value) else value
 
@@ -127,7 +127,7 @@ def test_partial_exit_then_missing_quote_keeps_remainder(monkeypatch):
     _open(bot)
     quotes = iter([1.6, None])
 
-    def _price(_jup, _mint, _decimals):
+    def _price(_jup, _mint, _decimals, **_kw):
         return next(quotes)
 
     monkeypatch.setattr(main_module, "_price_usd", _price)

@@ -233,7 +233,7 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "solders.transaction", spy)
     monkeypatch.setattr(jupiter_module, "send_raw_transaction", w.send)
     monkeypatch.setattr(reconcile_module, "get_wallet_pubkey", lambda cfg: OWNER)
-    monkeypatch.setattr(main_module, "_price_usd", lambda jup, mint, dec: w.marks.get(mint))
+    monkeypatch.setattr(main_module, "_price_usd", lambda jup, mint, dec, **_kw: w.marks.get(mint))
     monkeypatch.setattr(main_module, "time", types.SimpleNamespace(
         time=lambda: w.now, sleep=lambda s: None))
     return w

@@ -258,7 +258,7 @@ class BWorld:
 def patch_world(monkeypatch, w):
     monkeypatch.setattr(reconcile_module, "get_wallet_pubkey", lambda cfg: w.owner)
     monkeypatch.setattr(main_module, "_price_usd",
-                        lambda jup, mint, dec: w.mark_calls.append(mint) or w.marks.get(mint))
+                        lambda jup, mint, dec, **_kw: w.mark_calls.append(mint) or w.marks.get(mint))
     monkeypatch.setattr(main_module, "time", types.SimpleNamespace(
         time=lambda: w.now, sleep=lambda s: None))
     monkeypatch.setattr(main_module, "save_state", REAL_SAVE)

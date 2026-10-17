@@ -156,7 +156,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "time", types.SimpleNamespace(time=clock.time, sleep=lambda s: None))
     for name in ("get_signature_status", "get_confirmed_transaction", "fetch_wallet_token_balances"):
         monkeypatch.setattr(main_module, name, getattr(chain, name), raising=False)
-    monkeypatch.setattr(main_module, "_price_usd", lambda jup, mint, dec: marks.get(mint))
+    monkeypatch.setattr(main_module, "_price_usd", lambda jup, mint, dec, **_kw: marks.get(mint))
 
     def fake_reconcile(cfg, portfolio, session=None, notifier=None):
         reconciles.append({m: p.tokens for m, p in portfolio.positions.items()})
