@@ -32,7 +32,7 @@ from .config import Config, load_config
 from .jupiter import (
     MAX_EXPERIMENT_USD, JupiterClient, LAMPORTS_PER_SOL, SOL_MINT, USDC_MINT, USDC_RAW_PER_USD,
     SwapExecutor, TransactionStatus, parse_raw_amount, sol_usdc_raw_per_sol,
-    swap_quote_error, valid_token_decimals,
+    swap_quote_error, valid_token_decimals, quote_failure_reason,
 )
 from .preflight import run_preflight
 from .portfolio import Portfolio, is_raw_units
@@ -377,7 +377,9 @@ def _price_usd(jup: JupiterClient, mint: str, decimals: int | None) -> float | N
         log.warning("malformed exit quote for %s — not an executable price", mint)
         return None
     if kind is not ExitQuoteKind.PRICE or not _is_executable_mark(price):
-        _debug("price read %s: no quote/outAmount (missing)", _short(mint))
+        cause = quote_failure_reason(jup, "") if quote is None else ""
+        _debug("price read %s: no quote/outAmount (missing)%s", _short(mint),
+               f": {cause}" if cause else "")
         return None
     return float(price)
 
@@ -436,10 +438,13 @@ class _SolUsdCache:
     def get(self, jup) -> int | None:
         now = monotonic()
         if self._value is not None and self._at is not None and 0 <= now - self._at < self.ttl:
+            log.debug("sol/usd cache hit (age %.1fs)", now - self._at)
             return self._value
         self._value = self._at = None
+        log.debug("sol/usd cache miss -> fetch")
         out = sol_usdc_raw_per_sol(jup)
         if isinstance(out, bool) or not isinstance(out, int) or out <= 0:
+            log.debug("sol/usd cache fetch failed, not cached")
             return None
         self._value, self._at = out, now
         return out
@@ -902,7 +907,7 @@ class TradingBot:
                 raise _PaperQuoteError("no exact raw sell amount")
             quote = self.jup.quote(mint, SOL_MINT, raw, direct_only=True)
             if quote is None:
-                raise _PaperQuoteError("no route / quote unavailable")
+                raise _PaperQuoteError(quote_failure_reason(self.jup))
             err = swap_quote_error(quote, mint, SOL_MINT, raw) or route_quote_error(
                 quote, mint, SOL_MINT, raw, self.cfg.max_slippage_bps)
             if err:
@@ -1979,6 +1984,8 @@ class TradingBot:
             log.warning("sell-route check %s: buy quote failed (%s)", short, type(exc).__name__)
             return False
         token_min, reason = _validated_route_out(buy_quote, SOL_MINT, mint, lamports)
+        if buy_quote is None:
+            reason = quote_failure_reason(jup, reason)
         if token_min is not None:
             # Same direct-route policy the executable swap enforces: never
             # buy a token whose exit could only be a route we refuse to sign.
@@ -1994,6 +2001,8 @@ class TradingBot:
             log.warning("sell-route check %s: sell quote failed (%s)", short, type(exc).__name__)
             return False
         sell_min_out, reason = _validated_route_out(sell_quote, mint, SOL_MINT, token_min)
+        if sell_quote is None:
+            reason = quote_failure_reason(jup, reason)
         if sell_min_out is not None:
             policy = route_quote_error(sell_quote, mint, SOL_MINT, token_min, self.cfg.max_slippage_bps)
             if policy is not None:
