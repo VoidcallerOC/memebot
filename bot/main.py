@@ -288,6 +288,17 @@ BUY_INTENT_EXPIRY_SECONDS = SELL_INTENT_EXPIRY_SECONDS
 # passing this gate does NOT guarantee a future sell will succeed.
 MAX_ROUNDTRIP_LOSS = Fraction(1, 10)
 
+# Entry-probing request budget, PAPER (dry-run) mode only: per ``_seek_entry``
+# cycle, at most this many candidates may begin Jupiter-dependent evaluation
+# (SOL/USD sizing, pre-buy sell-route check, paper buy). The allowance is
+# consumed when a candidate passes every local screen and reaches sizing,
+# whether or not the SOL/USD price is then served from the paper cache, and is
+# not returned if that candidate fails, is rejected or is rate-limited. Later
+# candidates are deferred to the next cycle. Armed live entries are never
+# capped (unchanged: a failed live candidate moves on to the next). Deliberately
+# a constant, not a config knob.
+ENTRY_JUPITER_CANDIDATES_PER_CYCLE = 1
+
 
 def _parse_out_amount_usd(raw: object) -> float | None:
     """USD value of a USDC ``outAmount``, or None when it is not executable.
@@ -713,7 +724,16 @@ class TradingBot:
         if corrupt:  # paper and armed alike: no new entry on untrusted state
             log.error("entry search refused: %s", corrupt)
             return
+        # Per-cycle only (local to this call, never persisted): mints already
+        # evaluated this cycle, and candidates that began Jupiter-dependent work.
+        seen_mints: set = set()
+        jupiter_candidates = 0
         for candidate in self.strategy.find_candidates():
+            if candidate.mint in seen_mints:
+                _debug("entry candidate %s skipped: duplicate in this cycle",
+                       _short(candidate.mint))
+                continue
+            seen_mints.add(candidate.mint)
             if self.portfolio.has(candidate.mint):
                 _debug("entry skipped for %s: already held", _short(candidate.mint))
                 continue
@@ -764,6 +784,14 @@ class TradingBot:
                     )
                     continue
 
+            # Every local screen passed: from here on evaluation may call
+            # Jupiter (sizing, sell-route check, buy). Paper: one candidate per
+            # cycle. Armed live entries are not capped.
+            if not self.cfg.is_armed and jupiter_candidates >= ENTRY_JUPITER_CANDIDATES_PER_CYCLE:
+                log.info("entry candidate %s deferred: per-cycle Jupiter candidate cap reached",
+                         _short(candidate.mint))
+                continue
+            jupiter_candidates += 1
             size_usd = self.risk.position_size_usd()
             tokens = size_usd / safety.price_usd
             lamports = self._usd_to_lamports(size_usd)
