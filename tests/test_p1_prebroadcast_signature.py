@@ -168,7 +168,7 @@ class RWorld:
 def rw(monkeypatch, tmp_path):
     w = RWorld(tmp_path, Keypair())                          # throwaway, test-generated
     monkeypatch.setattr(reconcile_module, "get_wallet_pubkey", lambda cfg: w.owner)
-    monkeypatch.setattr(main_module, "_price_usd", lambda jup, mint, dec: w.marks.get(mint))
+    monkeypatch.setattr(main_module, "_price_usd", lambda jup, mint, dec, **_kw: w.marks.get(mint))
     monkeypatch.setattr(main_module, "time", types.SimpleNamespace(
         time=lambda: w.now, sleep=lambda s: None))
     return w

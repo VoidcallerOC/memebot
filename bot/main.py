@@ -342,7 +342,8 @@ def _classify_exit_quote(quote: object) -> tuple[ExitQuoteKind, float | None]:
     return ExitQuoteKind.PRICE, price
 
 
-def _price_usd(jup: JupiterClient, mint: str, decimals: int | None) -> float | None:
+def _price_usd(jup: JupiterClient, mint: str, decimals: int | None, *,
+               bypass_cooldown: bool = False) -> float | None:
     """USD mark for 1 WHOLE token, or None when that mark must not be traded.
 
     ``decimals`` must be the mint's verified SPL decimals (from the safety
@@ -357,6 +358,9 @@ def _price_usd(jup: JupiterClient, mint: str, decimals: int | None) -> float | N
     present, disagree with the request. A parsed 0.0 from canonical ``"0"`` or
     int ``0`` is returned as 0.0 so a legitimate zero quote still follows
     the exit rules.
+
+    ``bypass_cooldown=True`` (armed held-position exit marks only) skips the
+    client-side 429 cooldown; a real 429 still fails closed (None).
     """
     decimals = valid_token_decimals(decimals)
     if decimals is None:
@@ -364,7 +368,10 @@ def _price_usd(jup: JupiterClient, mint: str, decimals: int | None) -> float | N
         return None
     raw_in = 10 ** decimals
     _debug("price read %s: quoting 1 whole token (decimals=%s) to USDC", _short(mint), decimals)
-    quote = jup.quote(mint, USDC_MINT, raw_in)
+    if bypass_cooldown:
+        quote = jup.quote(mint, USDC_MINT, raw_in, bypass_cooldown=True)
+    else:
+        quote = jup.quote(mint, USDC_MINT, raw_in)
     if isinstance(quote, dict) and (
         ("inAmount" in quote and parse_raw_amount(quote["inAmount"]) != raw_in)
         or ("inputMint" in quote and quote["inputMint"] != mint)
@@ -649,7 +656,10 @@ class TradingBot:
                     pos.symbol,
                 )
                 continue
-            price = _price_usd(self.jup, mint, decimals)
+            # Armed: exit (SL/TP) marks for held positions bypass the 429
+            # cooldown like live sells; paper honours it.
+            price = _price_usd(self.jup, mint, decimals,
+                               bypass_cooldown=self.cfg.is_armed is True)
             # Missing and malformed quotes are not marks. Numeric 0.0 is.
             # Refuse anything else before exit rules or portfolio accounting.
             if not _is_executable_mark(price):

@@ -255,3 +255,88 @@ def test_armed_executor_quote_bypasses_cooldown(monkeypatch):
     r = ex.swap(MINT, SOL_MINT, 1000, allocation_usd=1.0)
     assert not r.ok and "rate-limited" in r.error
     assert calls == [{"direct_only": True, "bypass_cooldown": True}]
+
+
+# --- armed held-position exit marks bypass the cooldown; nothing else does ---
+
+PRICE_OK = {"inputMint": MINT, "outputMint": USDC_MINT,
+            "inAmount": str(10**6), "outAmount": str(10**6)}  # $1, == entry: no exit
+
+
+@pytest.fixture
+def armed(monkeypatch):
+    monkeypatch.setattr(Config, "is_armed", property(lambda self: True))
+
+
+def _cooling_bot(clock, *resps):
+    """Bot with a real JupiterClient already in a 429 cooldown (1 request)."""
+    s = Sess(Resp(429), *resps)
+    jup = JupiterClient(_cfg(), s)
+    _q(jup)
+    assert s.calls == 1 and jup.rate_limit_remaining() == pytest.approx(2.0)
+    bot = _bot(jup)
+    bot._sell_frozen = lambda mint: False
+    bot._sell = lambda *a, **k: (_ for _ in ()).throw(AssertionError("sell"))
+    return bot, s, jup
+
+
+def test_armed_held_position_read_bypasses_cooldown(clock, armed):
+    bot, s, jup = _cooling_bot(clock, Resp(200, PRICE_OK))
+    bot._manage_positions()
+    assert s.calls == 2 and jup.last_error_kind is None
+
+
+def test_armed_bypassed_429_extends_cooldown_and_holds(clock, armed, caplog):
+    bot, s, jup = _cooling_bot(clock, Resp(429))
+    with caplog.at_level(logging.WARNING):
+        bot._manage_positions()
+    assert s.calls == 2 and jup.last_error_kind == J.QUOTE_RATE_LIMITED
+    assert jup.rate_limit_remaining() == pytest.approx(4.0)  # streak 2
+    assert "exit quote unavailable — holding position" in caplog.text
+    assert MINT in bot.portfolio.positions
+
+
+def test_paper_held_position_read_still_skipped(clock):
+    bot, s, jup = _cooling_bot(clock, Resp(200, PRICE_OK))
+    bot._manage_positions()
+    assert s.calls == 1 and jup.last_error_kind == J.QUOTE_RATE_LIMITED
+
+
+def test_price_usd_default_honours_cooldown(clock, armed):
+    """Any other (e.g. entry-side) caller of _price_usd keeps the cooldown."""
+    bot, s, jup = _cooling_bot(clock, Resp(200, PRICE_OK))
+    assert main_module._price_usd(jup, MINT, 6) is None and s.calls == 1
+
+
+def test_armed_sol_sizing_still_skipped(clock, armed):
+    bot, s, jup = _cooling_bot(clock, Resp(200, OK))
+    assert bot._usd_to_lamports(5.0) is None and s.calls == 1
+
+
+def test_armed_sell_route_gate_still_skipped(clock, armed, caplog):
+    bot, s, jup = _cooling_bot(clock, Resp(200, OK))
+    with caplog.at_level(logging.WARNING):
+        assert bot._sell_route_ok(MINT, 10**7) is False
+    assert s.calls == 1 and "buy quote rejected: rate-limited" in caplog.text
+
+
+def _route_quote(inp, outp, raw, out):
+    return {"inputMint": inp, "outputMint": outp, "inAmount": str(raw),
+            "outAmount": str(out), "otherAmountThreshold": str(out * 99 // 100),
+            "swapMode": "ExactIn"}
+
+
+def test_sell_route_gate_sell_leg_rate_limited(caplog):
+    class Jup:
+        last_error_kind = None
+
+        def quote(self, i, o, amount, **k):
+            if i == SOL_MINT:
+                return _route_quote(SOL_MINT, MINT, amount, 5 * 10**6)
+            self.last_error_kind = J.QUOTE_RATE_LIMITED
+            return None
+    bot = _bot(Jup())
+    with caplog.at_level(logging.WARNING):
+        assert bot._sell_route_ok(MINT, 10**7) is False
+    line = [r.getMessage() for r in caplog.records if "sell-route check" in r.getMessage()][0]
+    assert "sell quote rejected: rate-limited" in line and "no route" not in line
