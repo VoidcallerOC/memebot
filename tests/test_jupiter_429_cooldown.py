@@ -340,3 +340,83 @@ def test_sell_route_gate_sell_leg_rate_limited(caplog):
         assert bot._sell_route_ok(MINT, 10**7) is False
     line = [r.getMessage() for r in caplog.records if "sell-route check" in r.getMessage()][0]
     assert "sell quote rejected: rate-limited" in line and "no route" not in line
+
+
+# --- review fixes: exponent overflow, never shorten, armed bypass sells only ---
+
+def test_1100_consecutive_429s_no_overflow(clock, monkeypatch):
+    monkeypatch.setattr(J.random, "uniform", lambda a, b: b)  # max jitter
+    n = 1100
+    s = Sess(*[Resp(429) for _ in range(n)])
+    jup = JupiterClient(_cfg(), s)
+    for _ in range(n):
+        _q(jup)
+        assert jup.last_error_kind == J.QUOTE_RATE_LIMITED
+        clock.t += 61
+    assert s.calls == n and jup._rl_streak == n
+    clock.t -= 61  # back to the moment of the last 429
+    assert jup.rate_limit_remaining() == pytest.approx(60.0)
+    assert _q(jup) is None and s.calls == n and jup.last_error_kind == J.QUOTE_RATE_LIMITED
+
+
+def _cooling_32s(clock, *resps):
+    s = Sess(*[Resp(429) for _ in range(5)], *resps)
+    jup = JupiterClient(_cfg(), s)
+    for _ in range(5):
+        _q(jup, bypass_cooldown=True)
+    assert jup.rate_limit_remaining() == pytest.approx(32.0)
+    return s, jup
+
+
+def test_short_retry_after_does_not_shorten_cooldown(clock):
+    s, jup = _cooling_32s(clock, Resp(429, headers={"Retry-After": "1"}))
+    _q(jup, bypass_cooldown=True)
+    assert s.calls == 6 and jup.rate_limit_remaining() == pytest.approx(32.0)
+    assert _q(jup) is None and s.calls == 6
+
+
+def test_bypassed_success_then_429_does_not_shorten(clock):
+    s, jup = _cooling_32s(clock, Resp(200, OK), Resp(429))
+    assert _q(jup, bypass_cooldown=True) == OK and jup._rl_streak == 0
+    _q(jup, bypass_cooldown=True)  # streak 1 -> 2s, must not cut the 32s
+    assert jup.rate_limit_remaining() == pytest.approx(32.0)
+    assert _q(jup) is None and s.calls == 7
+
+
+def _cooling_executor(clock, monkeypatch, armed_on, *resps):
+    monkeypatch.setattr(Config, "is_armed", property(lambda self: armed_on))
+    s = Sess(Resp(429), *resps)
+    jup = JupiterClient(_cfg(), s)
+    _q(jup)
+    assert s.calls == 1 and jup.rate_limit_remaining() > 0
+    ex = SwapExecutor(_cfg(), jup, Sess())
+    monkeypatch.setattr(ex, "_missing_pre_broadcast_callback", lambda *a: None)
+    return s, ex
+
+
+def test_armed_sell_during_cooldown_makes_request(clock, monkeypatch):
+    s, ex = _cooling_executor(clock, monkeypatch, True, Resp(429))
+    r = ex.swap(MINT, SOL_MINT, 1000, allocation_usd=1.0)
+    assert s.calls == 2 and not r.ok and "rate-limited" in r.error
+
+
+def test_armed_buy_unpatched_fails_closed_without_request(clock, monkeypatch):
+    """Real armed buy: its SOL/USD exposure check already honours the cooldown."""
+    s, ex = _cooling_executor(clock, monkeypatch, True, Resp(200, OK), Resp(200, OK))
+    r = ex.swap(SOL_MINT, MINT, 10**6, allocation_usd=1.0)
+    assert s.calls == 1 and not r.ok and r.tx_signature is None
+
+
+def test_armed_buy_during_cooldown_no_request_fails_closed(clock, monkeypatch):
+    s, ex = _cooling_executor(clock, monkeypatch, True, Resp(200, OK))
+    monkeypatch.setattr(ex, "_armed_sol_exposure_error", lambda *a: None)  # isolate swap quote
+    r = ex.swap(SOL_MINT, MINT, 10**6, allocation_usd=1.0)
+    assert s.calls == 1 and not r.ok and "rate-limited" in r.error
+    assert r.tx_signature is None
+
+
+@pytest.mark.parametrize("inp,outp", [(MINT, SOL_MINT), (SOL_MINT, MINT)])
+def test_paper_sell_and_buy_honour_cooldown(clock, monkeypatch, inp, outp):
+    s, ex = _cooling_executor(clock, monkeypatch, False, Resp(200, OK))
+    r = ex.swap(inp, outp, 10**6)
+    assert s.calls == 1 and not r.ok and "rate-limited" in r.error

@@ -258,6 +258,7 @@ def _status_from_rpc(value: Any, commitment: str) -> Optional[TransactionStatus]
 RATE_LIMIT_BASE_S = 2.0
 RATE_LIMIT_MAX_S = 60.0
 RATE_LIMIT_JITTER = 0.25
+RATE_LIMIT_MAX_EXP = 6  # 2s * 2**6 = 128s > cap; bounds the exponent
 
 # ``JupiterClient.last_error_kind`` values (None after a successful quote).
 QUOTE_RATE_LIMITED = "rate_limited"
@@ -319,11 +320,17 @@ class JupiterClient:
         self._rl_streak += 1
         delay = _retry_after_seconds(resp)
         if delay is None:
-            base = min(RATE_LIMIT_BASE_S * (2 ** (self._rl_streak - 1)), RATE_LIMIT_MAX_S)
+            # Exponent capped: 2s * 2**5 already exceeds the 60s cap, and an
+            # uncapped 2**streak would overflow float after ~1025 429s.
+            exp = min(self._rl_streak - 1, RATE_LIMIT_MAX_EXP)
+            base = min(RATE_LIMIT_BASE_S * (2 ** exp), RATE_LIMIT_MAX_S)
             delay = base * random.uniform(1 - RATE_LIMIT_JITTER, 1 + RATE_LIMIT_JITTER)
             delay = min(delay, RATE_LIMIT_MAX_S)
-        self._rl_not_before = time.monotonic() + delay
-        return delay
+        # Never shorten an active cooldown (e.g. a bypassed 429 with a short
+        # Retry-After, or after a bypassed success reset the streak).
+        now = time.monotonic()
+        self._rl_not_before = max(self._rl_not_before, now + delay)
+        return self._rl_not_before - now
 
     def quote(self, input_mint: str, output_mint: str, amount: int, *,
               direct_only: bool = False, bypass_cooldown: bool = False) -> Optional[dict]:
@@ -336,7 +343,8 @@ class JupiterClient:
         After an HTTP 429 the endpoint is cooled down (Retry-After, else
         2s,4s,8s.. capped 60s, +-25% jitter): calls return None immediately
         with no request (fail closed, same value as a 429). ``bypass_cooldown``
-        is only for armed live swap execution quotes. ``last_error_kind``
+        is only for armed live sell execution quotes and armed held-position
+        exit marks; a 429 can only extend, never shorten, the cooldown. ``last_error_kind``
         names the cause of the last failure (None after success)."""
         remaining = self.rate_limit_remaining()
         if remaining > 0 and not bypass_cooldown:
@@ -432,10 +440,11 @@ class SwapExecutor:
                 out_amount=0, status=TransactionStatus.CONFIRMED_FAILURE,
                 error="swap amount is not a positive integer raw amount",
             )
-        # Armed live swaps bypass the 429 cooldown: an executable live sell
-        # (e.g. a stop) must never be suppressed client-side; a real 429
-        # still fails closed exactly as before (exit retry backoff applies).
-        if self.cfg.is_armed:
+        # Armed live SELLS (token -> SOL) bypass the 429 cooldown: an
+        # executable live sell (e.g. a stop) must never be suppressed
+        # client-side; a real 429 still fails closed exactly as before (exit
+        # retry backoff applies). Armed buys (SOL -> token) honour it.
+        if self.cfg.is_armed and output_mint == SOL_MINT and input_mint != SOL_MINT:
             quote = self.jup.quote(input_mint, output_mint, amount, direct_only=True,
                                    bypass_cooldown=True)
         else:
