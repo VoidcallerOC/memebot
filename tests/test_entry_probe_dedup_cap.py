@@ -87,6 +87,8 @@ def test_duplicate_of_locally_rejected_mint_is_not_rescreened():
 
 def test_duplicate_set_resets_every_cycle(monkeypatch):
     monkeypatch.setattr(main_module, "ENTRY_JUPITER_CANDIDATES_PER_CYCLE", 5)
+    # Zero per-mint backoff so only the dedup reset is under test here.
+    monkeypatch.setattr(main_module, "ENTRY_BACKOFF_BASE_S", 0.0)
     jup = RouteJup(**FAIL_SELL)
     bot = entry_bot(jup, [A, A])
     bot._seek_entry()
@@ -154,7 +156,9 @@ def test_cached_sol_usd_still_consumes_allowance():
     sol_usd = [c for c in jup.calls if c[1] == USDC_MINT]
     bot._seek_entry()                                 # cache hit this time
     assert [c for c in jup.calls if c[1] == USDC_MINT] == sol_usd == [(SOL_MINT, USDC_MINT, 10**9)]
-    assert bot.route_checked == [A, A]
+    # One candidate per cycle even on the cache hit; cycle 2's slot goes to B
+    # (A is backed off after its failure, B was retained when deferred).
+    assert bot.route_checked == [A, B]
 
 
 class Resp:

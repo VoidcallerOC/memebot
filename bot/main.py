@@ -10,6 +10,7 @@ Run with: ``python -m bot.main``
 from __future__ import annotations
 
 import copy
+import itertools
 import logging
 import math
 import re
@@ -32,7 +33,7 @@ from .config import Config, load_config
 from .jupiter import (
     MAX_EXPERIMENT_USD, JupiterClient, LAMPORTS_PER_SOL, SOL_MINT, USDC_MINT, USDC_RAW_PER_USD,
     SwapExecutor, TransactionStatus, parse_raw_amount, sol_usdc_raw_per_sol,
-    swap_quote_error, valid_token_decimals, quote_failure_reason,
+    swap_quote_error, valid_token_decimals, quote_failure_reason, QUOTE_RATE_LIMITED,
 )
 from .preflight import run_preflight
 from .portfolio import Portfolio, is_raw_units
@@ -43,7 +44,7 @@ from .risk import RiskManager
 from .safety import SafetyScreener
 from .state import durable_saves_supported, load_state, save_state
 from .swap_policy import route_quote_error
-from .strategy import build_strategy
+from .strategy import Candidate, build_strategy
 
 try:
     from .decision.bridge import DecisionShadowBridge
@@ -298,6 +299,23 @@ MAX_ROUNDTRIP_LOSS = Fraction(1, 10)
 # capped (unchanged: a failed live candidate moves on to the next). Deliberately
 # a constant, not a config knob.
 ENTRY_JUPITER_CANDIDATES_PER_CYCLE = 1
+
+# Paper-only fairness for that cap (in-process, never persisted; armed live
+# entries never use either). (1) Per-mint backoff: a candidate whose
+# Jupiter-stage evaluation fails (sell-route check False, paper swap/quote
+# failure) is skipped BEFORE the cap for a bounded, exponential delay, so the
+# slot goes to the next candidate. A rate-limited failure (the endpoint-wide
+# 429 cooldown, not the mint's fault) gets the base delay without raising the
+# mint's streak. A success clears the mint's record. (2) Retention queue: a
+# candidate deferred by the cap or skipped by backoff is re-offered in later
+# cycles (one-shot sources such as smart_money emit a mint only once), through
+# every local screen again, until it is evaluated or explicitly expires.
+ENTRY_BACKOFF_BASE_S = 30.0
+ENTRY_BACKOFF_MAX_S = 900.0
+ENTRY_BACKOFF_MAX_EXP = 5           # 30s * 2**5 = 960s > cap; bounds the exponent
+ENTRY_BACKOFF_MAX_MINTS = 256       # backoff records kept (memory bound)
+ENTRY_RETRY_QUEUE_MAX = 32          # retained deferred candidates (memory bound)
+ENTRY_RETRY_QUEUE_TTL_S = 1800.0    # a retained candidate expires after this
 
 
 def _parse_out_amount_usd(raw: object) -> float | None:
@@ -728,18 +746,33 @@ class TradingBot:
         # evaluated this cycle, and candidates that began Jupiter-dependent work.
         seen_mints: set = set()
         jupiter_candidates = 0
-        for candidate in self.strategy.find_candidates():
+        paper = not self.cfg.is_armed
+        now = monotonic()
+        retained: list = []
+        if paper:
+            # Re-offer retained candidates first; they rerun every screen below.
+            self._expire_entry_retry_queue(now)
+            retained = [Candidate(mint=m) for m in self._entry_retry_queue()]
+        for candidate in itertools.chain(retained, self.strategy.find_candidates()):
             if candidate.mint in seen_mints:
                 _debug("entry candidate %s skipped: duplicate in this cycle",
                        _short(candidate.mint))
                 continue
             seen_mints.add(candidate.mint)
+            # Paper: a queued entry is only peeked here. It stays queued (same
+            # expiry) unless a final disposition below removes it, so an
+            # exception or an aborted cycle can never silently lose it.
+            queued_expiry = self._entry_retry_queue().get(candidate.mint) if paper else None
             if self.portfolio.has(candidate.mint):
                 _debug("entry skipped for %s: already held", _short(candidate.mint))
+                if paper:
+                    self._drop_entry_retry(candidate.mint, "already held")
                 continue
             if self._reentry_cooldown_active(candidate.mint):
                 log.info("entry skipped for %s: stop-loss re-entry cooldown active",
                          str(candidate.mint)[:8])
+                if paper:
+                    self._drop_entry_retry(candidate.mint, "stop-loss re-entry cooldown")
                 continue
             if self._buy_frozen(candidate.mint):
                 # Defence in depth (all entries are blocked while a buy intent
@@ -748,10 +781,35 @@ class TradingBot:
                           str(candidate.mint)[:8])
                 _debug("entry skipped for %s: buy frozen (rejected before screening)",
                        _short(candidate.mint))
+                if paper:
+                    self._drop_entry_retry(candidate.mint, "buy frozen")
                 continue
+            if paper:
+                # Before any market snapshot, holder RPC, screening or shadow
+                # journal: a backed-off mint costs no work and no Jupiter slot.
+                backoff = self._entry_backoff_remaining(candidate.mint, now)
+                if backoff > 0:
+                    _debug("entry candidate %s skipped: per-mint backoff %.0fs remaining",
+                           _short(candidate.mint), backoff)
+                    self._retain_entry_candidate(candidate.mint, queued_expiry, now)
+                    continue
             # One DexScreener TokenSnapshot per candidate for safety + decision parity.
-            market_snap = self._candidate_market_snapshot(candidate.mint)
-            safety = self.screener.screen(candidate.mint, snapshot=market_snap)
+            if paper and queued_expiry is not None:
+                # Paper, queued candidate only: an error while fetching or
+                # screening moves it to the back of the queue (same expiry)
+                # and the search goes on; it never counts as a pass. Feed
+                # candidates and live entries propagate exactly as before.
+                stage = "snapshot"
+                try:
+                    market_snap = self._candidate_market_snapshot(candidate.mint)
+                    stage = "screen"
+                    safety = self.screener.screen(candidate.mint, snapshot=market_snap)
+                except Exception as exc:
+                    self._requeue_entry_after_error(candidate.mint, queued_expiry, stage, exc)
+                    continue
+            else:
+                market_snap = self._candidate_market_snapshot(candidate.mint)
+                safety = self.screener.screen(candidate.mint, snapshot=market_snap)
             decision_shadow = getattr(self, "decision_shadow", None)
             if not safety.passed or safety.price_usd <= 0:
                 _debug("entry rejected for %s: safety screen (passed=%s, price>0=%s, "
@@ -766,6 +824,8 @@ class TradingBot:
                         )
                     except Exception as exc:
                         log.debug("decision shadow journal failed: %s", exc)
+                if paper:
+                    self._drop_entry_retry(candidate.mint, "safety screen rejected")
                 continue
 
             # Phase 7/11: decision engine gates dry-run paper only; never live.
@@ -776,20 +836,23 @@ class TradingBot:
                     )
                 except Exception as exc:
                     log.error("decision shadow failed closed: %s", exc)
+                    self._drop_entry_retry(candidate.mint, "decision shadow failed closed")
                     continue
                 if not decision_shadow.allows_paper_entry(eng):
                     log.info(
                         "decision shadow skip %s: action=%s risk=%s",
                         safety.symbol, eng.decision.action, eng.risk.status,
                     )
+                    self._drop_entry_retry(candidate.mint, "decision shadow skip")
                     continue
 
             # Every local screen passed: from here on evaluation may call
             # Jupiter (sizing, sell-route check, buy). Paper: one candidate per
             # cycle. Armed live entries are not capped.
-            if not self.cfg.is_armed and jupiter_candidates >= ENTRY_JUPITER_CANDIDATES_PER_CYCLE:
+            if paper and jupiter_candidates >= ENTRY_JUPITER_CANDIDATES_PER_CYCLE:
                 log.info("entry candidate %s deferred: per-cycle Jupiter candidate cap reached",
                          _short(candidate.mint))
+                self._retain_entry_candidate(candidate.mint, queued_expiry, now)
                 continue
             jupiter_candidates += 1
             size_usd = self.risk.position_size_usd()
@@ -802,9 +865,13 @@ class TradingBot:
                     "entry skipped for %s: SOL/USD price unavailable or size invalid",
                     safety.symbol,
                 )
+                if paper:  # not the mint's fault: no backoff, but keep it retained
+                    self._retain_entry_candidate(candidate.mint, queued_expiry, now)
                 return
             # Pre-buy sellability gate (paper and armed alike): quote-only,
             # before any swap, signature, send, or position side effect.
+            if paper and getattr(self, "jup", None) is not None:
+                self.jup.last_error_kind = None  # a failure below can't inherit an earlier 429
             if not self._sell_route_ok(candidate.mint, lamports):
                 log.warning(
                     "entry skipped for %s: pre-buy sell route missing or uneconomic",
@@ -812,6 +879,9 @@ class TradingBot:
                 )
                 _debug("entry rejected for %s: sell route gate (before swapping)",
                        _short(candidate.mint))
+                if paper:
+                    self._note_entry_failure(candidate.mint, safety.symbol, now)
+                    self._drop_entry_retry(candidate.mint, "evaluated: sell-route check failed")
                 continue
             if self.cfg.is_armed:
                 # Durable buy intent + pre-broadcast signature; the position is
@@ -825,15 +895,112 @@ class TradingBot:
             )
             if not result.ok:
                 log.info("entry aborted for %s: %s", safety.symbol, result.error)
+                if paper:
+                    self._note_entry_failure(candidate.mint, safety.symbol, now)
+                    self._drop_entry_retry(candidate.mint, "evaluated: paper buy failed")
                 continue
             self.portfolio.open(
                 candidate.mint, safety.symbol, safety.price_usd, size_usd, tokens,
                 token_decimals=valid_token_decimals(getattr(safety, "decimals", None)),
             )
+            if paper:
+                self._entry_backoff_records().pop(candidate.mint, None)
+                self._drop_entry_retry(candidate.mint, "evaluated: position opened")
             opened = self.portfolio.positions[candidate.mint]
             self.notifier.buy(safety.symbol, size_usd, opened.entry_price, result.simulated)
             self._save()
             return
+
+    # -- paper entry fairness (see ENTRY_BACKOFF_* / ENTRY_RETRY_QUEUE_*) ----
+
+    def _entry_backoff_records(self) -> dict:
+        """mint -> (not_before, failure_streak), monotonic clock; paper only."""
+        records = getattr(self, "_entry_backoff", None)
+        if records is None:
+            records = self._entry_backoff = {}
+        return records
+
+    def _entry_backoff_remaining(self, mint: str, now: float) -> float:
+        record = self._entry_backoff_records().get(mint)
+        return 0.0 if record is None else max(0.0, record[0] - now)
+
+    def _note_entry_failure(self, mint: str, symbol: str, now: float) -> None:
+        """Back ``mint`` off after a failed Jupiter-stage entry evaluation."""
+        records = self._entry_backoff_records()
+        # A streak is forgotten once the mint has been quiet for the max delay.
+        for old in [m for m, (until, _) in records.items() if now >= until + ENTRY_BACKOFF_MAX_S]:
+            del records[old]
+        until, failures = records.pop(mint, (0.0, 0))
+        rate_limited = getattr(getattr(self, "jup", None), "last_error_kind", None) == QUOTE_RATE_LIMITED
+        if rate_limited:
+            delay = ENTRY_BACKOFF_BASE_S
+        else:
+            failures += 1
+            delay = min(ENTRY_BACKOFF_BASE_S * (2 ** min(failures - 1, ENTRY_BACKOFF_MAX_EXP)),
+                        ENTRY_BACKOFF_MAX_S)
+        while len(records) >= ENTRY_BACKOFF_MAX_MINTS:
+            victim = min(records, key=lambda m: records[m][0])
+            del records[victim]
+            _debug("entry backoff record for %s evicted (table full)", _short(victim))
+        records[mint] = (max(until, now + delay), failures)
+        log.info("entry backoff for %s (%s): %.0fs after %s (failure streak %d)",
+                 _short(mint), symbol, delay,
+                 "rate limit (endpoint-wide; streak not raised)" if rate_limited
+                 else "Jupiter-stage failure", failures)
+
+    def _entry_retry_queue(self) -> dict:
+        """mint -> expiry (monotonic), insertion-ordered; paper only."""
+        queue = getattr(self, "_entry_queue", None)
+        if queue is None:
+            queue = self._entry_queue = {}
+        return queue
+
+    def _expire_entry_retry_queue(self, now: float) -> None:
+        queue = self._entry_retry_queue()
+        for mint, expiry in list(queue.items()):
+            if now >= expiry:
+                del queue[mint]
+                log.info("entry retry queue: %s expired (TTL %.0fs) before being (re)evaluated",
+                         _short(mint), ENTRY_RETRY_QUEUE_TTL_S)
+
+    def _drop_entry_retry(self, mint: str, reason: str) -> None:
+        """Final disposition of a reached candidate: remove it from the retry
+        queue (if queued), with the reason."""
+        if self._entry_retry_queue().pop(mint, None) is not None:
+            log.info("entry retry queue: %s removed (%s)", _short(mint), reason)
+
+    def _requeue_entry_after_error(self, mint: str, expiry: float, stage: str,
+                                   exc: Exception) -> None:
+        """A queued candidate's snapshot or screen raised: move it to the back
+        of the queue with its original expiry (never extended), or drop it
+        explicitly if it has expired. Only the exception type is logged (a
+        message could carry an RPC URL with a key)."""
+        queue = self._entry_retry_queue()
+        queue.pop(mint, None)
+        log.warning("entry retry queue: %s %s failed (%s); not screened as passing",
+                    _short(mint), stage, type(exc).__name__)
+        if monotonic() >= expiry:
+            log.info("entry retry queue: %s expired (TTL %.0fs) before being (re)evaluated",
+                     _short(mint), ENTRY_RETRY_QUEUE_TTL_S)
+            return
+        if len(queue) >= ENTRY_RETRY_QUEUE_MAX:  # cannot happen (it was just removed)
+            log.info("entry retry queue full (%d): %s dropped, not retained",
+                     ENTRY_RETRY_QUEUE_MAX, _short(mint))
+            return
+        queue[mint] = expiry
+        log.info("entry retry queue: %s moved to the back (expiry unchanged)", _short(mint))
+
+    def _retain_entry_candidate(self, mint: str, expiry, now: float) -> None:
+        """Keep a deferred / backed-off candidate for a later cycle. A
+        re-queued candidate keeps its original expiry (never refreshed)."""
+        queue = self._entry_retry_queue()
+        if mint in queue:
+            return
+        if len(queue) >= ENTRY_RETRY_QUEUE_MAX:
+            log.info("entry retry queue full (%d): %s dropped, not retained",
+                     ENTRY_RETRY_QUEUE_MAX, _short(mint))
+            return
+        queue[mint] = now + ENTRY_RETRY_QUEUE_TTL_S if expiry is None else expiry
 
     def _candidate_market_snapshot(self, mint: str):
         """Fetch one META TokenSnapshot for this candidate (DexScreener + holders).
