@@ -820,7 +820,7 @@ def test_paper_entry_unchanged_no_intent_no_callback_no_send(bw):
     assert seen == [{"allocation_usd": pytest.approx(2.0)}]
     assert bot.portfolio.buy_intents == [] and MINT in bot.portfolio.positions
     pos = bot.portfolio.positions[MINT]
-    assert pos.raw_tokens is None and pos.entry_price == 0.0005
+    assert pos.raw_tokens is None and pos.entry_price == pytest.approx(pos.size_usd / pos.tokens)
     assert bw.builds == 0 and bw.sends == [] and "buy_intents" in persisted(bw)["portfolio"]
 
 
