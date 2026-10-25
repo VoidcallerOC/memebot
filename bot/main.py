@@ -856,7 +856,6 @@ class TradingBot:
                 continue
             jupiter_candidates += 1
             size_usd = self.risk.position_size_usd()
-            tokens = size_usd / safety.price_usd
             lamports = self._usd_to_lamports(size_usd)
             if lamports is None:
                 # Fail closed: no verified SOL/USD price (or invalid size) means
@@ -899,9 +898,21 @@ class TradingBot:
                     self._note_entry_failure(candidate.mint, safety.symbol, now)
                     self._drop_entry_retry(candidate.mint, "evaluated: paper buy failed")
                 continue
+            # Book the simulated swap's raw output (like live books the raw
+            # fill), never size_usd / screener price. Fail closed if unusable.
+            token_decimals = valid_token_decimals(getattr(safety, "decimals", None))
+            out_raw = getattr(result, "out_amount", None)
+            if token_decimals is None or not is_raw_units(out_raw):
+                log.warning("entry aborted for %s: paper swap output %r (decimals %r) "
+                            "not bookable", safety.symbol, out_raw, token_decimals)
+                if paper:
+                    self._note_entry_failure(candidate.mint, safety.symbol, now)
+                    self._drop_entry_retry(candidate.mint, "evaluated: paper buy unbookable")
+                continue
+            tokens = out_raw / (10 ** token_decimals)
             self.portfolio.open(
-                candidate.mint, safety.symbol, safety.price_usd, size_usd, tokens,
-                token_decimals=valid_token_decimals(getattr(safety, "decimals", None)),
+                candidate.mint, safety.symbol, size_usd / tokens, size_usd, tokens,
+                token_decimals=token_decimals,
             )
             if paper:
                 self._entry_backoff_records().pop(candidate.mint, None)
